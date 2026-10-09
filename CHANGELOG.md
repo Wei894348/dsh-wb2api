@@ -1,15 +1,40 @@
 # 变更记录
 
+## 1.4.1（2026-10-09）
+
+**后端逻辑重写（`lib/gw/` 全部换掉）**
+
+按 1.4.0 的行为契约重新实现了一遍，模块划分与命名全部重来，不再沿用先前的文件组织：
+
+| 新模块 | 职责 |
+|---|---|
+| `settings.js` | 配置归一化与默认值、provider settings namespace |
+| `runtime.js` | 路径口径统一：运行目录 / 子进程 cwd / 凭证目录 / 网关 config 生成 |
+| `proc.js` | 子进程托管：定位可执行文件 → 探活 → spawn → 崩溃指数退避重启 → 回收 |
+| `chat.js` | LlmAdapter：消息序列化 + 发流 + SSE → StreamChunk |
+| `stream.js` | SSE 帧解析与双超时（首帧 / 帧间） |
+| `catalog.js` | `/v1/models` → dsh 模型目录（TTL 缓存、并发去重、失败保旧） |
+| `binary.js` / `archive.js` | 二进制下载 + SHA256 校验 + 原子落盘；自带 ZIP 解压 |
+| `credentials.js` | 账号开关（改 `auths/` 文件名后缀）与选择语法 |
+| `authorize.js` | Node 版 OAuth 登录与凭证落盘 |
+| `bootstrap.js` / `render.js` | `/wb2api-setup` 编排；状态与报告的纯函数渲染 |
+
+对外契约不变：子插件名 `wb2api-gateway`、`inject` 三项、六条 `/wb2api-*` 命令、
+LLM provider id 仍是 `workbuddy2api`。行为上保留的既有判据：启动前先探活复用外部网关、
+工具结果展开为独立 `tool` 消息并丢弃孤儿、残缺工具参数判 `max-tokens` 而非 `tool-calls`、
+只吐思考的空步判 `EMPTY_RESPONSE`、缓存命中 token 不计入 inputTokens、账号池空时显示
+「账号池为空」而非「可用 0/0」。
+
 ## 1.4.0（2026-10-09）
 
 **内置网关托管与模型 provider 注册（一体化）**
 
 - 新增 `lib/gw/`（12 个 .js）：网关托管 + provider 注册实现 —— 定位可执行文件、探活、
   拉子进程、崩溃重启、随 dsh 退出回收，并把网关的模型目录注册成 dsh 的 LLM provider。
-  - `gateway-supervisor.js` 子进程托管（定位可执行文件 → `/healthz` 探活 → spawn → 崩溃重启 → dispose 回收）
-  - `gateway-adapter.js` LlmAdapter（请求组装 + SSE → StreamChunk）、`models.js` 模型目录映射
-  - `gateway-binary.js` 二进制下载 + SHA256 校验 + 运行目录准备、`accounts.js` 账号开关
-  - `login.js` Node 版 OAuth 登录、`setup.js` `/wb2api-setup` 编排、`sse.js` / `zip.js` / `config.js` / `index.js`
+  - `proc.js` 子进程托管（定位可执行文件 → `/healthz` 探活 → spawn → 崩溃重启 → dispose 回收）
+  - `chat.js` LlmAdapter（请求组装 + SSE → StreamChunk）、`catalog.js` 模型目录映射
+  - `binary.js` 二进制下载 + SHA256 校验 + 运行目录准备、`credentials.js` 账号开关
+  - `authorize.js` Node 版 OAuth 登录、`bootstrap.js` `/wb2api-setup` 编排、`stream.js` / `zip.js` / `settings.js` / `index.js`
 - `lib/index.js` 把这份实现作为**子插件**挂载（`ctx.plugin(gatewayPlugin, config?.gateway ?? {})`），
   以下命令改由**本插件**注册：`/wb2api-setup`、`/wb2api-status`、`/wb2api-start`、
   `/wb2api-restart`、`/wb2api-login`、`/wb2api-account`。
@@ -25,8 +50,8 @@
   `backend/README.md`（校验值、重建方法）。
 - `resolveBinary()` 候选目录新增**包内 `backend/bin/`**（`new URL('../../backend/bin', import.meta.url)` 解析），
   优先级高于 `~/.dsh/wb2api/bin`，所以 `npm pack` 出去装到哪都能找到自带二进制。
-- 自动下载时的 Release 仓库指向本仓库：`lib/gw/gateway-binary.js` 的 `DEFAULT_RELEASE_REPO` 与
-  `lib/gw/config.js` 的 `binaryReleaseRepo` 都是 `Wei894348/dsh-wb2api`（自带二进制之后，下载只是兜底）。
+- 自动下载时的 Release 仓库指向本仓库：`lib/gw/binary.js` 的 `DEFAULT_RELEASE_REPO` 与
+  `lib/gw/settings.js` 的 `binaryReleaseRepo` 都是 `Wei894348/dsh-wb2api`（自带二进制之后，下载只是兜底）。
 
 **共存要求**
 

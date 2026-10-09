@@ -12,8 +12,8 @@ backend/
 
 插件怎么用它：
 
-- `lib/gw/gateway-supervisor.js` 负责它的生命周期（拉起 / 探活 / 崩溃重启 / 随 dsh 退出回收）；
-- `lib/gw/gateway-adapter.js` + `lib/gw/models.js` 把它的模型目录注册成 dsh 的 LLM provider。
+- `lib/gw/proc.js` 负责它的生命周期（拉起 / 探活 / 崩溃重启 / 随 dsh 退出回收）；
+- `lib/gw/chat.js` + `lib/gw/catalog.js` 把它的模型目录注册成 dsh 的 LLM provider。
 
 ## 当前这份二进制
 

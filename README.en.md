@@ -127,10 +127,10 @@ dsh-wb2api/                       ← repo root = npm package root (package.json
 │                                 (imports the sub-plugin at the top, mounts it via ctx.plugin at mountGateway)
 ├── lib/gw/                       gateway supervision + provider registration (12 .js files)
 │   ├── index.js                  sub-plugin entry: /wb2api-* commands, auto-start, status reporting
-│   ├── gateway-supervisor.js     child process: locate binary → /healthz probe → spawn → restart on crash → dispose
-│   ├── gateway-adapter.js        LlmAdapter: request assembly + SSE → StreamChunk
+│   ├── proc.js     child process: locate binary → /healthz probe → spawn → restart on crash → dispose
+│   ├── chat.js        LlmAdapter: request assembly + SSE → StreamChunk
 │   ├── models.js                 /v1/models → dsh model catalog mapping
-│   ├── gateway-binary.js         binary download + SHA256 verification + runtime dir prep
+│   ├── binary.js         binary download + SHA256 verification + runtime dir prep
 │   ├── accounts.js               account toggles (rename suffix under auths/)
 │   ├── login.js                  Node OAuth login
 │   ├── setup.js                  /wb2api-setup orchestration
@@ -210,7 +210,7 @@ dsh-wb2api/                       ← repo root = npm package root (package.json
 
 ## Where the gateway binary comes from
 
-`resolveBinary()` in `lib/gw/gateway-supervisor.js` tries these in order and uses the first hit:
+`resolveBinary()` in `lib/gw/proc.js` tries these in order and uses the first hit:
 
 | # | Location | Notes |
 |---|---|---|
@@ -222,7 +222,7 @@ dsh-wb2api/                       ← repo root = npm package root (package.json
 
 It only throws when every candidate misses, and the error lists every path it tried. Auto-download is off by
 default (`autoDownloadBinary: false`); when enabled, the release repository points at this repository
-(`DEFAULT_RELEASE_REPO` in `lib/gw/gateway-binary.js`, `binaryReleaseRepo` in `lib/gw/config.js`).
+(`DEFAULT_RELEASE_REPO` in `lib/gw/binary.js`, `binaryReleaseRepo` in `lib/gw/settings.js`).
 
 ---
 
@@ -245,7 +245,7 @@ listens on loopback only).
 ### Why the provider id is `workbuddy2api`
 
 The sub-plugin's identity name is `wb2api-gateway` (`export const name` in `lib/gw/index.js`), but the LLM
-provider id stays `PROVIDER = 'workbuddy2api'` (`lib/gw/config.js`) **on purpose**: dsh settings such as
+provider id stays `PROVIDER = 'workbuddy2api'` (`lib/gw/settings.js`) **on purpose**: dsh settings such as
 `agent-default-model.provider` reference that id, and renaming it would break existing model configurations.
 
 > Do **not** mount two plugins that register the same provider id in one profile — they collide with

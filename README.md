@@ -114,16 +114,20 @@ dsh-wb2api/                       ← 仓库根 = npm 包根（package.json 在�
 ├── cordis.patch.yml              插件注册补丁（insert 一行）
 ├── lib/index.js                  宿主半侧：15 条 /dsh-wb2api/* 路由 + 上游直连 + 任务引擎桥
 │                                 （顶部 import 子插件，底部 mountGateway 处 ctx.plugin(gatewayPlugin, …) 挂载）
-├── lib/gw/                       网关托管 + provider 注册（12 个 .js）
+├── lib/gw/                       网关托管 + provider 注册（13 个 .js）
 │   ├── index.js                  子插件入口：/wb2api-* 命令、启动时自拉起、状态汇报
-│   ├── gateway-supervisor.js     子进程托管：定位可执行文件 → /healthz 探活 → spawn → 崩溃重启 → dispose 回收
-│   ├── gateway-adapter.js        LlmAdapter 实现：请求组装 + SSE → StreamChunk
-│   ├── models.js                 /v1/models → dsh 模型目录映射
-│   ├── gateway-binary.js         二进制下载 + SHA256 校验 + 运行目录准备
-│   ├── accounts.js               账号开关（改 auths/ 下文件名后缀实现启停）
-│   ├── login.js                  Node 版 OAuth 登录
-│   ├── setup.js                  /wb2api-setup 编排
-│   └── sse.js / zip.js / config.js
+│   ├── settings.js               配置归一化与默认值、provider settings namespace
+│   ├── runtime.js                路径口径：运行目录 / cwd / 凭证目录 / 网关 config 生成
+│   ├── proc.js                   子进程托管：定位可执行文件 → /healthz 探活 → spawn → 崩溃重启 → 回收
+│   ├── chat.js                   LlmAdapter 实现：请求组装 + SSE → StreamChunk
+│   ├── stream.js                 SSE 帧解析与双超时（首帧 / 帧间）
+│   ├── catalog.js                /v1/models → dsh 模型目录映射（含 TTL 缓存与去重）
+│   ├── binary.js                 二进制下载 + SHA256 校验 + 原子落盘
+│   ├── archive.js                自带 ZIP 解压（无第三方依赖）
+│   ├── credentials.js            账号开关（改 auths/ 下文件名后缀实现启停）
+│   ├── authorize.js              Node 版 OAuth 登录与凭证落盘
+│   ├── bootstrap.js              /wb2api-setup 编排
+│   └── render.js                 状态/报告文案渲染（纯函数）
 ├── backend/                      网关二进制（随包发布，`files` 已收录）
 │   ├── bin/wb2a-server.exe       Windows amd64 可执行文件（SHA256 见 backend/README.md）
 │   ├── build-gateway.ps1         从 Go 源码 clone + go build 重建
@@ -199,7 +203,7 @@ dsh-wb2api/                       ← 仓库根 = npm 包根（package.json 在�
 
 ## 网关二进制从哪来
 
-`lib/gw/gateway-supervisor.js` 的 `resolveBinary()` 依次找，命中即用：
+`lib/gw/proc.js` 的 `resolveBinary()` 依次找，命中即用：
 
 | 顺序 | 位置 | 说明 |
 |---|---|---|
@@ -210,7 +214,7 @@ dsh-wb2api/                       ← 仓库根 = npm 包根（package.json 在�
 | 5 | `PATH` | 交给 `ctx.subprocess.resolveExecutable()`，可能已全局安装 |
 
 全部落空才抛错，错误消息会列出所有试过的路径。自动下载默认关闭（`autoDownloadBinary: false`），
-真要下载时 Release 仓库指向本仓库（`lib/gw/gateway-binary.js` 的 `DEFAULT_RELEASE_REPO`、`lib/gw/config.js` 的 `binaryReleaseRepo`）。
+真要下载时 Release 仓库指向本仓库（`lib/gw/binary.js` 的 `DEFAULT_RELEASE_REPO`、`lib/gw/settings.js` 的 `binaryReleaseRepo`）。
 
 ---
 
@@ -231,7 +235,7 @@ dsh-wb2api/                       ← 仓库根 = npm 包根（package.json 在�
 ### provider id 为什么叫 `workbuddy2api`
 
 子插件身份名是 `wb2api-gateway`（`lib/gw/index.js` 的 `export const name`），但 LLM provider 的 id 是
-`lib/gw/config.js` 里的 `PROVIDER = 'workbuddy2api'`，**故意没动**：dsh 的 `agent-default-model.provider`
+`lib/gw/settings.js` 里的 `PROVIDER = 'workbuddy2api'`，**故意没动**：dsh 的 `agent-default-model.provider`
 等设置引用这个 id，改名会打断现有模型配置。
 
 > 同一个 profile 里**不要同时挂两个注册同一 provider id 的插件** —— 会撞成 `DUPLICATE_ADAPTER`，宿主起不来。
