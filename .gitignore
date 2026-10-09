@@ -1,0 +1,18 @@
+# 依赖与打包产物
+node_modules/
+*.tgz
+*.tar.gz
+dist/
+
+# 凭证与运行态：**绝不入库**
+runtime/auths/
+runtime/config.json
+runtime/data/
+**/auths/*.json
+*.log
+
+# 本机路径相关的临时文件
+.wb_key.json
+wb-restart-check.log
+.DS_Store
+Thumbs.db

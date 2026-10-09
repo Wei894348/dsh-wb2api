@@ -1,0 +1,9 @@
+{
+  "admin": {
+    "enabled": true
+  },
+  "auth_dir": "./auths",
+  "state_file": "./data/state.json",
+  "listen": "127.0.0.1:7863",
+  "api_key": "<REDACTED-SEE-LIVE-CONFIG>"
+}

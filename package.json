@@ -1,0 +1,86 @@
+{
+  "name": "dsh-plugin-wb2api-ui",
+  "version": "1.4.0",
+  "description": "把本机 WorkBuddy / CodeBuddy 账号池接进 DeepSeek Harness：自托管网关进程并注册模型 provider、Web 设置面板（网关状态 / 每账号积分 / OAuth 登录 / 凭证导入 / 账号管理）、成长任务自动化引擎（一键确认待办 → 执行 → 达标自动领奖）。 · Bring a local WorkBuddy / CodeBuddy account pool into DeepSeek Harness: a self-supervised gateway process with model-provider registration, a settings panel, and a growth-task automation engine.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Wei894348 (https://github.com/Wei894348)",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "workbuddy2api",
+    "workbuddy",
+    "codebuddy",
+    "gateway",
+    "llm-provider",
+    "supervisor",
+    "settings-panel",
+    "autotask",
+    "credits"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Wei894348/dsh-wb2api.git"
+  },
+  "homepage": "https://github.com/Wei894348/dsh-wb2api#readme",
+  "bugs": {
+    "url": "https://github.com/Wei894348/dsh-wb2api/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./client.js"
+    },
+    "./engine": {
+      "default": "./engine/wb_tasks.mjs"
+    },
+    "./gateway": {
+      "default": "./lib/gw/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "client.js",
+    "engine",
+    "backend",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "docs",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-commands": ">=0.1.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-llm": ">=0.1.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-subprocess": ">=0.1.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/schemastery": "^3.18.0"
+  }
+}

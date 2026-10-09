@@ -1,0 +1,5 @@
+# dsh-plugin-wb2api-ui bundle patch：把本插件插入 profile 的层栈。
+# name 必须与真实安装的包名一致 —— 加载器按 name 导入该包。
+- insert:
+    - id: wb2api-ui
+      name: 'dsh-plugin-wb2api-ui'
