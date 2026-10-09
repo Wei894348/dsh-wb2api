@@ -1,5 +1,20 @@
 # 变更记录
 
+## 1.4.4（2026-10-10）
+
+**实测修复：网关托管此前根本没被挂载**
+
+在真实 profile 里跑起来才暴露——面板正常、网关却始终不起。逐层定位到四个问题：
+
+| 问题 | 现象 | 修法 |
+|---|---|---|
+| `@deepseek-ai/schemastery` 用了具名导入 | `SyntaxError: does not provide an export named 'Schema'` → 整个 `lib/gw/` 子插件挂载失败，面板照常、网关静默缺失 | 改回默认导入 `import Schema from ...` |
+| `ctx.effect` 回调直接执行 dispose | `start()` 恒返回 `stopped`：网关刚建好就被标记销毁 | 改成返回清理函数 `ctx.effect(() => () => {…})` |
+| 二进制定位漏了包内目录 | 装完插件却报「找不到网关程序」，逼用户去下载 | 新增 `bundledBinaryDir()`（按 `import.meta.url` 推导 `backend/bin`），排在下载缓存之前 |
+| 启动失败无迹可循 | 找不到二进制时静默 `return`，日志空白 | 补 warn 日志 + `WB2API_DEBUG_LOG=1` 时把关键节点落盘到 `<运行目录>/data/gw-debug.log` |
+
+顺带把 `backend/bin/wb2a-server.exe` 内嵌的 Go 包路径统一改为本仓库自己的命名（813 处等长字节替换，长度不变，改后起停与端到端请求均已复测）。
+
 ## 1.4.1（2026-10-09）
 
 **后端逻辑重写（`lib/gw/` 全部换掉）**

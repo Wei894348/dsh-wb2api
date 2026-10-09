@@ -8,7 +8,7 @@
     pwsh -File build-gateway.ps1 -SourceRepo <源码仓库地址或本地路径>
                                                   # 克隆到 .build/ 并交叉编译到 backend/bin
     pwsh -File build-gateway.ps1 -SourceRepo <...> -OutDir .\dist   # 换个输出目录
-    pwsh -File build-gateway.ps1 -SourceRepo <...> -KeepSource      # 保留源码目录（默认复用 .build/upstream）
+    pwsh -File build-gateway.ps1 -SourceRepo <...> -KeepSource      # 保留源码目录（默认复用 .build/src）
 
   要求：Go 1.22+（`go version` 能看到即可）。首次会 git clone + 下载依赖，需要网络。
 #>
@@ -32,7 +32,7 @@ Write-Host "go: $($go.Source)" -ForegroundColor Cyan
 
 # 2. 取源码（复用已有克隆，只拉更新）
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
-$src = Join-Path $WorkDir 'upstream'
+$src = Join-Path $WorkDir 'src'
 if (Test-Path (Join-Path $src '.git')) {
   Write-Host "复用已有源码：$src" -ForegroundColor DarkGray
   git -C $src fetch --depth 1 origin
@@ -49,7 +49,7 @@ $env:CGO_ENABLED = '0'
 $env:GOOS = 'windows'
 $env:GOARCH = 'amd64'
 Write-Host "构建 → $out" -ForegroundColor Cyan
-# 上游入口在 cmd/server（若上游改过目录布局，改这一行即可）。
+# 网关主包入口在 cmd/server（若源码目录布局有变，改这一行即可）。
 & go build -C $src -trimpath -ldflags '-s -w' -o $out ./cmd/server
 
 # 4. 指纹 + 与自带那份比对
@@ -63,7 +63,7 @@ $bundled = Join-Path $PSScriptRoot 'bin\wb2a-server.exe'
 if (Test-Path -LiteralPath $bundled) {
   $bundledHash = (Get-FileHash -LiteralPath $bundled -Algorithm SHA256).Hash
   if ($bundledHash -eq $hash) { Write-Host "  与自带那份一致 ✔" -ForegroundColor Green }
-  else { Write-Host "  与自带那份不同（自带的 SHA256: $bundledHash）—— 上游可能已更新，或有构建差异" -ForegroundColor Yellow }
+  else { Write-Host "  与自带那份不同（自带的 SHA256: $bundledHash）—— 源码可能有更新，或有构建差异" -ForegroundColor Yellow }
 }
 
 if (-not $KeepSource) { Write-Host "（源码留在 $src，想清理直接删该目录）" -ForegroundColor DarkGray }
