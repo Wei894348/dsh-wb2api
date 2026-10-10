@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 560" width="1000" height="560" role="img" aria-label="WorkBuddy 反代 设置面板">
+  <defs>
+    <linearGradient id="d-head" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4c8dff"/>
+      <stop offset="1" stop-color="#7a5cff"/>
+    </linearGradient>
+  </defs>
+  <rect width="1000" height="560" rx="14" fill="#f5f6f8"/>
+  <rect x="0" y="0" width="1000" height="44" rx="14" fill="#ffffff"/>
+  <rect x="0" y="30" width="1000" height="14" fill="#ffffff"/>
+  <circle cx="26" cy="22" r="6" fill="#ff5f57"/>
+  <circle cx="48" cy="22" r="6" fill="#febc2e"/>
+  <circle cx="70" cy="22" r="6" fill="#28c840"/>
+  <text x="500" y="27" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13" fill="#8b8f96">dsh web · 设置 → 插件 → 插件配置</text>
+
+  <!-- 左侧导航 -->
+  <rect x="0" y="44" width="220" height="516" fill="#fbfbfc"/>
+  <line x1="220" y1="44" x2="220" y2="560" stroke="#e8eaee" stroke-width="1"/>
+  <text x="24" y="84" font-family="system-ui, sans-serif" font-size="13" fill="#a0a4ab">设置</text>
+  <rect x="12" y="98" width="196" height="34" rx="8" fill="#eef1f6"/>
+  <text x="28" y="120" font-family="system-ui, sans-serif" font-size="14" fill="#3d4045">插件</text>
+  <rect x="12" y="138" width="196" height="34" rx="8" fill="#e6ecf9"/>
+  <text x="28" y="160" font-family="system-ui, sans-serif" font-size="14" fill="#2f5fe0">插件配置</text>
+  <text x="40" y="192" font-family="system-ui, sans-serif" font-size="13" fill="#5b6068">WorkBuddy 反代</text>
+  <text x="40" y="222" font-family="system-ui, sans-serif" font-size="13" fill="#a0a4ab">dshmarket</text>
+  <text x="40" y="252" font-family="system-ui, sans-serif" font-size="13" fill="#a0a4ab">小鲸鱼记账</text>
+
+  <!-- 主面板 -->
+  <rect x="248" y="72" width="728" height="452" rx="12" fill="#ffffff" stroke="#e8eaee"/>
+  <rect x="248" y="72" width="728" height="6" rx="3" fill="url(#d-head)"/>
+  <circle cx="286" cy="112" r="13" fill="#4c8dff"/>
+  <path d="M280 112 H292 M288 108 L292 112 L288 116" stroke="#fff" stroke-width="2" fill="none" stroke-linecap="round"/>
+  <text x="312" y="110" font-family="system-ui, sans-serif" font-size="17" font-weight="600" fill="#23262b">WorkBuddy 反代</text>
+  <text x="312" y="130" font-family="system-ui, sans-serif" font-size="12.5" fill="#8b8f96">workbuddy2api · 网关托管 + 账号池 + 成长任务</text>
+
+  <line x1="272" y1="158" x2="952" y2="158" stroke="#eef0f3"/>
+
+  <!-- 状态行 -->
+  <circle cx="288" cy="188" r="5" fill="#22a06b"/>
+  <text x="302" y="193" font-family="system-ui, sans-serif" font-size="13.5" fill="#3d4045">网关运行中</text>
+  <text x="392" y="193" font-family="system-ui, sans-serif" font-size="13.5" fill="#8b8f96">127.0.0.1:7863</text>
+  <text x="520" y="193" font-family="system-ui, sans-serif" font-size="13.5" fill="#8b8f96">· 模型 76</text>
+  <text x="612" y="193" font-family="system-ui, sans-serif" font-size="13.5" fill="#8b8f96">· 账号 6</text>
+
+  <!-- 账号表 -->
+  <rect x="272" y="216" width="680" height="212" rx="8" fill="#fafbfc" stroke="#eef0f3"/>
+  <text x="292" y="244" font-family="system-ui, sans-serif" font-size="12" fill="#a0a4ab">账号</text>
+  <text x="540" y="244" font-family="system-ui, sans-serif" font-size="12" fill="#a0a4ab">剩余积分</text>
+  <text x="700" y="244" font-family="system-ui, sans-serif" font-size="12" fill="#a0a4ab">今日</text>
+  <text x="828" y="244" font-family="system-ui, sans-serif" font-size="12" fill="#a0a4ab">状态</text>
+  <line x1="292" y1="256" x2="932" y2="256" stroke="#eef0f3"/>
+
+  <text x="292" y="284" font-family="system-ui, sans-serif" font-size="13" fill="#3d4045">账号 1 · a5a80660</text>
+  <text x="540" y="284" font-family="system-ui, sans-serif" font-size="13" fill="#3d4045">2,480.20</text>
+  <text x="700" y="284" font-family="system-ui, sans-serif" font-size="13" fill="#8b8f96">+12</text>
+  <text x="828" y="284" font-family="system-ui, sans-serif" font-size="13" fill="#22a06b">可用</text>
+
+  <text x="292" y="312" font-family="system-ui, sans-serif" font-size="13" fill="#3d4045">账号 2 · 2e11fcee</text>
+  <text x="540" y="312" font-family="system-ui, sans-serif" font-size="13" fill="#3d4045">3,015.55</text>
+  <text x="700" y="312" font-family="system-ui, sans-serif" font-size="13" fill="#8b8f96">+8</text>
+  <text x="828" y="312" font-family="system-ui, sans-serif" font-size="13" fill="#22a06b">可用</text>
+
+  <text x="292" y="340" font-family="system-ui, sans-serif" font-size="13" fill="#3d4045">账号 3 · 3c05c2ad</text>
+  <text x="540" y="340" font-family="system-ui, sans-serif" font-size="13" fill="#3d4045">1,872.10</text>
+  <text x="700" y="340" font-family="system-ui, sans-serif" font-size="13" fill="#8b8f96">+6</text>
+  <text x="828" y="340" font-family="system-ui, sans-serif" font-size="13" fill="#22a06b">可用</text>
+
+  <text x="292" y="368" font-family="system-ui, sans-serif" font-size="13" fill="#3d4045">账号 4 · 5a95afd6</text>
+  <text x="540" y="368" font-family="system-ui, sans-serif" font-size="13" fill="#3d4045">2,104.00</text>
+  <text x="700" y="368" font-family="system-ui, sans-serif" font-size="13" fill="#8b8f96">+4</text>
+  <text x="828" y="368" font-family="system-ui, sans-serif" font-size="13" fill="#c78a1a">停用</text>
+
+  <text x="292" y="396" font-family="system-ui, sans-serif" font-size="13" fill="#3d4045">账号 5 · 5d4c7de1</text>
+  <text x="540" y="396" font-family="system-ui, sans-serif" font-size="13" fill="#3d4045">4,618.00</text>
+  <text x="700" y="396" font-family="system-ui, sans-serif" font-size="13" fill="#8b8f96">+15</text>
+  <text x="828" y="396" font-family="system-ui, sans-serif" font-size="13" fill="#22a06b">可用</text>
+
+  <!-- 底部操作 -->
+  <rect x="272" y="444" width="164" height="40" rx="9" fill="#2f5fe0"/>
+  <text x="354" y="469" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" fill="#ffffff">一键做任务</text>
+  <rect x="448" y="444" width="140" height="40" rx="9" fill="#eef1f6"/>
+  <text x="518" y="469" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" fill="#3d4045">签到 / 保活</text>
+  <rect x="600" y="444" width="140" height="40" rx="9" fill="#eef1f6"/>
+  <text x="670" y="469" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" fill="#3d4045">OAuth 登录</text>
+  <rect x="752" y="444" width="140" height="40" rx="9" fill="#eef1f6"/>
+  <text x="822" y="469" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" fill="#3d4045">导入凭证</text>
+</svg>

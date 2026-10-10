@@ -1,5 +1,34 @@
 # 变更记录
 
+## 1.5.0（2026-10-10）
+
+**对齐插件市场惯例：README 与代码布局重排**
+
+参照社区插件（`dshmarket` 等）的 README 与目录组织，把对外观感与文件布局统一到市场常见形态。功能与对外契约不变。
+
+**README**
+
+| 位置 | 改法 |
+|---|---|
+| 头部 | 居中 logo + 包名标题 + `[English](…) \| 中文` 语言切换 + npm/license/node 徽章 + 一句话简介 + 面板截图 |
+| 功能章 | 「能力总览」表格 → 「你会得到」加粗列表（市场常见写法），每条一句话说清用户拿到什么 |
+| 新增章 | 「安全」——凭证不出本机 / 密钥不入仓库 / 二进制校验 / 补丁可读 / 单飞锁 |
+| 目录结构 | 按新布局重画（`client/`、`locale/`、`assets/`、ASCII 化的 docs 文件名） |
+
+`README.en.md` 同结构同章节；其 `lib/gw/` 清单修正为 13 个新模块（旧版列的还是 1.4.0 时期的 12 个文件名）。
+
+**代码布局**
+
+| 旧 | 新 | 说明 |
+|---|---|---|
+| `client.js`（仓库根） | `client/client.js` | 与市场插件一致，浏览器半侧收进 `client/`；`exports["./client"]`、`files`、`sync.ps1`、冒烟脚本默认路径同步 |
+| `docs/插件面板说明.md` | `docs/PANEL.md` | 非 ASCII 文件名 → ASCII |
+| `docs/逻辑总览.md` | `docs/ARCHITECTURE.md` | 同上 |
+| — | `locale/{zh,en}.json` | 面板元信息（title / description），新增 `exports["./locale/*.json"]` |
+| — | `assets/{logo.svg,demo.svg}` | README 用图，随包发布 |
+
+`package.json` 随之更新：`exports["./client"]` → `./client/client.js`、新增 `./locale/*.json`、`files` 换成 `client` / `locale` / `assets`。装法不变，`dsh plugin add` 照旧。
+
 ## 1.4.4（2026-10-10）
 
 **实测修复：网关托管此前根本没被挂载**

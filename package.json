@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-wb2api-ui",
-  "version": "1.4.4",
+  "version": "1.5.0",
   "description": "把本机 WorkBuddy / CodeBuddy 账号池接进 DeepSeek Harness：自托管网关进程并注册模型 provider、Web 设置面板（网关状态 / 每账号积分 / OAuth 登录 / 凭证导入 / 账号管理）、成长任务自动化引擎（一键确认待办 → 执行 → 达标自动领奖）。 · Bring a local WorkBuddy / CodeBuddy account pool into DeepSeek Harness: a self-supervised gateway process with model-provider registration, a settings panel, and a growth-task automation engine.",
   "type": "module",
   "license": "MIT",
@@ -40,7 +40,7 @@
       "default": "./lib/index.js"
     },
     "./client": {
-      "default": "./client.js"
+      "default": "./client/client.js"
     },
     "./engine": {
       "default": "./engine/wb_tasks.mjs"
@@ -48,12 +48,15 @@
     "./gateway": {
       "default": "./lib/gw/index.js"
     },
+    "./locale/*.json": "./locale/*.json",
     "./package.json": "./package.json"
   },
   "files": [
     "lib",
-    "client.js",
+    "client",
     "engine",
+    "locale",
+    "assets",
     "backend",
     "cordis.patch.yml",
     "README.md",

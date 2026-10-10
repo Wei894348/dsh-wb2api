@@ -1,22 +1,29 @@
+<p align="center">
+  <img src="assets/logo.svg" width="96" alt="dsh-plugin-wb2api-ui logo">
+</p>
+
 # dsh-plugin-wb2api-ui
+
+[English](README.en.md) | 中文
+
+[![npm](https://img.shields.io/npm/v/dsh-plugin-wb2api-ui)](https://www.npmjs.com/package/dsh-plugin-wb2api-ui)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![node](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](package.json)
 
 把本机 WorkBuddy / CodeBuddy 账号池接进 DeepSeek Harness —— 一个包三件事：**托管网关进程并注册模型 provider**、**Web 设置面板**、**成长任务自动化引擎**。
 
-> 装一个插件 → 有模型服务、有面板、能一键做任务。网关二进制随包发布，装到哪都能跑。
+装一个插件 → 有模型服务、有面板、能一键做任务。网关二进制随包发布，装到哪都能跑。
 
----
+![设置面板](assets/demo.svg)
 
-## 能力总览
+## 你会得到
 
-| 能力 | 位置 | 说明 |
-|---|---|---|
-| 网关托管 + 模型 provider 注册 | `lib/gw/` | 拉起 / 探活 / 崩溃重启 / 随 dsh 退出回收 `wb2a-server`，并把它的模型目录注册成 dsh 的 LLM provider |
-| 网关本体 | `backend/bin/wb2a-server.exe` | Windows amd64，随包发布；重建脚本 `backend/build-gateway.ps1` |
-| 设置面板 | `client.js` + `lib/index.js` | dsh 设置里的「WorkBuddy 反代」分区：网关状态、每账号积分、OAuth 登录、凭证导入、账号启停 |
-| 任务自动化引擎 | `engine/` | 纯 Node、零第三方依赖：确认待办 → 两轮执行 → 达标自动领奖 |
-| 运维脚本 | `tools/` | 手工跑的签到 / 导入 / 池健康检查 / 面板冒烟 |
-
----
+- **模型服务**——插件自己托管 `wb2a-server` 网关（拉起 / 探活 / 崩溃重启 / 随 dsh 退出回收），把它的模型目录注册成 dsh 的 LLM provider；dsh 里选模型即可用，不用另配服务
+- **随包网关**——`backend/bin/wb2a-server.exe`（Windows amd64）跟着包走，定位顺序里包内那份优先级最高，`dsh plugin add` 装到哪个 profile 都能找到
+- **设置面板**——dsh 设置里的「WorkBuddy 反代」分区：网关状态、每账号剩余积分、OAuth 登录、凭证导入、账号启停，一屏管完
+- **一键做任务**——确认待办 → 两轮执行 → 达标自动领奖，全程在面板上看着跑
+- **零第三方依赖**——网关托管、ZIP 解压、任务引擎全是纯 Node；不拉依赖树，不动构建链
+- **凭证不出本机**——账号池只读本机运行目录，`accessToken` / `refreshToken` 与网关 `api_key` 永不入仓库
 
 ## 安装
 
@@ -53,8 +60,6 @@ dsh plugin --profile web list                                  # 依赖在不在
 dsh --profile web --dump-config | Select-String wb2api-ui      # 组合树里应出现 - id: wb2api-ui
 ```
 
----
-
 ## 快速开始
 
 ```powershell
@@ -74,14 +79,12 @@ node engine/wb_tasks.mjs auto all --passes 2  # 执行 + 自动领奖
 node engine/wb_tasks.mjs credits              # 各账号积分
 ```
 
----
-
 ## 组件拓扑
 
 ```
                      ┌──────────────────── dsh 进程（宿主半侧，启动时加载一次）────────────────────┐
    浏览器 GUI  ──────►  dsh-plugin-wb2api-ui  ──►  /dsh-wb2api/* 路由  ──┐                            │
-   (settings.section)   client.js（热替换 500ms）   lib/index.js         │                            │
+   (settings.section)   client/client.js（热替换 500ms）  lib/index.js    │                            │
                      └───────────────────────────────────────────────────┼────────────────────────────┘
                                                                          │
         ┌────────────────────────────────────────────────────────────────┴──────────────────────┐
@@ -90,7 +93,7 @@ node engine/wb_tasks.mjs credits              # 各账号积分
         │     `workbuddy2api`；命令 /wb2api-setup · -status · -start · -restart · -login · -account  │
         │  ② 任务自动化引擎（engine/，纯 Node，无第三方依赖）                                        │
         │     scanPendingTasks（确认待办）→ runAutomation（两轮执行）→ 达标自动领奖                  │
-        │  ③ 设置面板（client.js）：网关状态 / 积分 / OAuth 登录 / 凭证导入 / 账号启停               │
+        │  ③ 设置面板（client/client.js）：网关状态 / 积分 / OAuth 登录 / 凭证导入 / 账号启停        │
         └───────┬───────────────────────────────────┬──────────────────────────────┬─────────────┘
                 │ spawn / GET /healthz              │                              │
     ┌───────────▼────────────────────┐   ┌──────────▼────────────────────┐   ┌─────▼──────────────────┐
@@ -104,35 +107,35 @@ node engine/wb_tasks.mjs credits              # 各账号积分
 
 网关与任务引擎共用**同一个账号池目录** `~/.dsh/wb2api/auths/`：网关用它对外提供模型，引擎用它做任务。改这个目录，两边同时生效。
 
----
-
 ## 目录结构
 
 ```
 dsh-wb2api/                       ← 仓库根 = npm 包根（package.json 在这里）
 ├── package.json                  清单：main / exports / files / dsh.bundle / dsh.client
 ├── cordis.patch.yml              插件注册补丁（insert 一行）
-├── lib/index.js                  宿主半侧：15 条 /dsh-wb2api/* 路由 + 上游直连 + 任务引擎桥
-│                                 （顶部 import 子插件，底部 mountGateway 处 ctx.plugin(gatewayPlugin, …) 挂载）
-├── lib/gw/                       网关托管 + provider 注册（13 个 .js）
-│   ├── index.js                  子插件入口：/wb2api-* 命令、启动时自拉起、状态汇报
-│   ├── settings.js               配置归一化与默认值、provider settings namespace
-│   ├── runtime.js                路径口径：运行目录 / cwd / 凭证目录 / 网关 config 生成
-│   ├── proc.js                   子进程托管：定位可执行文件 → /healthz 探活 → spawn → 崩溃重启 → 回收
-│   ├── chat.js                   LlmAdapter 实现：请求组装 + SSE → StreamChunk
-│   ├── stream.js                 SSE 帧解析与双超时（首帧 / 帧间）
-│   ├── catalog.js                /v1/models → dsh 模型目录映射（含 TTL 缓存与去重）
-│   ├── binary.js                 二进制下载 + SHA256 校验 + 原子落盘
-│   ├── archive.js                自带 ZIP 解压（无第三方依赖）
-│   ├── credentials.js            账号开关（改 auths/ 下文件名后缀实现启停）
-│   ├── authorize.js              Node 版 OAuth 登录与凭证落盘
-│   ├── bootstrap.js              /wb2api-setup 编排
-│   └── render.js                 状态/报告文案渲染（纯函数）
+├── lib/                          宿主半侧（node 侧）
+│   ├── index.js                  15 条 /dsh-wb2api/* 路由 + 上游直连 + 任务引擎桥
+│   │                             （顶部 import 子插件，底部 mountGateway 处 ctx.plugin(gatewayPlugin, …) 挂载）
+│   └── gw/                       网关托管 + provider 注册（13 个 .js）
+│       ├── index.js              子插件入口：/wb2api-* 命令、启动时自拉起、状态汇报
+│       ├── settings.js           配置归一化与默认值、provider settings namespace
+│       ├── runtime.js            路径口径：运行目录 / cwd / 凭证目录 / 网关 config 生成
+│       ├── proc.js               子进程托管：定位可执行文件 → /healthz 探活 → spawn → 崩溃重启 → 回收
+│       ├── chat.js               LlmAdapter 实现：请求组装 + SSE → StreamChunk
+│       ├── stream.js             SSE 帧解析与双超时（首帧 / 帧间）
+│       ├── catalog.js            /v1/models → dsh 模型目录映射（含 TTL 缓存与去重）
+│       ├── binary.js             二进制下载 + SHA256 校验 + 原子落盘
+│       ├── archive.js            自带 ZIP 解压（无第三方依赖）
+│       ├── credentials.js        账号开关（改 auths/ 下文件名后缀实现启停）
+│       ├── authorize.js          Node 版 OAuth 登录与凭证落盘
+│       ├── bootstrap.js          /wb2api-setup 编排
+│       └── render.js             状态/报告文案渲染（纯函数）
+├── client/                       浏览器半侧（web 侧）
+│   └── client.js                 设置分区卡片（手写 __ModuleLoader__ factory，无构建）
 ├── backend/                      网关二进制（随包发布，`files` 已收录）
 │   ├── bin/wb2a-server.exe       Windows amd64 可执行文件（SHA256 见 backend/README.md）
 │   ├── build-gateway.ps1         从 Go 源码 clone + go build 重建
 │   └── README.md                 二进制校验值、重建方法
-├── client.js                     浏览器半侧：设置分区卡片（手写 __ModuleLoader__ factory，无构建）
 ├── engine/                       任务自动化引擎（包内自带，装到哪都跟着走）
 │   ├── wb_tasks.mjs              CLI：list / scan / auto / credits
 │   └── wb_up/
@@ -145,25 +148,29 @@ dsh-wb2api/                       ← 仓库根 = npm 包根（package.json 在�
 │       ├── backend.mjs           动作层用的 api 门面
 │       ├── store.mjs             凭证读写（读 ~/.dsh/wb2api/auths）
 │       └── run.mjs               编排：扫描 → 两轮执行 → 自动领奖 + 单飞锁
+├── locale/                       面板文案与元信息（zh / en）
+│   ├── zh.json
+│   └── en.json
+├── assets/                       README 用图
+│   ├── logo.svg
+│   └── demo.svg
 ├── tools/                        运维脚本（手动跑，不经插件）
 │   ├── wb_import.mjs             把桌面端当前登录态导入账号池（解 $wbEncrypted 信封）
 │   ├── wb_daily.mjs              签到 / 领已完成任务（--tasks 才跑任务引擎，默认不跑）
 │   ├── wb_checkin.mjs            单账号签到 + 验 token
 │   ├── wb_pooltest.mjs           发几发请求看账号池谁在干活
-│   └── wb_client_smoke.mjs       client.js 的离线渲染冒烟（最小 React 替身 + 哑 DOM）
+│   └── wb_client_smoke.mjs       client/client.js 的离线渲染冒烟（最小 React 替身 + 哑 DOM）
 ├── runtime/
 │   ├── config.example.json       网关配置模板（api_key 是占位符）
 │   └── anthropic_bridge.py       把网关包成 Anthropic /v1/messages 的桥（可选用）
 ├── docs/
-│   ├── 逻辑总览.md               上游通道、任务动作、计分与领奖语义、凭证解密、网关托管、排障
-│   └── 插件面板说明.md           面板功能与安装说明
+│   ├── ARCHITECTURE.md           上游通道、任务动作、计分与领奖语义、凭证解密、网关托管、排障
+│   └── PANEL.md                  面板功能与安装说明
 ├── sync.ps1                      现场 ↔ 存档 同步（默认从现场刷新）
 ├── CHANGELOG.md
 ├── LICENSE
 └── .gitignore
 ```
-
----
 
 ## 斜杠命令
 
@@ -174,8 +181,6 @@ dsh-wb2api/                       ← 仓库根 = npm 包根（package.json 在�
 | `/wb2api-start` / `/wb2api-restart` | 拉起 / 重启受管网关进程 |
 | `/wb2api-login` | Node 版 OAuth 登录（`cn` / `global`） |
 | `/wb2api-account` | 账号开关（`auto` / 序号 / uid 前缀） |
-
----
 
 ## 宿主路由表（`/dsh-wb2api/*`，走 dsh 自己的端口，默认 3080）
 
@@ -199,8 +204,6 @@ dsh-wb2api/                       ← 仓库根 = npm 包根（package.json 在�
 
 `tasks/run` 的请求体（都可省）：`{ uid?: "<前缀>", only?: ["<task_code>"], passes?: 1-4 }`。
 
----
-
 ## 网关二进制从哪来
 
 `lib/gw/proc.js` 的 `resolveBinary()` 依次找，命中即用：
@@ -215,8 +218,6 @@ dsh-wb2api/                       ← 仓库根 = npm 包根（package.json 在�
 
 全部落空才抛错，错误消息会列出所有试过的路径。自动下载默认关闭（`autoDownloadBinary: false`），
 真要下载时 Release 仓库指向本仓库（`lib/gw/binary.js` 的 `DEFAULT_RELEASE_REPO`、`lib/gw/settings.js` 的 `binaryReleaseRepo`）。
-
----
 
 ## 运行目录与数据
 
@@ -240,7 +241,13 @@ dsh-wb2api/                       ← 仓库根 = npm 包根（package.json 在�
 
 > 同一个 profile 里**不要同时挂两个注册同一 provider id 的插件** —— 会撞成 `DUPLICATE_ADAPTER`，宿主起不来。
 
----
+## 安全
+
+- **凭证只在本机流转**：账号池读 `~/.dsh/wb2api/auths/`，网关只监听回环（`127.0.0.1:7863`）；`/healthz` 免鉴权但不暴露账号信息
+- **密钥不入仓库**：`auths/` 里的 `accessToken` / `refreshToken` 与 `config.json` 的 `api_key` 被 `.gitignore` 挡住，`runtime/config.example.json` 里是掩码占位
+- **二进制有校验**：`lib/gw/binary.js` 下载后做 SHA256 校验再原子落盘；随包发布的那份校验值记在 `backend/README.md`
+- **注册补丁可读**：`cordis.patch.yml` 只有一行 `insert`，写清了插件 id 与包名，没有隐藏注入
+- **任务引擎有单飞锁**：真花钱的动作（专家链）不会并发重跑（`~/.dsh/wb2api/data/wb-tasks.lock`，20 分钟自动失效）
 
 ## 自动化开关（当前状态）
 
@@ -250,8 +257,6 @@ dsh-wb2api/                       ← 仓库根 = npm 包根（package.json 在�
 | 面板打开时的自动签到 | 开（每天一次） | `WB2API_NO_AUTO_ACTIVITY=1` 可关 |
 | Windows 计划任务 | **已全部删除** | `wb2api-tasks-night` / `-dawn` / `dsh-wb2api-daily` 都已移除 |
 | 自备的签到计划任务（如每天 08:30 打 `/checkin`） | 保留 | 只签到 + 领已完成任务，**不碰任务引擎** |
-
----
 
 ## 开发：现场 vs 本仓库
 
@@ -274,9 +279,7 @@ pwsh -File sync.ps1 -WhatIfOnly      # 只看会动哪些文件
 
 > `auths/` 里的 accessToken / refreshToken 与网关 `config.json` 的 api_key **永不进仓库**（`.gitignore` 已挡）。
 
-浏览器半侧 `client.js` 是每 500ms 热替换的，改完刷新页面即可；宿主半侧 `lib/index.js` **必须重启 dsh**。
-
----
+浏览器半侧 `client/client.js` 是每 500ms 热替换的，改完刷新页面即可；宿主半侧 `lib/index.js` **必须重启 dsh**。
 
 ## 已知坑（都是实测踩出来的）
 
@@ -295,8 +298,6 @@ pwsh -File sync.ps1 -WhatIfOnly      # 只看会动哪些文件
    （`dsh-client-connection / runtime / ui-settings / ui-slots / locale`），跨大版本升级后要复核。
 10. **provider id 唯一**：同一 profile 里两个插件注册同一个 provider id 会 `DUPLICATE_ADAPTER`，宿主起不来。
 
----
-
 ## 排障
 
 | 现象 | 先看哪里 |
@@ -310,8 +311,6 @@ pwsh -File sync.ps1 -WhatIfOnly      # 只看会动哪些文件
 | 状态显示网关「运行中」但没模型 | 探活只证端口通，`healthy` 才代表有可用账号 |
 | dsh 启动报 `DUPLICATE_ADAPTER` | 该 profile 里挂了两个注册同一 provider id 的插件，移除其中一个后重启 |
 
----
-
 ## 打包与发布
 
 ```powershell
@@ -322,8 +321,6 @@ git push -u origin main
 ```
 
 上传前复查：`git status` 里**不能有** `auths/`、`config.json`、`*.log`、`*.tgz`、`node_modules/`。
-
----
 
 ## 许可
 

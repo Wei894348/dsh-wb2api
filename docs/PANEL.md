@@ -5,7 +5,7 @@
 
 ## 面板与网关的关系
 
-| | 网关（`lib/gw/` + `backend/bin/`） | 面板（`client.js` + 宿主路由） |
+| | 网关（`lib/gw/` + `backend/bin/`） | 面板（`client/client.js` + 宿主路由） |
 |---|---|---|
 | 职责 | 注册 provider 路由、托管网关进程、提供 `/wb2api-*` 斜杠命令 | 只加一块设置面板 |
 | 进程 | 启停网关 | **不碰进程**，避免抢端口 |
@@ -74,7 +74,7 @@ node "<工具目录>/probe_wb2api_credits.mjs" --raw    # 附带包明细
 | 顶层数组 | 逐项导入，单个失败不影响其余，返回值里逐条列出成功项 |
 
 **没走面板也不要紧**：`lib/index.js` 属于 host 半侧，改动要重启 dsh 才生效
-（只有 `client.js` 享受 HMR）。所以配了同一条通道的 CLI：
+（只有 `client/client.js` 享受 HMR）。所以配了同一条通道的 CLI：
 
 ```bash
 node "<工具目录>/import_wb2api_accounts.mjs" "<账号导出>.json"            # 写入
@@ -103,7 +103,8 @@ OAuth 还是上传 JSON，新账号 5 秒内自动进池。
   ├─ package.json           dsh.bundle.patch + dsh.client.platform=web
   ├─ cordis.patch.yml       把自己的 host 行插进 profile
   ├─ lib/index.js           node 半侧：/dsh-wb2api/* 路由
-  └─ client.js              浏览器半侧：settings.section 面板
+  └─ client/
+      └─ client.js          浏览器半侧：settings.section 面板
 ~/.dsh/profiles/web/node_modules/dsh-plugin-wb2api-ui   ← junction 指向上面的目录
 ```
 
@@ -127,7 +128,7 @@ dsh --profile web --dump-config | grep -A2 wb2api-ui
 
 装完**重启 dsh**（新增/移除插件会改启动图，必须重启才生效），设置里就会出现「WorkBuddy 反代」。
 
-> **但改本插件的 `client.js` 不用重启**：组合里有 `@deepseek-ai/dsh-client-hmr`，
+> **但改本插件的 `client/client.js` 不用重启**：组合里有 `@deepseek-ai/dsh-client-hmr`，
 > 它每 500ms `stat` 一次每个插件的 client bundle，文件一变就重算 rev 并通过
 > `/plugins/events` SSE 让浏览器原地重挂本插件 —— 存盘等半秒即可，不刷新页面、不丢会话。
 > bundle 响应是 `cache-control: immutable`，被缓存挡住时用 `Ctrl+Shift+R`。
@@ -206,7 +207,7 @@ color:      var(--dsw-alias-label-primary-foreground)     // 暗色下是近黑
 
 ### 4. client 半侧热替换，host 半侧不热替换
 
-改 `client.js` 存盘半秒就被 HMR 送进浏览器（页面不刷新、会话不丢）；改 `lib/index.js`
+改 `client/client.js` 存盘半秒就被 HMR 送进浏览器（页面不刷新、会话不丢）；改 `lib/index.js`
 **不会** —— host 半侧活在 dsh 的 node 进程里，只有重启 dsh 才重新加载。
 
 这个不对称极易误判：host 逻辑改完，在面板上照旧操作走的还是旧代码，看起来像「修复没生效」。

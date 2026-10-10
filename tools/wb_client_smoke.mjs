@@ -15,7 +15,7 @@ import { join } from 'node:path';
 // 默认取「本插件的现场安装目录」里的 client.js；换机器/换路径用第一个参数或 WB_CLIENT 覆盖。
 const CLIENT = process.argv[2]
   ?? process.env.WB_CLIENT
-  ?? join(homedir(), '.dsh', 'plugins', 'dsh-plugin-wb2api-ui', 'client.js');
+  ?? join(homedir(), '.dsh', 'plugins', 'dsh-plugin-wb2api-ui', 'client', 'client.js');
 const src = readFileSync(CLIENT, 'utf8');
 
 const noop = () => {};

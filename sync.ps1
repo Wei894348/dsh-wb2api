@@ -34,9 +34,9 @@ $Map = @(
   # 插件本体（仓库根 = npm 包根，与 dsh 加载的那份布局一致）
   @{ Live = "$PluginLive\package.json";       Store = 'package.json' }
   @{ Live = "$PluginLive\cordis.patch.yml";   Store = 'cordis.patch.yml' }
-  @{ Live = "$PluginLive\README.md";          Store = 'docs\插件面板说明.md' }
+  @{ Live = "$PluginLive\README.md";          Store = 'docs\PANEL.md' }
   @{ Live = "$PluginLive\lib\index.js";       Store = 'lib\index.js' }
-  @{ Live = "$PluginLive\client.js";          Store = 'client.js' }
+  @{ Live = "$PluginLive\client\client.js";   Store = 'client\client.js' }
   # 引擎
   @{ Live = "$Workspace\wb_tasks.mjs";        Store = 'engine\wb_tasks.mjs' }
   # 运维脚本

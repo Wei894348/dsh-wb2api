@@ -1,25 +1,32 @@
+<p align="center">
+  <img src="assets/logo.svg" width="96" alt="dsh-plugin-wb2api-ui logo">
+</p>
+
 # dsh-plugin-wb2api-ui
+
+English | [中文](README.md)
+
+[![npm](https://img.shields.io/npm/v/dsh-plugin-wb2api-ui)](https://www.npmjs.com/package/dsh-plugin-wb2api-ui)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![node](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](package.json)
 
 Bring a local WorkBuddy / CodeBuddy account pool into DeepSeek Harness — one package does three things:
 **runs the gateway process and registers the model provider**, ships a **Web settings panel**, and runs a
 **growth-task automation engine**.
 
-> Install one plugin → you get model service, a settings panel, and one-click task runs.
-> The gateway binary ships inside the package, so it works wherever it is installed.
+Install one plugin → you get model service, a settings panel, and one-click task runs.
+The gateway binary ships inside the package, so it works wherever it is installed.
 
----
+![Settings panel](assets/demo.svg)
 
-## Capabilities
+## What you get
 
-| Capability | Where | What it does |
-|---|---|---|
-| Gateway supervision + model-provider registration | `lib/gw/` | Spawns / probes / restarts / reclaims `wb2a-server` and registers its model catalog as a dsh LLM provider |
-| The gateway itself | `backend/bin/wb2a-server.exe` | Windows amd64, shipped in the package; rebuild with `backend/build-gateway.ps1` |
-| Settings panel | `client.js` + `lib/index.js` | A "WorkBuddy 反代" section: gateway status, per-account credits, OAuth login, credential import, account toggles |
-| Task automation engine | `engine/` | Pure Node, zero third-party deps: confirm pending → two execution passes → auto-claim rewards |
-| Ops scripts | `tools/` | Manual check-in / import / pool health check / panel smoke test |
-
----
+- **Model service** — the plugin supervises the `wb2a-server` gateway itself (spawn / probe / restart on crash / reclaim when dsh exits) and registers its model catalog as a dsh LLM provider; pick a model in dsh and it just works
+- **Gateway in the package** — `backend/bin/wb2a-server.exe` (Windows amd64) travels with the package and wins the lookup order, so `dsh plugin add` finds it in any profile
+- **Settings panel** — a "WorkBuddy 反代" section in dsh settings: gateway status, per-account credits, OAuth login, credential import, account toggles — all on one screen
+- **One-click tasks** — confirm pending → two execution passes → auto-claim rewards, with live progress in the panel
+- **Zero third-party deps** — gateway supervision, ZIP extraction, and the task engine are pure Node; no dependency tree, no build chain
+- **Credentials stay local** — the pool is read from the local runtime directory; `accessToken` / `refreshToken` and the gateway `api_key` never enter the repo
 
 ## Install
 
@@ -59,8 +66,6 @@ dsh plugin --profile web list                                  # is the dependen
 dsh --profile web --dump-config | Select-String wb2api-ui      # the composed tree should contain: - id: wb2api-ui
 ```
 
----
-
 ## Quick start
 
 ```powershell
@@ -83,14 +88,12 @@ node engine/wb_tasks.mjs auto all --passes 2  # execute + auto-claim
 node engine/wb_tasks.mjs credits              # per-account credits
 ```
 
----
-
 ## Topology
 
 ```
                      ┌──────────────────── dsh process (host half, loaded once at startup) ──────────┐
     browser GUI  ────►  dsh-plugin-wb2api-ui  ──►  /dsh-wb2api/* routes  ──┐                           │
-   (settings.section)   client.js (hot swap 500ms)  lib/index.js           │                           │
+   (settings.section)   client/client.js (hot swap 500ms)  lib/index.js    │                           │
                      └────────────────────────────────────────────────────┼───────────────────────────┘
                                                                           │
         ┌─────────────────────────────────────────────────────────────────┴──────────────────────┐
@@ -100,7 +103,7 @@ node engine/wb_tasks.mjs credits              # per-account credits
         │     -start · -restart · -login · -account                                               │
         │  ② task automation engine (engine/, pure Node, no third-party deps)                     │
         │     scanPendingTasks → runAutomation (two passes) → auto-claim                          │
-        │  ③ settings panel (client.js): gateway status / credits / OAuth / import / accounts     │
+        │  ③ settings panel (client/client.js): gateway status / credits / OAuth / import / accounts │
         └───────┬───────────────────────────────────┬──────────────────────────────┬─────────────┘
                 │ spawn / GET /healthz              │                              │
     ┌───────────▼────────────────────┐   ┌──────────▼────────────────────┐   ┌─────▼──────────────────┐
@@ -115,31 +118,35 @@ node engine/wb_tasks.mjs credits              # per-account credits
 The gateway and the task engine share **one credential pool** at `~/.dsh/wb2api/auths/`: the gateway serves
 models from it, the engine runs tasks with it. Change that directory and both sides follow.
 
----
-
 ## Layout
 
 ```
 dsh-wb2api/                       ← repo root = npm package root (package.json lives here)
 ├── package.json                  manifest: main / exports / files / dsh.bundle / dsh.client
 ├── cordis.patch.yml              bundle patch (one insert row)
-├── lib/index.js                  host half: 15 /dsh-wb2api/* routes + direct upstream calls + engine bridge
-│                                 (imports the sub-plugin at the top, mounts it via ctx.plugin at mountGateway)
-├── lib/gw/                       gateway supervision + provider registration (12 .js files)
-│   ├── index.js                  sub-plugin entry: /wb2api-* commands, auto-start, status reporting
-│   ├── proc.js     child process: locate binary → /healthz probe → spawn → restart on crash → dispose
-│   ├── chat.js        LlmAdapter: request assembly + SSE → StreamChunk
-│   ├── models.js                 /v1/models → dsh model catalog mapping
-│   ├── binary.js         binary download + SHA256 verification + runtime dir prep
-│   ├── accounts.js               account toggles (rename suffix under auths/)
-│   ├── login.js                  Node OAuth login
-│   ├── setup.js                  /wb2api-setup orchestration
-│   └── sse.js / zip.js / config.js
+├── lib/                          host half (node side)
+│   ├── index.js                  15 /dsh-wb2api/* routes + direct upstream calls + engine bridge
+│   │                             (imports the sub-plugin at the top, mounts it via ctx.plugin at mountGateway)
+│   └── gw/                       gateway supervision + provider registration (13 .js files)
+│       ├── index.js              sub-plugin entry: /wb2api-* commands, auto-start, status reporting
+│       ├── settings.js           config normalization + defaults, provider settings namespace
+│       ├── runtime.js            path policy: runtime dir / cwd / credential dir / gateway config generation
+│       ├── proc.js               child process: locate binary → /healthz probe → spawn → restart on crash → dispose
+│       ├── chat.js               LlmAdapter: request assembly + SSE → StreamChunk
+│       ├── stream.js             SSE frame parsing with dual timeouts (first frame / inter-frame)
+│       ├── catalog.js            /v1/models → dsh model catalog mapping (TTL cache + de-dup)
+│       ├── binary.js             binary download + SHA256 verification + atomic write
+│       ├── archive.js            built-in ZIP extraction (no third-party deps)
+│       ├── credentials.js        account toggles (rename the suffix under auths/)
+│       ├── authorize.js          Node OAuth login + credential write
+│       ├── bootstrap.js          /wb2api-setup orchestration
+│       └── render.js             status/report text rendering (pure functions)
+├── client/                       browser half (web side)
+│   └── client.js                 settings section card (hand-written __ModuleLoader__ factory, no build step)
 ├── backend/                      the gateway binary (shipped, included in `files`)
 │   ├── bin/wb2a-server.exe       Windows amd64 executable (SHA256 in backend/README.md)
 │   ├── build-gateway.ps1         rebuild from Go source: clone + go build
 │   └── README.md                 checksums and rebuild instructions
-├── client.js                     browser half: settings section card (hand-written __ModuleLoader__ factory, no build step)
 ├── engine/                       task automation engine (ships with the package)
 │   ├── wb_tasks.mjs              CLI: list / scan / auto / credits
 │   └── wb_up/
@@ -152,25 +159,29 @@ dsh-wb2api/                       ← repo root = npm package root (package.json
 │       ├── backend.mjs           api facade used by the action layer
 │       ├── store.mjs             credential read/write (~/.dsh/wb2api/auths)
 │       └── run.mjs               orchestration: scan → two passes → auto-claim + single-flight lock
+├── locale/                       panel strings and metadata (zh / en)
+│   ├── zh.json
+│   └── en.json
+├── assets/                       images used by the READMEs
+│   ├── logo.svg
+│   └── demo.svg
 ├── tools/                        ops scripts (run manually, not through the plugin)
 │   ├── wb_import.mjs             import the desktop client's current login (%wbEncrypted envelope)
 │   ├── wb_daily.mjs              check-in / claim finished tasks (--tasks to run the engine; off by default)
 │   ├── wb_checkin.mjs            single-account check-in + token verification
 │   ├── wb_pooltest.mjs           fire a few requests to see which account is working
-│   └── wb_client_smoke.mjs       offline render smoke test for client.js (minimal React stand-in + dummy DOM)
+│   └── wb_client_smoke.mjs       offline render smoke test for client/client.js (minimal React stand-in + dummy DOM)
 ├── runtime/
 │   ├── config.example.json       gateway config template (api_key is a placeholder)
 │   └── anthropic_bridge.py       optional bridge exposing the gateway as Anthropic /v1/messages
 ├── docs/
-│   ├── 逻辑总览.md               upstream channels, task actions, scoring/claim semantics, credential decryption, supervision, troubleshooting
-│   └── 插件面板说明.md           panel features and installation notes
+│   ├── ARCHITECTURE.md           upstream channels, task actions, scoring/claim semantics, credential decryption, supervision, troubleshooting
+│   └── PANEL.md                  panel features and installation notes
 ├── sync.ps1                      live ↔ archive sync (pulls from live by default)
 ├── CHANGELOG.md
 ├── LICENSE
 └── .gitignore
 ```
-
----
 
 ## Slash commands
 
@@ -181,8 +192,6 @@ dsh-wb2api/                       ← repo root = npm package root (package.json
 | `/wb2api-start` / `/wb2api-restart` | Start / restart the supervised gateway process |
 | `/wb2api-login` | Node OAuth login (`cn` / `global`) |
 | `/wb2api-account` | Account toggles (`auto` / index / uid prefix) |
-
----
 
 ## Host routes (`/dsh-wb2api/*`, served on dsh's own port, default 3080)
 
@@ -206,8 +215,6 @@ dsh-wb2api/                       ← repo root = npm package root (package.json
 
 `tasks/run` body (all optional): `{ uid?: "<prefix>", only?: ["<task_code>"], passes?: 1-4 }`.
 
----
-
 ## Where the gateway binary comes from
 
 `resolveBinary()` in `lib/gw/proc.js` tries these in order and uses the first hit:
@@ -223,8 +230,6 @@ dsh-wb2api/                       ← repo root = npm package root (package.json
 It only throws when every candidate misses, and the error lists every path it tried. Auto-download is off by
 default (`autoDownloadBinary: false`); when enabled, the release repository points at this repository
 (`DEFAULT_RELEASE_REPO` in `lib/gw/binary.js`, `binaryReleaseRepo` in `lib/gw/settings.js`).
-
----
 
 ## Runtime directory and data
 
@@ -251,7 +256,13 @@ provider id stays `PROVIDER = 'workbuddy2api'` (`lib/gw/settings.js`) **on purpo
 > Do **not** mount two plugins that register the same provider id in one profile — they collide with
 > `DUPLICATE_ADAPTER` and the host will not start.
 
----
+## Security
+
+- **Credentials never leave the machine**: the pool lives in `~/.dsh/wb2api/auths/`, the gateway listens on loopback only (`127.0.0.1:7863`), and `/healthz` is unauthenticated but exposes no account data
+- **No secrets in the repo**: `accessToken` / `refreshToken` under `auths/` and the `api_key` in `config.json` are blocked by `.gitignore`; `runtime/config.example.json` carries a masked placeholder
+- **Verified binary**: `lib/gw/binary.js` checks SHA256 after download before writing atomically; the shipped copy's digest is recorded in `backend/README.md`
+- **Readable patch**: `cordis.patch.yml` is a single `insert` row naming the plugin id and package — no hidden injection
+- **Single-flight lock on the engine**: real-credit actions (expert chains) never run concurrently (`~/.dsh/wb2api/data/wb-tasks.lock`, expires after 20 minutes)
 
 ## Automation switches (current state)
 
@@ -261,8 +272,6 @@ provider id stays `PROVIDER = 'workbuddy2api'` (`lib/gw/settings.js`) **on purpo
 | Auto check-in when the panel opens | on (once a day) | `WB2API_NO_AUTO_ACTIVITY=1` disables it |
 | Windows scheduled tasks | **all removed** | `wb2api-tasks-night` / `-dawn` / `dsh-wb2api-daily` are gone |
 | Your own check-in schedule (e.g. 08:30 hitting `/checkin`) | kept | Check-in + claim finished tasks only, **never touches the engine** |
-
----
 
 ## Development: live copy vs this repo
 
@@ -287,10 +296,8 @@ pwsh -File sync.ps1 -WhatIfOnly      # show what would move
 > `accessToken` / `refreshToken` in `auths/` and the gateway `config.json` `api_key` **never enter the repo**
 > (`.gitignore` blocks them).
 
-The browser half `client.js` is hot-swapped every 500ms — refresh the page. The host half `lib/index.js`
+The browser half `client/client.js` is hot-swapped every 500ms — refresh the page. The host half `lib/index.js`
 **requires a dsh restart**.
-
----
 
 ## Known pitfalls (all measured)
 
@@ -319,8 +326,6 @@ The browser half `client.js` is hot-swapped every 500ms — refresh the page. Th
 10. **Provider id is unique**: two plugins registering the same provider id in one profile trigger
     `DUPLICATE_ADAPTER` and the host will not start.
 
----
-
 ## Troubleshooting
 
 | Symptom | Where to look |
@@ -334,8 +339,6 @@ The browser half `client.js` is hot-swapped every 500ms — refresh the page. Th
 | Status says the gateway is running but no models | The probe only proves the port is open; `healthy` is what means an account is usable |
 | dsh fails to start with `DUPLICATE_ADAPTER` | Two plugins in that profile register the same provider id; remove one and restart |
 
----
-
 ## Packaging and release
 
 ```powershell
@@ -347,8 +350,6 @@ git push -u origin main
 
 Before uploading, check `git status`: it must **not** contain `auths/`, `config.json`, `*.log`, `*.tgz`, or
 `node_modules/`.
-
----
 
 ## License
 
