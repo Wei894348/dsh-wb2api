@@ -215,7 +215,8 @@ dsh-wb2api/                       ← 仓库根 = npm 包根（package.json 在�
 │   ├── wb_daily.mjs              签到 / 领已完成任务（--tasks 才跑任务引擎，默认不跑）
 │   ├── wb_checkin.mjs            单账号签到 + 验 token
 │   ├── wb_pooltest.mjs           发几发请求看账号池谁在干活
-│   └── wb_client_smoke.mjs       client/client.js 的离线渲染冒烟（最小 React 替身 + 哑 DOM）
+│   ├── wb_client_smoke.mjs       client/client.js 的离线渲染冒烟（最小 React 替身 + 哑 DOM）
+│   └── wb_catalog_smoke.mjs      ModelCatalog 的离线冒烟（断言实际发出的 authorization 头；--live 打真网关）
 ├── runtime/
 │   ├── config.example.json       网关配置模板（api_key 是占位符）
 │   └── anthropic_bridge.py       把网关包成 Anthropic /v1/messages 的桥（可选用）
@@ -364,6 +365,7 @@ pwsh -File sync.ps1 -WhatIfOnly      # 只看会动哪些文件
 | 某项 `progress_after` 仍 `not_accepted` | 异步计分未落账：再跑一轮（第二次会跳过已领的，只补未落账的） |
 | 401 / 「登录身份过期」 | 该号 accessToken 失效：桌面端重新登录后重跑 `node tools/wb_import.mjs --write` |
 | 模型发不出去 | 看 `/healthz` 的 `healthy`：`healthy = 0` 就是没可用账号（`/wb2api-login` 加号或 `/wb2api-account auto` 恢复） |
+| 提示「WorkBuddy (workbuddy2api 网关) 加载失败：GET /v1/models 失败：HTTP 401」 | 插件带去的 `api_key` 与网关 `config.json` 的不一致。三方对齐：凭据库 ref `WORKBUDDY2API_API_KEY` → 环境变量同名 → 网关 `~/.dsh/wb2api/config.json` 的 `api_key`。手工复核：`curl -H "Authorization: Bearer <api_key>" http://127.0.0.1:7863/v1/models`（通了就是插件侧解析问题，跑 `node tools/wb_catalog_smoke.mjs --live`） |
 | 状态显示网关「运行中」但没模型 | 探活只证端口通，`healthy` 才代表有可用账号 |
 | dsh 启动报 `DUPLICATE_ADAPTER` | 该 profile 里挂了两个注册同一 provider id 的插件，移除其中一个后重启 |
 

@@ -1,5 +1,22 @@
 # 变更记录
 
+## 1.5.3（2026-10-10）
+
+**修复：模型目录一律 401（`WorkBuddy (workbuddy2api 网关) 加载失败：GET /v1/models 失败：HTTP 401`）**
+
+根因：`ModelCatalog` 把 `options.apiKey` 当字符串直接拼进请求头，而 `lib/gw/index.js`
+传进去的是**函数** `() => resolveApiKey(ctx, config)`（密钥要走凭据库，只能延迟解析）。
+函数是 truthy，于是发出去的头成了 `Bearer () => resolveApiKey(ctx, config)` ——
+网关按「密钥不对」回 401，而错误消息里只看得到 401，看不出密钥是谁。
+
+| 位置 | 改法 |
+|---|---|
+| `lib/gw/catalog.js` | 新增 `_resolveApiKey()`：`apiKey` 支持字符串**或**函数（异步也行），请求前 `await` 出字符串；函数抛错/返回非字符串一律降级为「不带密钥」，不炸穿目录加载 |
+| `lib/gw/catalog.js` | 构造函数 `options.apiKey \|\| ''` → `?? ''`（显式区分「没传」与「空串」），并补 JSDoc 说明两种形态 |
+| `tools/wb_catalog_smoke.mjs` | 新增回归冒烟：函数形 / Promise 形 / 字符串形 / 空值 / 抛错 / 非字符串 六种入参，逐条断言**实际发出去的 `authorization` 头**；`--live` 可追加打一次真网关（只读 `/v1/models`） |
+
+只影响模型目录拉取；chat 链路（`GatewayChat.requireApiKey()` 本来就 `await` 了）一直是好的。
+
 ## 1.5.2（2026-10-10）
 
 **README 补「桌面端添加插件」安装方式**
