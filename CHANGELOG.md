@@ -1,5 +1,22 @@
 # 变更记录
 
+## 1.5.4（2026-10-10）
+
+**模型下拉去掉 `cn:` 前缀（展示剥离，出方向自动还原）**
+
+模型选择器里每条都是 `cn:glm-5.0-turbo` / `cn:kimi-k2.7`，区域前缀把真正的模型名挤窄。
+`ModelCatalog` 本来就带 `policy` 开关（`lib/gw/catalog.js` 里写好但没接线），这次接上
+`strip-cn`，并补上出方向的还原。
+
+| 位置 | 改法 |
+|---|---|
+| `lib/gw/index.js` | `new ModelCatalog({...})` 补 `policy: 'strip-cn'` |
+| `lib/gw/chat.js` | `buildRequestBody` 新增 `modelEntry` 入参；发请求前用 `toWireModel()` 把展示裸名还原成 `cn:xxx`，目录查不到时原样透传 |
+| `tools/wb_catalog_smoke.mjs` | 新增三条断言：strip-cn 剥前缀 / `global:` 保留 / `toWireModel` 还原 wire id |
+
+为什么必须还原：网关的跨域粘性会话按完整 id 记账，裸名会被钉回 CN 集合，global 模型
+会走错出口。剥前缀只影响 dsh 侧的展示。
+
 ## 1.5.3（2026-10-10）
 
 **修复：模型目录一律 401（`WorkBuddy (workbuddy2api 网关) 加载失败：GET /v1/models 失败：HTTP 401`）**

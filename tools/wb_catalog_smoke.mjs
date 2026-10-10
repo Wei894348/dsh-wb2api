@@ -11,7 +11,7 @@
  *       node tools/wb_catalog_smoke.mjs --live    # 顺带打一次真网关（只读 /v1/models）
  */
 
-import { ModelCatalog } from '../lib/gw/catalog.js'
+import { ModelCatalog, toWireModel } from '../lib/gw/catalog.js'
 
 const results = []
 const record = (name, ok, detail) => {
@@ -71,6 +71,44 @@ async function captureHeader (apiKey) {
   const seen = await captureHeader(() => ({ nope: true }))
   const ok = seen.auth === null
   record('函数返回非字符串 → 不带 authorization 头', ok, `实际: ${JSON.stringify(seen.auth)}`)
+}
+
+// ── 7-9. 展示层剥 CN 前缀 + 出方向还原 wire id（1.5.4）────────────────────────
+// 背景：dsh 的模型下拉直接读 catalog 的 id。原先 policy 缺省 'keep'，下拉里每条
+// 都是 `cn:glm-5.0-turbo`；剥掉后更干净，但发请求前必须用 toWireModel 把 realm
+// 前缀补回去（裸名会被网关钉回 CN 集合，global 模型会走错出口）。
+
+const MODEL_FIXTURE = [
+  { id: 'cn:glm-5.0-turbo', context_length: 131072 },
+  { id: 'global:claude-x', context_length: 200000 },
+  { id: 'deepseek-v4', context_length: 65536 },
+]
+
+function catalogWith (list, policy) {
+  const fetchImpl = async () => ({ ok: true, status: 200, json: async () => ({ data: list }) })
+  return new ModelCatalog({ baseURL: 'http://127.0.0.1:7863/v1', apiKey: 'k', policy, fetchImpl })
+}
+
+{
+  const ids = (await catalogWith(MODEL_FIXTURE, 'strip-cn').get(true)).map((m) => m.id)
+  const ok = ids.join(',') === 'glm-5.0-turbo,global:claude-x,deepseek-v4'
+  record('strip-cn：剥掉 cn: 前缀，global: 保留', ok, ids.join(', '))
+}
+
+{
+  const ids = (await catalogWith(MODEL_FIXTURE, 'keep').get(true)).map((m) => m.id)
+  const ok = ids[0] === 'cn:glm-5.0-turbo'
+  record('keep：旧策略仍可用（回滚保险）', ok, ids.join(', '))
+}
+
+{
+  const c = catalogWith(MODEL_FIXTURE, 'strip-cn')
+  await c.get(true)
+  const cn = toWireModel(c.find('glm-5.0-turbo'))    // 展示裸名 → cn:xxx
+  const gl = toWireModel(c.find('global:claude-x'))  // global 原样
+  const bare = toWireModel(c.find('deepseek-v4'))    // 裸名 → 补默认 realm
+  const ok = cn === 'cn:glm-5.0-turbo' && gl === 'global:claude-x' && bare === 'cn:deepseek-v4'
+  record('toWireModel：展示裸名能还原成网关认的 wire id', ok, `${cn} / ${gl} / ${bare}`)
 }
 
 // 可选：真网关。只读 /v1/models，不打付费上游。
