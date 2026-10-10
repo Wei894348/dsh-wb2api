@@ -1,5 +1,47 @@
 # 变更记录
 
+## 1.5.5（2026-10-10）
+
+**修复：带 `cn:` 前缀的模型名查不到目录 → 被判「不支持 reasoningEffort」→ 整轮请求被换模型**
+
+1.5.4 改成 `strip-cn` 展示后引入一个回归，且只在「调用方传带前缀名字」时发作：
+`ModelCatalog.find()` 只按展示 id 建索引，而 profile patch、手填配置、老配置片段里完全
+可能写 `cn:deepseek-v4.1-flash`。查不到时 `GatewayChat.resolveModel()` 会返回一个
+**不带 `reasoning` 字段**的兜底对象，`dsh-llm` 的 `resolveCallWithInfo()` 随即认定
+「该模型不支持 reasoningEffort」并抛 `UNSUPPORTED_REASONING_EFFORT`，DSH 把整轮请求
+换到别的模型 —— 表象是「系统提示 / 人格层莫名失效」，实际是模型被换掉了。
+
+| 位置 | 改法 |
+|---|---|
+| `lib/gw/catalog.js` | `_load()` 新增 `byRealmBare`（`realm:bareId` 精确索引） |
+| `lib/gw/catalog.js` | `find()` 首查未命中时按 realm 归一化再查一次：`cn:deepseek-v4.1-flash` → 同 realm 的 `deepseek-v4.1-flash`。按 realm 精确匹配，避免同名跨域时 `cn:xxx` 被 `global:xxx` 抢先 |
+| `tools/wb_catalog_smoke.mjs` | 新增三条断言：带前缀入参命中 / 命中后可还原 wire id / 同名跨域不串味 + 未知名仍返回 `undefined` |
+
+只影响「名字带前缀」的查询；裸名（展示名）路径与 `toWireModel()` 出方向不变。
+
+### 同时修复：system 提示词被整段丢弃（人格不生效）
+
+`serializeMessages()` 把 `role:'system'` 的历史消息按「system 由 `buildRequestBody` 统一
+unshift」`continue` 掉了，而 `options.system` 通常是空的 —— 于是 dsh 渲染好的人格 / 指令
+提示词（`createSystemMessage()` 放进 `role:'system'` 消息的那份）**根本没进请求**。
+网关照常 200 回包，只是模型完全不认人格，最容易误判成"模型不行"或"提示词没写好"。
+
+官方 adapter 的语义是「历史里的 system + options.system」两处合并，所以这里必须保留。
+
+| 位置 | 改法 |
+|---|---|
+| `lib/gw/chat.js` | `serializeMessages()` 保留 `role:'system'` 消息（原位置、原文本） |
+| `lib/gw/chat.js` | `buildRequestBody()` 的 `options.system` 做内容去重，避免与历史里的同段落重复发送 |
+| `tools/wb_request_smoke.mjs` | 新增：7 条断言专盯 system 是否进请求 / 两处来源并存 / 去重 / 只有一处时不丢 / 裸名还原 wire id |
+
+### 配套（本地重装链路）
+
+| 位置 | 改法 |
+|---|---|
+| `sync.ps1` | v2：现场路径由已废弃的 `~/.dsh/plugins/<pkg>` 改为 `~/.dsh/profiles/<p>/node_modules/<pkg>`（覆盖 desktop / web / wbtest）；插件本体不再逐文件登记，改为按 `files` 白名单全量同步（补上旧版漏掉的 `lib/gw/*`）；排除运行时 `data/`；输出改 `Write-Output` 以便落盘 |
+| `tools/reinstall_local.mjs` | 新增：从 tgz 解包产物逐文件覆盖现场 profile（hash 比对，保留运行时 `data/`），用于本地重装；用法 `node tools/reinstall_local.mjs <解包目录>` |
+| 三个 profile 的 `package.json` | 依赖由 `github:Wei894348/dsh-wb2api`（会拉回未含修复的远端 HEAD）改为 `file:.../dsh-plugin-wb2api-ui-1.5.5.tgz`，避免重装即回退 |
+
 ## 1.5.4（2026-10-10）
 
 **模型下拉去掉 `cn:` 前缀（展示剥离，出方向自动还原）**

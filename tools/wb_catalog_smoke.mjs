@@ -111,6 +111,47 @@ function catalogWith (list, policy) {
   record('toWireModel：展示裸名能还原成网关认的 wire id', ok, `${cn} / ${gl} / ${bare}`)
 }
 
+// ── 10-12. find() 对带 realm 前缀入参的归一化（1.5.5）──────────────────────
+// 背景：strip-cn 后 byId 里存的是裸名，而调用方（profile patch / 手填配置 /
+// 老配置片段）完全可能传 `cn:xxx`。查不到时 resolveModel() 会返回**不带
+// reasoning 字段**的兜底对象，dsh 的 resolveCallWithInfo() 直接抛
+// UNSUPPORTED_REASONING_EFFORT，整轮请求被换到别的模型 —— 表现成
+// "系统提示 / 人格层莫名失效"，实际是模型被换掉了。
+
+{
+  const c = catalogWith(MODEL_FIXTURE, 'strip-cn')
+  await c.get(true)
+  const byPrefix = c.find('cn:glm-5.0-turbo')   // 带前缀入参
+  const byBare = c.find('glm-5.0-turbo')        // 展示用裸名
+  const ok = byPrefix !== undefined && byPrefix === byBare && byPrefix.realm === 'cn'
+  record('find()：带 cn: 前缀的入参也能命中（strip-cn 目录）', ok,
+    byPrefix ? `命中 id=${byPrefix.id}` : 'NOT FOUND')
+}
+
+{
+  const c = catalogWith(MODEL_FIXTURE, 'strip-cn')
+  await c.get(true)
+  const wire = toWireModel(c.find('cn:glm-5.0-turbo'))
+  const ok = wire === 'cn:glm-5.0-turbo'
+  record('find()：归一化命中后仍能还原出正确的 wire id', ok, wire)
+}
+
+{
+  // 同名跨域不能拿错 realm：目录里 cn:dup 与 global:dup 同时存在
+  const DUP_FIXTURE = [
+    { id: 'global:dup', context_length: 1000 },
+    { id: 'cn:dup', context_length: 2000 },
+  ]
+  const c = catalogWith(DUP_FIXTURE, 'strip-cn')
+  await c.get(true)
+  const cn = c.find('cn:dup')
+  const gl = c.find('global:dup')
+  const miss = c.find('cn:nope')
+  const ok = cn?.realm === 'cn' && gl?.realm === 'global' && miss === undefined
+  record('find()：归一化按 realm 精确匹配，未知名仍返回 undefined', ok,
+    `cn:dup→${cn?.realm} / global:dup→${gl?.realm} / cn:nope→${miss === undefined ? 'undefined' : 'hit'}`)
+}
+
 // 可选：真网关。只读 /v1/models，不打付费上游。
 if (process.argv.includes('--live')) {
   const { readFileSync } = await import('node:fs')
