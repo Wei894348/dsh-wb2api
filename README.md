@@ -26,32 +26,63 @@
 
 ## 安装
 
-四种装法任选其一。**装完必须重启 dsh** —— 宿主半侧只在启动时读 `bundles`。
+五种装法任选其一。**装完必须重启 dsh** —— 宿主半侧只在启动时读 `bundles`。
 
-### 一、插件市场
+### 一、桌面端 UI：添加插件（最省事）
+
+设置 → 插件 → **添加插件**。输入框接受包名、Git 地址、压缩包、本地绝对路径四种形式 —— 除包名外都能直接用：
+
+| 输入 | 示例 | 本插件 |
+|---|---|---|
+| GitHub 仓库地址 | `https://github.com/Wei894348/dsh-wb2api` | ✅ 已实测 |
+| GitHub 简写（pnpm 规格） | `github:Wei894348/dsh-wb2api` | ✅ |
+| 本地目录绝对路径 | `F:\project\dsh_chajian\dsh-wb2api` | ✅ |
+| 压缩包路径 | `F:\...\dsh-plugin-wb2api-ui-1.5.2.tgz` | ✅ |
+| npm 包名 | `dsh-plugin-wb2api-ui` | ⚠️ 尚未发布到 npm |
+
+> 对话框里的引导写得很明确：**包名就是 npm 包名**，即社区插件 README 里 `dsh plugin add` 或
+> `pnpm add` 之后那一段（如 `dsh-xxx`、`@作者/插件名`）。本插件还没发到 npm，所以那一行走不通 ——
+> 走 GitHub 地址、本地目录或压缩包都可以。
+
+**安装源**（对话框右上，默认「中国大陆镜像源」）选择**从哪个 npm 源拉包**：
+
+| 选项 | 说明 |
+|---|---|
+| 默认安装源 | 跟随 pnpm 当前配置（`pnpm config get registry`） |
+| npm 官方源 | `registry.npmjs.org` |
+| 中国大陆镜像源 | npmmirror |
+| 自定义地址 | 内网 / 私有源，须以 `http://` 或 `https://` 开头；要登录的源把凭据放进本机 `~/.npmrc` |
+
+它**只对 npm 那两种输入（包名 / 压缩包）生效**：Git 地址直接走 git，本地路径压根不下载。前一个源取不到包时会自动切下一个重试。
+
+点 **安装并重启** 收尾。若包声明了安装脚本，pnpm 默认不执行，会先弹「需要允许安装脚本」——允许后脚本以你的权限在本机跑，授权记在当前 profile，之后不再问。
+
+> 这也是**唯一能给 `desktop` profile 装插件的方式**：它由桌面端独占，命令行碰不了（见下）。
+
+### 二、插件市场
 
 在 dsh 的插件市场里搜 `wb2api`，点安装即可：
 
 - **DSH Plugin Hub**（`dsh-plugin`）—— 设置 → 插件市场，数据源 [dsh-plugin.org](https://dsh-plugin.org)
 - **dshmarket** —— 设置 → 插件，数据源 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin)
 
-### 二、命令行：从 GitHub 直装
+### 三、命令行：从 GitHub 直装
 
 ```powershell
 dsh plugin --profile web add github:Wei894348/dsh-wb2api
 ```
 
-### 三、命令行：从压缩包装
+### 四、命令行：从压缩包装
 
 ```powershell
 # 仓库根打包
 npm pack                                              # → dsh-plugin-wb2api-ui-<version>.tgz
 
 # 装进 profile（profile 不存在时先建：dsh --profile <名> --from-default-profile web --dump-config）
-dsh plugin --profile web add file:<本仓库>\dsh-plugin-wb2api-ui-1.5.0.tgz
+dsh plugin --profile web add file:<本仓库>\dsh-plugin-wb2api-ui-<version>.tgz
 ```
 
-### 四、本地开发态（link）
+### 五、本地开发态（link）
 
 ```powershell
 # 把仓库链接到现场目录，profile 里写 "dsh-plugin-wb2api-ui": "link:<路径>"
@@ -62,7 +93,8 @@ dsh plugin --profile web add link:<本仓库路径>
 `dsh.profile.bundles`。**正在运行的 dsh 不会重读这个列表 —— 装完必须重启 dsh**（宿主半侧只在启动时加载）。
 
 > **桌面端（Electron）的 `desktop` profile 例外**：它由桌面端独占，`dsh plugin --profile desktop …` 会被直接拒绝
-> （`profile "desktop" is managed exclusively by the Electron application`），只能用桌面端的插件市场 UI 装。
+> （`profile "desktop" is managed exclusively by the Electron application`），只能用桌面端的 UI 装 ——
+> 即**方式一（添加插件，填 GitHub 地址 / 本地目录 / 压缩包）**或方式二的市场 UI。
 
 ### 验证装上了
 
@@ -72,6 +104,10 @@ dsh --profile web --dump-config | Select-String wb2api-ui      # 组合树里应
 ```
 
 ## 卸载
+
+**桌面端**：设置 → 插件 → 找到本插件 → 卸载（`desktop` profile 命令行碰不了，只能走 UI）。
+
+**命令行**：
 
 ```powershell
 dsh plugin --profile web remove dsh-plugin-wb2api-ui

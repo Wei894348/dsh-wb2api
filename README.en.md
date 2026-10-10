@@ -29,22 +29,54 @@ The gateway binary ships inside the package, so it works wherever it is installe
 
 ## Install
 
-Four ways — pick one. **Restart dsh afterwards**; the host half only reads `bundles` at startup.
+Five ways — pick one. **Restart dsh afterwards**; the host half only reads `bundles` at startup.
 
-### 1. Plugin marketplace
+### 1. Desktop UI: "Add plugin" (easiest)
+
+Settings → Plugins → **Add plugin**. The field takes a package name, a Git address, a tarball, or an absolute local path — everything except the package name works out of the box:
+
+| Input | Example | This plugin |
+|---|---|---|
+| GitHub repository address | `https://github.com/Wei894348/dsh-wb2api` | ✅ tested |
+| GitHub shorthand (pnpm spec) | `github:Wei894348/dsh-wb2api` | ✅ |
+| Absolute local directory | `F:\project\dsh_chajian\dsh-wb2api` | ✅ |
+| Tarball path | `F:\...\dsh-plugin-wb2api-ui-1.5.2.tgz` | ✅ |
+| npm package name | `dsh-plugin-wb2api-ui` | ⚠️ not on npm yet |
+
+> The dialog's own guide says it plainly: the **package name is the npm package name** — the part after
+> `dsh plugin add` or `pnpm add` in a community plugin's README (e.g. `dsh-xxx`, `@author/plugin`).
+> This plugin is not published to npm yet, so that row is a dead end — use the GitHub address, a local
+> directory, or a tarball instead.
+
+**Install source** (top-right of the dialog, defaults to the Mainland China mirror) picks **which npm registry the package is pulled from**:
+
+| Option | Notes |
+|---|---|
+| Default registry | follows pnpm's current config (`pnpm config get registry`) |
+| Official npm registry | `registry.npmjs.org` |
+| Mainland China mirror | npmmirror |
+| Custom address | internal / private registry; must start with `http://` or `https://`; put credentials for a private registry in your local `~/.npmrc` |
+
+It only affects the two npm-based inputs (package name / tarball): a Git address goes straight over git and a local path is never downloaded. If one registry cannot serve the package, the dialog retries through the next one automatically.
+
+Finish with **Install and Restart**. If a package declares install scripts, pnpm does not run them by default — you get an "Install scripts need permission" prompt first; once allowed they run with your permissions and the grant is remembered for that profile.
+
+> This UI is also the **only** way to install into the `desktop` profile: the Electron app owns it, so the CLI cannot touch it (see below).
+
+### 2. Plugin marketplace
 
 Search `wb2api` in dsh's plugin marketplace and hit install:
 
 - **DSH Plugin Hub** (`dsh-plugin`) — Settings → Plugin Marketplace, feeds from [dsh-plugin.org](https://dsh-plugin.org)
 - **dshmarket** — Settings → Plugins, feeds from [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin)
 
-### 2. CLI: straight from GitHub
+### 3. CLI: straight from GitHub
 
 ```powershell
 dsh plugin --profile web add github:Wei894348/dsh-wb2api
 ```
 
-### 3. CLI: from a tarball
+### 4. CLI: from a tarball
 
 ```powershell
 # pack at the repo root
@@ -52,10 +84,10 @@ npm pack                                              # → dsh-plugin-wb2api-ui
 
 # install into a profile (create it first if needed:
 #   dsh --profile <name> --from-default-profile web --dump-config)
-dsh plugin --profile web add file:<this repo>\dsh-plugin-wb2api-ui-1.5.0.tgz
+dsh plugin --profile web add file:<this repo>\dsh-plugin-wb2api-ui-<version>.tgz
 ```
 
-### 4. Local development (link)
+### 5. Local development (link)
 
 ```powershell
 # link the repo into the live plugin dir; the profile then holds
@@ -70,7 +102,8 @@ that list — restart dsh after installing** (the host half loads only at startu
 > **The Electron `desktop` profile is the exception**: it is owned by the desktop app, so
 > `dsh plugin --profile desktop …` is refused outright
 > (`profile "desktop" is managed exclusively by the Electron application`). Install there through the
-> desktop plugin marketplace UI instead.
+> desktop UI — i.e. **method 1** (Add plugin, with a GitHub address / local directory / tarball) or the
+> marketplace UI in method 2.
 
 ### Verify the install
 
@@ -80,6 +113,10 @@ dsh --profile web --dump-config | Select-String wb2api-ui      # the composed tr
 ```
 
 ## Uninstall
+
+**Desktop**: Settings → Plugins → find this plugin → Uninstall (the `desktop` profile is off-limits to the CLI, so the UI is the only route).
+
+**CLI**:
 
 ```powershell
 dsh plugin --profile web remove dsh-plugin-wb2api-ui
