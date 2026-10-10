@@ -6,7 +6,6 @@
 
 English | [中文](README.md)
 
-[![npm](https://img.shields.io/npm/v/dsh-plugin-wb2api-ui)](https://www.npmjs.com/package/dsh-plugin-wb2api-ui)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![node](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](package.json)
 
@@ -30,13 +29,22 @@ The gateway binary ships inside the package, so it works wherever it is installe
 
 ## Install
 
-### From GitHub
+Four ways — pick one. **Restart dsh afterwards**; the host half only reads `bundles` at startup.
+
+### 1. Plugin marketplace
+
+Search `wb2api` in dsh's plugin marketplace and hit install:
+
+- **DSH Plugin Hub** (`dsh-plugin`) — Settings → Plugin Marketplace, feeds from [dsh-plugin.org](https://dsh-plugin.org)
+- **dshmarket** — Settings → Plugins, feeds from [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin)
+
+### 2. CLI: straight from GitHub
 
 ```powershell
 dsh plugin --profile web add github:Wei894348/dsh-wb2api
 ```
 
-### From a tarball
+### 3. CLI: from a tarball
 
 ```powershell
 # pack at the repo root
@@ -44,10 +52,10 @@ npm pack                                              # → dsh-plugin-wb2api-ui
 
 # install into a profile (create it first if needed:
 #   dsh --profile <name> --from-default-profile web --dump-config)
-dsh plugin --profile web add file:<this repo>\dsh-plugin-wb2api-ui-1.4.0.tgz
+dsh plugin --profile web add file:<this repo>\dsh-plugin-wb2api-ui-1.5.0.tgz
 ```
 
-### Local development (link)
+### 4. Local development (link)
 
 ```powershell
 # link the repo into the live plugin dir; the profile then holds
@@ -59,12 +67,27 @@ dsh plugin --profile web add link:<path to this repo>
 and writes the package name into that profile's `dsh.profile.bundles`. **A running dsh does not re-read
 that list — restart dsh after installing** (the host half loads only at startup).
 
+> **The Electron `desktop` profile is the exception**: it is owned by the desktop app, so
+> `dsh plugin --profile desktop …` is refused outright
+> (`profile "desktop" is managed exclusively by the Electron application`). Install there through the
+> desktop plugin marketplace UI instead.
+
 ### Verify the install
 
 ```powershell
 dsh plugin --profile web list                                  # is the dependency there
 dsh --profile web --dump-config | Select-String wb2api-ui      # the composed tree should contain: - id: wb2api-ui
 ```
+
+## Uninstall
+
+```powershell
+dsh plugin --profile web remove dsh-plugin-wb2api-ui
+```
+
+Restart dsh afterwards. The runtime directory `%USERPROFILE%\.dsh\wb2api\` (account pool and
+`config.json`) is **not touched by `remove`** — it is a data directory independent of the plugin;
+delete that layer by hand if you want it gone.
 
 ## Quick start
 

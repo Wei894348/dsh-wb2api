@@ -6,7 +6,6 @@
 
 [English](README.en.md) | 中文
 
-[![npm](https://img.shields.io/npm/v/dsh-plugin-wb2api-ui)](https://www.npmjs.com/package/dsh-plugin-wb2api-ui)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![node](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](package.json)
 
@@ -27,23 +26,32 @@
 
 ## 安装
 
-### 从 GitHub 装
+四种装法任选其一。**装完必须重启 dsh** —— 宿主半侧只在启动时读 `bundles`。
+
+### 一、插件市场
+
+在 dsh 的插件市场里搜 `wb2api`，点安装即可：
+
+- **DSH Plugin Hub**（`dsh-plugin`）—— 设置 → 插件市场，数据源 [dsh-plugin.org](https://dsh-plugin.org)
+- **dshmarket** —— 设置 → 插件，数据源 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin)
+
+### 二、命令行：从 GitHub 直装
 
 ```powershell
 dsh plugin --profile web add github:Wei894348/dsh-wb2api
 ```
 
-### 从压缩包装
+### 三、命令行：从压缩包装
 
 ```powershell
 # 仓库根打包
 npm pack                                              # → dsh-plugin-wb2api-ui-<version>.tgz
 
 # 装进 profile（profile 不存在时先建：dsh --profile <名> --from-default-profile web --dump-config）
-dsh plugin --profile web add file:<本仓库>\dsh-plugin-wb2api-ui-1.4.0.tgz
+dsh plugin --profile web add file:<本仓库>\dsh-plugin-wb2api-ui-1.5.0.tgz
 ```
 
-### 本地开发态（link）
+### 四、本地开发态（link）
 
 ```powershell
 # 把仓库链接到现场目录，profile 里写 "dsh-plugin-wb2api-ui": "link:<路径>"
@@ -53,12 +61,24 @@ dsh plugin --profile web add link:<本仓库路径>
 `dsh plugin add` 做两件事：把包装进 `~/.dsh/profiles/<profile>/node_modules/`，并把包名写进该 profile 的
 `dsh.profile.bundles`。**正在运行的 dsh 不会重读这个列表 —— 装完必须重启 dsh**（宿主半侧只在启动时加载）。
 
+> **桌面端（Electron）的 `desktop` profile 例外**：它由桌面端独占，`dsh plugin --profile desktop …` 会被直接拒绝
+> （`profile "desktop" is managed exclusively by the Electron application`），只能用桌面端的插件市场 UI 装。
+
 ### 验证装上了
 
 ```powershell
 dsh plugin --profile web list                                  # 依赖在不在
 dsh --profile web --dump-config | Select-String wb2api-ui      # 组合树里应出现 - id: wb2api-ui
 ```
+
+## 卸载
+
+```powershell
+dsh plugin --profile web remove dsh-plugin-wb2api-ui
+```
+
+卸完同样要重启 dsh。运行目录 `%USERPROFILE%\.dsh\wb2api\`（账号池与 `config.json`）**不归 `remove` 管** ——
+它是独立于插件的数据目录，要彻底清干净得手动删这一层。
 
 ## 快速开始
 

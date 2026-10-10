@@ -1,5 +1,16 @@
 # 变更记录
 
+## 1.5.1（2026-10-10）
+
+**安装 / 卸载说明补全，仓库接入社区插件目录**
+
+| 位置 | 改法 |
+|---|---|
+| README「安装」 | 拆成四种装法：插件市场（DSH Plugin Hub / dshmarket）、GitHub 直装、压缩包、link 开发态 |
+| 同上 | 标注 `desktop`（Electron 独占）profile 不能用命令行装，只能走桌面端市场 UI |
+| README 新增「卸载」 | `dsh plugin remove` 一条命令，并说明运行目录 `%USERPROFILE%\.dsh\wb2api\` 不归 `remove` 管 |
+| 仓库元数据 | 加 `dsh-plugin` 等 topic 与 description —— `dsh-plugin` topic 是社区插件目录自动收录的入口 |
+
 ## 1.5.0（2026-10-10）
 
 **对齐插件市场惯例：README 与代码布局重排**
