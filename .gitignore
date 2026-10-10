@@ -11,6 +11,10 @@ runtime/data/
 **/auths/*.json
 *.log
 
+# 本机排障用的临时目录（打包解包 / 人格样本），不入库
+.pack*/
+.probe/
+
 # 本机路径相关的临时文件
 .wb_key.json
 wb-restart-check.log
