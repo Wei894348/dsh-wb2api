@@ -10,11 +10,13 @@
 
 ## 安装
 
-任选其一。**装完必须重启 dsh**（宿主半侧只在启动时加载插件）。
+**装完必须重启 dsh**（宿主半侧只在启动时加载插件）。本插件未上架插件市场、也未发布到 npm，用下面两种方式之一安装。
 
-### 方式一：dshmarket 插件市场（推荐）
+### 方式一：命令行
 
-打开 dsh 的插件市场（dshmarket），搜索 `wb2api` 或 `wb2api-ui`，找到本插件点 **安装** 即可。
+```powershell
+dsh plugin --profile web add github:Wei894348/dsh-wb2api
+```
 
 ### 方式二：桌面端 UI
 
@@ -25,12 +27,6 @@ https://github.com/Wei894348/dsh-wb2api
 ```
 
 也可以填本地目录绝对路径或 `npm pack` 出来的 `.tgz` 压缩包路径。这是 `desktop` profile 唯一的安装方式（命令行碰不了桌面端）。
-
-### 方式三：命令行
-
-```powershell
-dsh plugin --profile web add github:Wei894348/dsh-wb2api
-```
 
 ## 卸载
 
