@@ -1,5 +1,19 @@
 # 变更记录
 
+## 1.5.8（2026-10-16）
+
+**修复：global（国际版）chat 全挂 + 网关二进制更新**
+
+- **global chat 路径回切 `/console`**：上游在 `/v2/chat/completions` 新挂渠道校验，
+  stream=true 确定性 403 code 11-128 "request illegal"（非 UA/指纹问题，同指纹打
+  `/console` 即过）。`/console` 要求首条消息为 system，`ensureConsoleSystem` 兜底注入
+  配套保留。副作用（已知取舍）：`/console` 挂腾讯云 WAF body 内容规则，命令执行类
+  内容可能 403——属内容拦截不罚账号，与渠道拦截（会误封号）性质不同。
+- **bundled 网关 `wb2a-server.exe` 更新**（agent 版，含上述路径修复）。
+- sidecar 桥支持（`lib/gw/proc.js`）：`<运行目录>/sidecars.json` 清单拉起/回收桥进程；
+  `runtime/anthropic_bridge.py` 加 NO_PROXY 回环豁免与 reasoning_effort 默认 low。
+- README：安装方式恢复 dshmarket 市场入口。
+
 ## 1.5.7（2026-10-10）
 
 **新增：EMPTY_RESPONSE 计数观测**

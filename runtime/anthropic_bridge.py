@@ -18,6 +18,11 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 UPSTREAM = os.environ.get("WB2A_UPSTREAM", "http://127.0.0.1:7863").rstrip("/")
+
+# 上游是本机回环 —— 不许环境里的 http_proxy 劫持（2026-10-11：带代理环境重启
+# bridge 后全部请求报 10061，因为 urllib 把 127.0.0.1:7863 发给了本地代理）。
+os.environ["NO_PROXY"] = os.environ.get("NO_PROXY", "") + ",127.0.0.1,localhost"
+os.environ["no_proxy"] = os.environ["NO_PROXY"]
 API_KEY = os.environ.get("WB2A_API_KEY", "")
 DEFAULT_MODEL = os.environ.get("WB2A_DEFAULT_MODEL", "cn:auto")
 LISTEN = os.environ.get("WB2A_BRIDGE_LISTEN", "127.0.0.1:7864")
@@ -143,6 +148,14 @@ def ant_to_oai(req):
         "max_tokens": req.get("max_tokens") or 8192,
         "stream": bool(req.get("stream")),
     }
+    # 思考强度（2026-10-11）：Anthropic 协议不携带 reasoning_effort，CC 请求
+    # 此前一直以模型默认深度打 GLM —— 思考越深越容易在思维链里翻盘拒答
+    # （同模型 Codex 走 codex_bridge 传 reasoning_effort=low，从不拒）。
+    # 默认压到 low；可用环境变量 ANTHROPIC_BRIDGE_EFFORT 或请求体里的
+    # reasoning_effort 字段覆盖。
+    body["reasoning_effort"] = (req.get("reasoning_effort")
+                                or os.environ.get("ANTHROPIC_BRIDGE_EFFORT")
+                                or "low")
     if req.get("stream"):
         body["stream_options"] = {"include_usage": True}
     if req.get("temperature") is not None:
