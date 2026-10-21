@@ -10,13 +10,9 @@ A DeepSeek Harness (dsh) plugin that turns your local WorkBuddy / CodeBuddy acco
 
 ## Install
 
-Pick one. **Restart dsh after installing** (the host side only loads plugins at startup).
+Pick one. **Restart dsh after installing** (the host side only loads plugins at startup). This plugin is not published to any plugin marketplace — install it directly using one of the two ways below.
 
-### Option 1: dshmarket plugin marketplace (recommended)
-
-Open the dsh plugin marketplace (dshmarket), search `wb2api` or `wb2api-ui`, find this plugin and click **Install**.
-
-### Option 2: Desktop UI
+### Option 1: Desktop UI
 
 Desktop app → Settings → Plugins → **Add Plugin**, enter:
 
@@ -26,7 +22,7 @@ https://github.com/Wei894348/dsh-wb2api
 
 A local directory path or a `.tgz` tarball path (from `npm pack`) also works. This is the only way to install into the `desktop` profile (CLI cannot touch it).
 
-### Option 3: Command line
+### Option 2: Command line
 
 ```powershell
 dsh plugin --profile web add github:Wei894348/dsh-wb2api
