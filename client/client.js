@@ -792,6 +792,8 @@
       '.wb2api-tools .wbp-row{padding:10px 0}',
       '.wb2api-tools .wbp-row:first-child{padding-top:0}',
       '.wb2api-tools .wbp-rows>.wbp-row:last-child{border-bottom:.5px solid var(--dsw-alias-border-l2)}',
+      '.wb2api-card-collapsed .wbp-footRow{display:none}',
+      '.wb2api-card-collapsed{gap:0}',
     ].join('');
     document.head.appendChild(tag);
   }
@@ -799,79 +801,82 @@
 
   window.__wb2apiToolsFactory = makeToolsComponent;
 
-  // --- 侧栏额度卡片：隐藏 / 恢复 ---------------------------------------------
+  // --- 侧栏额度卡片：折叠 / 展开 ---------------------------------------------
   //
-  // 卡片由界面运行时渲染（宽栏是 `.wbp-foot`，窄栏是 `.wbp-railButton`），它读的是
-  // `sidebarCreditVisible` 偏好。这里在卡片右上角贴一枚小按钮写这个偏好，再让运行时的
-  // 面板 store 立刻重读一次文档 —— 点一下就收起，不需要等它自己的轮询。
-  // 收起之后仍可在设置页「侧栏额度卡片」开关里打开（同一条偏好）。
-  var CARD_VISIBLE_PREF = 'sidebarCreditVisible'
+  // 卡片由界面运行时渲染（宽栏 `.wbp-foot`，窄栏 `.wbp-railButton`）。这里在卡片标题行
+  // 右端嵌一枚小箭头：点一下把明细行收起来、只留标题行，再点展开。折叠状态记在本地
+  // 偏好里，重渲染或切宽/窄栏后自动恢复；只收明细，不隐藏整张卡片。
+  var CARD_COLLAPSED_PREF = 'sidebarCardCollapsed'
   var cardToggleTimer = null
 
-  function sidebarCardVisiblePref() {
-    var prefs = readPrefs()
-    return prefs[CARD_VISIBLE_PREF] !== false
+  function cardCollapsedPref() {
+    return readPrefs()[CARD_COLLAPSED_PREF] === true
   }
 
-  async function setSidebarCardVisible(visible) {
-    writePref(CARD_VISIBLE_PREF, visible !== false)
-    var store = window.__wb2apiPanelStore
-    if (store && typeof store.refresh === 'function') {
-      try { await store.refresh() } catch (_error) { /* 立即刷新失败：等运行时自己的轮询 */ }
+  /** 直接改 DOM 上的折叠类：点一下立刻生效，不必等运行时重渲染。 */
+  function applyCardCollapsed(card, collapsed) {
+    if (card === null || card === undefined) return
+    if (collapsed) card.classList.add('wb2api-card-collapsed')
+    else card.classList.remove('wb2api-card-collapsed')
+    var arrow = card.querySelector('#wb2api-card-toggle')
+    if (arrow !== null) {
+      arrow.textContent = collapsed ? '▸' : '▾'
+      arrow.title = collapsed ? '展开额度明细' : '收起额度明细'
+      arrow.setAttribute('aria-label', arrow.title)
+      arrow.setAttribute('aria-expanded', collapsed ? 'false' : 'true')
     }
-    scheduleCardToggle()
+  }
+
+  function setCardCollapsed(collapsed) {
+    writePref(CARD_COLLAPSED_PREF, collapsed === true)
   }
 
   function scheduleCardToggle() {
     if (cardToggleTimer !== null) return
-    cardToggleTimer = window.setTimeout(function () { cardToggleTimer = null; syncCardToggle() }, 120)
+    cardToggleTimer = window.setTimeout(function () { cardToggleTimer = null; syncCardToggle() }, 60)
   }
 
-  /** 收起按钮做成 <span>：卡本身是 <button>，span 才能安全嵌进去。 */
+  /** 箭头做成 <span>：卡片本身是 <button>，span 才能安全嵌进去。 */
   function cardToggleSpan() {
     var span = document.createElement('span')
     span.id = 'wb2api-card-toggle'
     span.setAttribute('role', 'button')
     span.setAttribute('tabindex', '0')
-    span.title = '收起额度卡片'
-    span.setAttribute('aria-label', span.title)
-    span.textContent = '×'
-    span.style.cssText = 'flex:none;margin-left:auto;padding:0 6px;cursor:pointer;'
-      + 'color:var(--dsw-alias-label-tertiary,#8a8f98);font-size:13px;line-height:16px;'
-      + 'border-radius:6px;user-select:none;'
-    var hide = function (event) {
+    span.style.cssText = 'flex:none;padding:0 4px;cursor:pointer;user-select:none;'
+      + 'color:var(--dsw-alias-label-tertiary,#8a8f98);font-size:10px;line-height:16px;'
+    var toggle = function (event) {
       event.preventDefault()
       event.stopPropagation()
-      void setSidebarCardVisible(false)
+      var card = span.closest ? span.closest('.wbp-foot') : null
+      var next = !(card !== null && card.classList.contains('wb2api-card-collapsed'))
+      setCardCollapsed(next)
+      if (card !== null) applyCardCollapsed(card, next)
+      scheduleCardToggle()
     }
-    span.addEventListener('click', hide)
+    span.addEventListener('click', toggle)
     span.addEventListener('keydown', function (event) {
-      if (event.key === 'Enter' || event.key === ' ') hide(event)
-    })
-    span.addEventListener('mouseenter', function () {
-      span.style.color = 'var(--dsw-alias-label-primary,#e6e8ea)'
-    })
-    span.addEventListener('mouseleave', function () {
-      span.style.color = 'var(--dsw-alias-label-tertiary,#8a8f98)'
+      if (event.key === 'Enter' || event.key === ' ') toggle(event)
     })
     return span
   }
 
   /**
-   * 把按钮挂进卡片自己的标题行（`.wbp-footTop`），不挂外层容器。
-   *
-   * 外层容器在窄栏/折叠状态下会裁切溢出内容，绝对定位的按钮会被切掉；放进标题行
-   * 则由它自己的 flex 布局摆位，任何宽度都可见。窄栏那枚环形按钮直接嵌进去。
+   * 把箭头挂进卡片自己的标题行（`.wbp-footTop`），不挂外层容器 ——
+   * 外层容器在窄栏/折叠时会裁切溢出内容，绝对定位的按钮会被切掉。
    */
   function syncCardToggle() {
     if (typeof document === 'undefined' || document === null) return
     try {
       var card = document.querySelector('.wbp-foot')
-      var rail = card === null ? document.querySelector('.wbp-railButton') : null
-      var anchor = card === null ? rail : (card.querySelector('.wbp-footTop') || card)
-      if (anchor === null || anchor === undefined) return
-      if (anchor.querySelector('#wb2api-card-toggle') !== null) return
-      anchor.appendChild(cardToggleSpan())
+      var stale = document.getElementById('wb2api-card-toggle')
+      if (card === null) {
+        if (stale !== null && stale.parentElement !== null) stale.remove()
+        return
+      }
+      var top = card.querySelector('.wbp-footTop')
+      if (top === null) return
+      if (top.querySelector('#wb2api-card-toggle') === null) top.appendChild(cardToggleSpan())
+      applyCardCollapsed(card, cardCollapsedPref())
     } catch (_error) { /* 页面结构变化不该影响功能 */ }
   }
 
