@@ -819,42 +819,51 @@
     cardToggleTimer = window.setTimeout(function () { cardToggleTimer = null; syncCardToggle() }, 120)
   }
 
-  function cardToggleButton(hidden) {
-    var button = document.createElement('button')
-    button.type = 'button'
-    button.id = 'wb2api-card-toggle'
-    button.title = hidden ? '显示额度卡片' : '收起额度卡片'
-    button.setAttribute('aria-label', button.title)
-    button.textContent = hidden ? '额度' : '×'
-    button.style.cssText = 'position:absolute;z-index:30;border:0;background:transparent;'
-      + 'color:var(--dsw-alias-label-tertiary,#8a8f98);cursor:pointer;font:inherit;'
-      + 'font-size:12px;line-height:16px;padding:0 4px;border-radius:6px;'
-      + (hidden ? 'left:4px;top:2px;' : 'right:4px;top:2px;')
-    button.addEventListener('click', function (event) {
+  /** 收起按钮做成 <span>：卡本身是 <button>，span 才能安全嵌进去。 */
+  function cardToggleSpan() {
+    var span = document.createElement('span')
+    span.id = 'wb2api-card-toggle'
+    span.setAttribute('role', 'button')
+    span.setAttribute('tabindex', '0')
+    span.title = '收起额度卡片'
+    span.setAttribute('aria-label', span.title)
+    span.textContent = '×'
+    span.style.cssText = 'flex:none;margin-left:auto;padding:0 6px;cursor:pointer;'
+      + 'color:var(--dsw-alias-label-tertiary,#8a8f98);font-size:13px;line-height:16px;'
+      + 'border-radius:6px;user-select:none;'
+    var hide = function (event) {
       event.preventDefault()
       event.stopPropagation()
-      void setSidebarCardVisible(hidden)
+      void setSidebarCardVisible(false)
+    }
+    span.addEventListener('click', hide)
+    span.addEventListener('keydown', function (event) {
+      if (event.key === 'Enter' || event.key === ' ') hide(event)
     })
-    return button
+    span.addEventListener('mouseenter', function () {
+      span.style.color = 'var(--dsw-alias-label-primary,#e6e8ea)'
+    })
+    span.addEventListener('mouseleave', function () {
+      span.style.color = 'var(--dsw-alias-label-tertiary,#8a8f98)'
+    })
+    return span
   }
 
+  /**
+   * 把按钮挂进卡片自己的标题行（`.wbp-footTop`），不挂外层容器。
+   *
+   * 外层容器在窄栏/折叠状态下会裁切溢出内容，绝对定位的按钮会被切掉；放进标题行
+   * 则由它自己的 flex 布局摆位，任何宽度都可见。窄栏那枚环形按钮直接嵌进去。
+   */
   function syncCardToggle() {
     if (typeof document === 'undefined' || document === null) return
-    if (document.body === undefined || document.body === null) return
     try {
-    var card = document.querySelector('.wbp-foot') || document.querySelector('.wbp-railButton')
-    var existing = document.getElementById('wb2api-card-toggle')
-    if (card === null) {
-      if (existing !== null) existing.remove()
-      return
-    }
-    var host = card.parentElement
-    if (host === null) return
-    if (existing !== null && existing.parentElement === host) return
-    if (existing !== null) existing.remove()
-    var computed = window.getComputedStyle ? window.getComputedStyle(host) : null
-    if (computed !== null && computed.position === 'static') host.style.position = 'relative'
-    host.appendChild(cardToggleButton(sidebarCardVisiblePref()))
+      var card = document.querySelector('.wbp-foot')
+      var rail = card === null ? document.querySelector('.wbp-railButton') : null
+      var anchor = card === null ? rail : (card.querySelector('.wbp-footTop') || card)
+      if (anchor === null || anchor === undefined) return
+      if (anchor.querySelector('#wb2api-card-toggle') !== null) return
+      anchor.appendChild(cardToggleSpan())
     } catch (_error) { /* 页面结构变化不该影响功能 */ }
   }
 
