@@ -791,6 +791,81 @@
 
   window.__wb2apiToolsFactory = makeToolsComponent;
 
+  // --- 侧栏额度卡片：隐藏 / 恢复 ---------------------------------------------
+  //
+  // 卡片由界面运行时渲染（宽栏是 `.wbp-foot`，窄栏是 `.wbp-railButton`），它读的是
+  // `sidebarCreditVisible` 偏好。这里在卡片右上角贴一枚小按钮写这个偏好，再让运行时的
+  // 面板 store 立刻重读一次文档 —— 点一下就收起，不需要等它自己的轮询。
+  // 收起之后仍可在设置页「侧栏额度卡片」开关里打开（同一条偏好）。
+  var CARD_VISIBLE_PREF = 'sidebarCreditVisible'
+  var cardToggleTimer = null
+
+  function sidebarCardVisiblePref() {
+    var prefs = readPrefs()
+    return prefs[CARD_VISIBLE_PREF] !== false
+  }
+
+  async function setSidebarCardVisible(visible) {
+    writePref(CARD_VISIBLE_PREF, visible !== false)
+    var store = window.__wb2apiPanelStore
+    if (store && typeof store.refresh === 'function') {
+      try { await store.refresh() } catch (_error) { /* 立即刷新失败：等运行时自己的轮询 */ }
+    }
+    scheduleCardToggle()
+  }
+
+  function scheduleCardToggle() {
+    if (cardToggleTimer !== null) return
+    cardToggleTimer = window.setTimeout(function () { cardToggleTimer = null; syncCardToggle() }, 120)
+  }
+
+  function cardToggleButton(hidden) {
+    var button = document.createElement('button')
+    button.type = 'button'
+    button.id = 'wb2api-card-toggle'
+    button.title = hidden ? '显示额度卡片' : '收起额度卡片'
+    button.setAttribute('aria-label', button.title)
+    button.textContent = hidden ? '额度' : '×'
+    button.style.cssText = 'position:absolute;z-index:30;border:0;background:transparent;'
+      + 'color:var(--dsw-alias-label-tertiary,#8a8f98);cursor:pointer;font:inherit;'
+      + 'font-size:12px;line-height:16px;padding:0 4px;border-radius:6px;'
+      + (hidden ? 'left:4px;top:2px;' : 'right:4px;top:2px;')
+    button.addEventListener('click', function (event) {
+      event.preventDefault()
+      event.stopPropagation()
+      void setSidebarCardVisible(hidden)
+    })
+    return button
+  }
+
+  function syncCardToggle() {
+    if (typeof document === 'undefined' || document === null) return
+    if (document.body === undefined || document.body === null) return
+    try {
+    var card = document.querySelector('.wbp-foot') || document.querySelector('.wbp-railButton')
+    var existing = document.getElementById('wb2api-card-toggle')
+    if (card === null) {
+      if (existing !== null) existing.remove()
+      return
+    }
+    var host = card.parentElement
+    if (host === null) return
+    if (existing !== null && existing.parentElement === host) return
+    if (existing !== null) existing.remove()
+    var computed = window.getComputedStyle ? window.getComputedStyle(host) : null
+    if (computed !== null && computed.position === 'static') host.style.position = 'relative'
+    host.appendChild(cardToggleButton(sidebarCardVisiblePref()))
+    } catch (_error) { /* 页面结构变化不该影响功能 */ }
+  }
+
+  function watchSidebarCard() {
+    if (typeof MutationObserver !== 'function' || typeof document === 'undefined' || document === null) return
+    var observer = new MutationObserver(function () { scheduleCardToggle() })
+    observer.observe(document.body, { childList: true, subtree: true })
+    scheduleCardToggle()
+  }
+  watchSidebarCard()
+
   // 让同一页面的其它脚本能手动清缓存（调试用）。
   window.__wb2apiShim = {
     invalidate: function () { cache.value = null; },

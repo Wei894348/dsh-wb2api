@@ -799,6 +799,81 @@
 
   window.__wb2apiToolsFactory = makeToolsComponent;
 
+  // --- 侧栏额度卡片：隐藏 / 恢复 ---------------------------------------------
+  //
+  // 卡片由界面运行时渲染（宽栏是 `.wbp-foot`，窄栏是 `.wbp-railButton`），它读的是
+  // `sidebarCreditVisible` 偏好。这里在卡片右上角贴一枚小按钮写这个偏好，再让运行时的
+  // 面板 store 立刻重读一次文档 —— 点一下就收起，不需要等它自己的轮询。
+  // 收起之后仍可在设置页「侧栏额度卡片」开关里打开（同一条偏好）。
+  var CARD_VISIBLE_PREF = 'sidebarCreditVisible'
+  var cardToggleTimer = null
+
+  function sidebarCardVisiblePref() {
+    var prefs = readPrefs()
+    return prefs[CARD_VISIBLE_PREF] !== false
+  }
+
+  async function setSidebarCardVisible(visible) {
+    writePref(CARD_VISIBLE_PREF, visible !== false)
+    var store = window.__wb2apiPanelStore
+    if (store && typeof store.refresh === 'function') {
+      try { await store.refresh() } catch (_error) { /* 立即刷新失败：等运行时自己的轮询 */ }
+    }
+    scheduleCardToggle()
+  }
+
+  function scheduleCardToggle() {
+    if (cardToggleTimer !== null) return
+    cardToggleTimer = window.setTimeout(function () { cardToggleTimer = null; syncCardToggle() }, 120)
+  }
+
+  function cardToggleButton(hidden) {
+    var button = document.createElement('button')
+    button.type = 'button'
+    button.id = 'wb2api-card-toggle'
+    button.title = hidden ? '显示额度卡片' : '收起额度卡片'
+    button.setAttribute('aria-label', button.title)
+    button.textContent = hidden ? '额度' : '×'
+    button.style.cssText = 'position:absolute;z-index:30;border:0;background:transparent;'
+      + 'color:var(--dsw-alias-label-tertiary,#8a8f98);cursor:pointer;font:inherit;'
+      + 'font-size:12px;line-height:16px;padding:0 4px;border-radius:6px;'
+      + (hidden ? 'left:4px;top:2px;' : 'right:4px;top:2px;')
+    button.addEventListener('click', function (event) {
+      event.preventDefault()
+      event.stopPropagation()
+      void setSidebarCardVisible(hidden)
+    })
+    return button
+  }
+
+  function syncCardToggle() {
+    if (typeof document === 'undefined' || document === null) return
+    if (document.body === undefined || document.body === null) return
+    try {
+    var card = document.querySelector('.wbp-foot') || document.querySelector('.wbp-railButton')
+    var existing = document.getElementById('wb2api-card-toggle')
+    if (card === null) {
+      if (existing !== null) existing.remove()
+      return
+    }
+    var host = card.parentElement
+    if (host === null) return
+    if (existing !== null && existing.parentElement === host) return
+    if (existing !== null) existing.remove()
+    var computed = window.getComputedStyle ? window.getComputedStyle(host) : null
+    if (computed !== null && computed.position === 'static') host.style.position = 'relative'
+    host.appendChild(cardToggleButton(sidebarCardVisiblePref()))
+    } catch (_error) { /* 页面结构变化不该影响功能 */ }
+  }
+
+  function watchSidebarCard() {
+    if (typeof MutationObserver !== 'function' || typeof document === 'undefined' || document === null) return
+    var observer = new MutationObserver(function () { scheduleCardToggle() })
+    observer.observe(document.body, { childList: true, subtree: true })
+    scheduleCardToggle()
+  }
+  watchSidebarCard()
+
   // 让同一页面的其它脚本能手动清缓存（调试用）。
   window.__wb2apiShim = {
     invalidate: function () { cache.value = null; },
@@ -7168,6 +7243,20 @@ window.__ModuleLoader__.load({
 					const __nativeRegister = __slots.register.bind(__slots);
 					const __Tools = __wb2apiToolsFactory(react);
 					__slots.register = function (desc, Component) {
+						// 侧栏卡片与仪表盘共用同一个面板 store：这里把它接到 window 上，
+						// 隐藏按钮才能在写入偏好之后立刻触发一次重读（不然要等下一轮轮询）。
+						if (desc !== null && desc !== void 0 && (desc.name === "sidebar.footer.action" || desc.name === "main") && typeof desc.inject === "function" && desc.__wb2apiStoreHooked !== true) {
+							desc.__wb2apiStoreHooked = true;
+							const __nativeInject = desc.inject;
+							desc.inject = function () {
+								const __face = __nativeInject.apply(this, arguments);
+								try {
+									const __store = __face !== null && __face !== void 0 && __face.hooks !== void 0 ? __face.hooks.workBuddyPanel : void 0;
+									if (__store !== void 0 && typeof window !== "undefined") window.__wb2apiPanelStore = __store;
+								} catch (__error) { /* 接不上只影响即时刷新，不影响渲染 */ }
+								return __face;
+							};
+						}
 						const __target = desc !== null && desc !== void 0 && desc.name === "settings.section" && desc.id === "wb2api";
 						if (!__target || typeof Component !== "function") return __nativeRegister(desc, Component);
 						const __Wrapped = function (props) {
