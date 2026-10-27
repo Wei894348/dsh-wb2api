@@ -706,15 +706,24 @@
       // 只留「标题 + 一行状态 + 一个动作」：分组说明、日志尾巴、token 统计这些次要
       // 文案全部去掉（用户 2026-10-27：删除多余的标语、说明文字、次要标签）。
       const lastLog = tasks.logs.length > 0 ? String(tasks.logs[tasks.logs.length - 1]) : '';
-      return h(React.Fragment, null,
-        h(toolsGroup, { title: '网关' },
+      /**
+       * 顶部这一块**不再用两个带标题的分组**。
+       *
+       * 分组自带 `margin-top:28px` 与标题行，两块叠在页首会堆出两段空隙，看起来
+       * 像两段各自为政的东西贴在账号区上面（用户原话：最上面太突兀、空白太多）。
+       * 改成一张无外边距的紧凑行组：两行「短标题 + 状态 + 右侧动作」，行距收紧，
+       * 与下面账号行同宽同列，读起来是一条状态带而不是两个章节。
+       */
+      return h('div', { className: 'wb2api-tools', 'data-wb2api-tools': '' },
+        h('div', { className: 'wbp-rows' },
           h(toolsRow, {
-            title: gateway.phase === 'loading' ? '读取中…' : gateway.text,
-            desc: gateway.note || null,
-          }, h(toolsButton, { label: gateway.busy ? '重启中…' : '重启网关', disabled: gateway.busy, onClick: restartGateway }))),
-        h(toolsGroup, { title: '成长任务' },
-          h(toolsRow, { title: taskTitle, desc: tasks.note || lastLog || null },
-            h(toolsButton, { label: tasks.running ? '领取中…' : '领取任务积分', disabled: tasks.running, onClick: runTasks }))));
+            title: '网关',
+            desc: gateway.phase === 'loading' ? '读取中…' : (gateway.text + (gateway.note ? ' · ' + gateway.note : '')),
+          }, h(toolsButton, { label: gateway.busy ? '重启中…' : '重启网关', disabled: gateway.busy, onClick: restartGateway })),
+          h(toolsRow, {
+            title: '成长任务',
+            desc: taskTitle + (tasks.note ? ' · ' + tasks.note : (lastLog ? ' · ' + lastLog : '')),
+          }, h(toolsButton, { label: tasks.running ? '领取中…' : '领取任务积分', disabled: tasks.running, onClick: runTasks }))));
     };
   }
 
@@ -727,6 +736,28 @@
    * 补丁注入 vendor 的 `apply` 内部完成「合页」：拦 `ctx.slots.register`，把设置页
    * 裹成「原页面 + 工具块」的 Fragment —— 效果和之前一致，但不碰模块加载面。
    */
+  /**
+   * 工具块的少量排版修正。
+   *
+   * 参考实现的 `.wbp-group` 是「标题 + 28px 上边距」的结构，放在页面最顶上时会在
+   * 页首堆出两段空隙、看着很突兀；行本身又是 16px 上下内边距，两行就占掉半屏。
+   * 这里只覆盖我们自己这块（`.wb2api-tools`），不动参考页面的任何样式。
+   */
+  function injectToolsCss() {
+    if (typeof document === 'undefined' || document === null) return;
+    if (document.querySelector('style[data-plugin-css="wb2api-tools"]') !== null) return;
+    var tag = document.createElement('style');
+    tag.dataset.pluginCss = 'wb2api-tools';
+    tag.textContent = [
+      '.wb2api-tools{margin:0 0 4px}',
+      '.wb2api-tools .wbp-row{padding:10px 0}',
+      '.wb2api-tools .wbp-row:first-child{padding-top:0}',
+      '.wb2api-tools .wbp-rows>.wbp-row:last-child{border-bottom:.5px solid var(--dsw-alias-border-l2)}',
+    ].join('');
+    document.head.appendChild(tag);
+  }
+  injectToolsCss();
+
   window.__wb2apiToolsFactory = makeToolsComponent;
 
   // 让同一页面的其它脚本能手动清缓存（调试用）。
