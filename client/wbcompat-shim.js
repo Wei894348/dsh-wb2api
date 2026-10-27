@@ -170,6 +170,8 @@
       var credit = creditByFile.get(account.file);
       var ok = credit !== undefined && credit.state === 'ok';
       var segments = ok && Array.isArray(credit.segments) ? credit.segments : [];
+      var expiresAtMs = Number(account.expiresAt) > 0 ? Number(account.expiresAt) * 1000 : 0;
+      var tokenExpired = expiresAtMs > 0 && expiresAtMs <= now;
       var row = {
         id: account.file,
         uid: account.uid,
@@ -180,13 +182,20 @@
         domain: typeof account.domain === 'string' ? account.domain : '',
         renewable: true,
         enabled: account.disabled !== true,
-        available: account.disabled !== true && account.expired !== true,
-        // 令牌到期时间属于次要信息（账号行会渲染成「N 天后令牌过期」），不再下发。
-        expiresAtMs: 0,
+        // 「可用」要同时满足：没被手动禁用、文件没过期、令牌没过期。参考实现还会看
+        // sessionDead —— 见下面两处判定，光看前两条会把已经死掉的号画成绿色圆点。
+        available: account.disabled !== true && account.expired !== true && !tokenExpired,
+        expiresAtMs: expiresAtMs,
         lastUsedAtMs: 0,
         addedAtMs: Number.isFinite(Number(account.mtime)) ? Math.round(Number(account.mtime)) : 0,
       };
       if (account.nickname) row.nickname = account.nickname;
+      if (tokenExpired) {
+        // 令牌过期：参考实现只对 `renewable !== true` 的账号渲染「令牌即将过期」，
+        // 所以真正要它显示「登录已失效」必须走 sessionDead 这条。
+        row.sessionDead = true;
+        row.available = false;
+      }
       if (ok) {
         row.credits = Number(Number(credit.total).toFixed(2));
         row.creditsTotal = segmentTotal(segments);
@@ -197,10 +206,15 @@
         row.creditsError = typeof credit.error === 'string' && credit.error !== ''
           ? credit.error
           : '读取失败';
-        if (/401|403|凭证|授权/.test(row.creditsError)) row.sessionDead = false;
+        // 计费接口 401/403（或凭证类报错）= 这枚 token 在平台侧已经不认了。
+        // 之前这里把 sessionDead 写成 false，于是死号照样绿点 + 可用，用户在面板上
+        // 看到「能用」但实际打不动 —— 2026-10-27 修。
+        if (/401|403|凭证|授权|失效|过期/.test(row.creditsError)) {
+          row.sessionDead = true;
+          row.available = false;
+        }
       }
       if (account.disabled === true) row.enabled = false;
-      void now;
       return row;
     });
 
@@ -293,7 +307,10 @@
         for (var n = 0; n < data.checkin.rows.length; n += 1) {
           var source = data.checkin.rows[n];
           var uid = String(source.uid || source.accountId || '');
-          if (uid !== '') signedToday[uid] = source.day === todayString;
+          // 只有**当天且真的签成功**才算：之前只比日期，导致「今天签到失败」的账号
+          // 也挂上「今日已签到」，看起来像签过了（用户 2026-10-27 报的问题）。
+          var succeeded = source.state === 'checked-in' || source.state === 'already';
+          if (uid !== '') signedToday[uid] = source.day === todayString && succeeded;
         }
         for (var m = 0; m < built.rows.length; m += 1) {
           if (signedToday[built.rows[m].uid] === true) built.rows[m].checkinToday = true;
@@ -625,14 +642,23 @@
           const body = await response.json();
           const pool = body && body.gateway ? body.gateway : {};
           const accounts = Array.isArray(body && body.accounts) ? body.accounts : [];
-          const usable = accounts.filter((account) => account.disabled !== true).length;
+          const usable = accounts.filter((account) => account.disabled !== true && account.expired !== true).length;
+          const health = pool.health !== null && typeof pool.health === 'object' ? pool.health : null;
           setGateway((prev) => ({
             phase: 'ready',
             busy: false,
-            // 只留「跑没跑 + 几个可用」这一句：端口和健康计数属于次要标签，
-            // 重启结果与错误走 note，界面上一屏能看到就行。
+            // 网关行下面的提示沿用 1.5.9 的口径：跑没跑 · 可用账号 · 网关地址 · 健康计数。
+            // 「可用账号」优先用网关自己的健康计数（它知道谁被熔断/冷却），
+            // 读不到才回落到账号池里未禁用的条数 —— 两处口径不同时以网关为准。
             text: (pool.running === true ? '运行中' : '未运行')
-              + ' · 可用账号 ' + usable + '/' + accounts.length,
+              + ' · 可用账号 '
+              + (pool.health && Number.isFinite(Number(pool.health.total))
+                ? String(pool.health.healthy === undefined ? '—' : pool.health.healthy) + '/' + String(pool.health.total)
+                : usable + '/' + accounts.length)
+              + (typeof pool.baseURL === 'string' && pool.baseURL !== '' ? ' · ' + pool.baseURL : '')
+              + (health !== null && Number.isFinite(Number(health.total))
+                ? ' · 健康 ' + String(health.healthy === undefined ? '—' : health.healthy) + '/' + String(health.total)
+                : ''),
           }));
         } catch (error) {
           setGateway({ phase: 'error', busy: false, text: '读取网关状态失败', note: String((error && error.message) || error) });
