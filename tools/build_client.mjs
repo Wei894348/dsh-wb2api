@@ -102,6 +102,30 @@ const TOOLS_INJECT = `		// --- wb2api: 网关重启 / 任务领取，折进参�
 if (!bundle.includes(TOOLS_ANCHOR)) throw new Error('vendor 里找不到注入锚点：exports.CARD_VARIANTS')
 bundle = bundle.replace(TOOLS_ANCHOR, `${TOOLS_INJECT}\n${TOOLS_ANCHOR}`)
 
+/**
+ * 账号行上的「今日已签到」标签。
+ *
+ * 需求是**不要单独一个签到分组**，标签直接长在账号那一行上（和额度、状态同一行）。
+ * 参考实现的账号行只认它自己的字段，所以这里做一处结构注入：在账号名后面加一个
+ * 条件渲染的小标签，取值来自 shim 给账号对象额外挂的 `checkinToday`
+ * （WorkBuddyWebAccount 之外的非契约字段，宿主不认识、渲染层只在这里读）。
+ *
+ * 改动只有这一处、只读一个新增字段：参考实现升级时重新拷一份 vendor，
+ * 锚点若变了会直接抛错（不会静默丢掉标签）。
+ */
+const CHIP_ANCHOR = 'children: account.name'
+const chipAt = bundle.indexOf(CHIP_ANCHOR)
+if (chipAt < 0) throw new Error('vendor 里找不到账号行姓名字段（children: account.name）')
+const chipEnd = bundle.indexOf('}),', chipAt)
+if (chipEnd < 0) throw new Error('vendor 里找不到账号行姓名节点的结尾')
+const CHIP = `
+									account.checkinToday === true ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										className: "wbp-usagePlanStatus",
+										style: { color: "var(--dsw-alias-state-success-primary, #16a34a)" },
+										children: "今日已签到"
+									}) : null,`
+bundle = bundle.slice(0, chipEnd + 3) + CHIP + bundle.slice(chipEnd + 3)
+
 const shim = readFileSync(shimPath, 'utf8')
 
 const banner = `// WorkBuddy 反代（workbuddy2api）设置面板 —— 浏览器半侧。

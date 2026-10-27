@@ -297,25 +297,20 @@
       doc.models = buildModels(data.models, realm);
       doc.catalog = { source: 'live', fetchedAt: Date.now() };
 
-      // 签到：参考实现的设置页本来就有「每日签到」分组（自动开关 + 每账号一行 +
-      // 「立即签到」）。这里把宿主 autocheckin 的记录翻译成它的 WorkBuddyWebCheckin，
-      // 于是签到是**原生界面**，不额外画控件。
+      // 签到：**不再单独成组**，而是标在每个账号行上。参考实现的账号行被构建期
+      // 补了一处条件渲染（读 `account.checkinToday`），所以这里只给账号对象挂标记。
+      // 数据来自宿主 /dsh-wb2api/checkin-status（本插件自己的记录优先，外部文件兜底）。
       if (data.checkin && Array.isArray(data.checkin.rows)) {
-        var byUid = {};
-        for (var m = 0; m < built.mine.length; m += 1) byUid[built.mine[m].uid] = built.mine[m].file;
-        var checkinRows = [];
+        var todayString = localDayString(new Date());
+        var signedToday = {};
         for (var n = 0; n < data.checkin.rows.length; n += 1) {
           var source = data.checkin.rows[n];
-          var accountId = byUid[source.uid];
-          if (accountId === undefined) continue;
-          var row = { accountId: accountId };
-          if (typeof source.day === 'string') row.day = source.day;
-          if (Number(source.atMs) > 0) row.atMs = Number(source.atMs);
-          if (typeof source.state === 'string') row.state = source.state;
-          if (typeof source.reason === 'string' && source.reason !== '') row.reason = source.reason;
-          checkinRows.push(row);
+          var uid = String(source.uid || source.accountId || '');
+          if (uid !== '') signedToday[uid] = source.day === todayString;
         }
-        doc.checkin = { auto: data.checkin.auto === true, rows: checkinRows };
+        for (var m = 0; m < built.rows.length; m += 1) {
+          if (signedToday[built.rows[m].uid] === true) built.rows[m].checkinToday = true;
+        }
       }
     }
 
@@ -620,7 +615,6 @@
       const [gateway, setGateway] = useState({ phase: 'idle', text: '—', note: '', busy: false });
       const [tasks, setTasks] = useState({ running: false, pending: null, summary: null, logs: [], note: '', });
       /** 今日签到：phase=idle/ready/error；rows 里 today 由本地日期与记录 day 比出来。 */
-      const [checkin, setCheckin] = useState({ phase: 'idle', day: '', rows: [], note: '', busy: false });
       // 凭证 JSON 粘贴：参考界面的「添加账号」只有扫码 / 令牌两条路，本插件一直
       // 支持整份凭证 JSON（含 refreshToken），这里补一个输入框，走宿主 /import。
 
@@ -703,54 +697,7 @@
         }
       }, []);
 
-      /** 今日签到：宿主 autocheckin 记录 + 账号昵称，按本地日期比出「今日已签到」。 */
-      const loadCheckin = useCallback(async () => {
-        try {
-          const [statusResponse, stateResponse] = await Promise.all([
-            fetch('/dsh-wb2api/checkin-status', { headers: { accept: 'application/json' } }),
-            fetch('/dsh-wb2api/state', { headers: { accept: 'application/json' } }),
-          ]);
-          if (!statusResponse.ok) throw new Error('HTTP ' + statusResponse.status);
-          const status = await statusResponse.json().catch(() => ({}));
-          const pool = stateResponse.ok ? await stateResponse.json().catch(() => ({})) : {};
-          const byUid = new Map();
-          for (const account of (Array.isArray(pool.accounts) ? pool.accounts : [])) byUid.set(account.uid, account);
-          const today = localDayString(new Date());
-          const rows = (Array.isArray(status.rows) ? status.rows : []).map((row) => {
-            const account = byUid.get(row.uid) || byUid.get(row.accountId);
-            return {
-              uid: String(row.uid || row.accountId || ''),
-              name: (account && account.nickname) || String(row.uid || '').slice(0, 8),
-              today: row.day === today,
-              day: typeof row.day === 'string' ? row.day : '',
-              state: typeof row.state === 'string' ? row.state : '',
-              reason: typeof row.reason === 'string' ? row.reason : '',
-            };
-          });
-          setCheckin({ phase: 'ready', day: typeof status.day === 'string' ? status.day : '', rows: rows, note: '', busy: false });
-        } catch (error) {
-          setCheckin((prev) => ({ ...prev, phase: 'error', busy: false, note: '签到状态读取失败：' + String((error && error.message) || error) }));
-        }
-      }, []);
-
-      const runCheckin = useCallback(async () => {
-        setCheckin((prev) => ({ ...prev, busy: true, note: '正在签到…' }));
-        try {
-          const response = await fetch('/dsh-wb2api/checkin', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json', accept: 'application/json' },
-            body: '{}',
-          });
-          const body = await response.json().catch(() => ({}));
-          if (!response.ok) throw new Error(typeof body.error === 'string' ? body.error : 'HTTP ' + response.status);
-          await loadCheckin();
-          setCheckin((prev) => ({ ...prev, busy: false }));
-        } catch (error) {
-          setCheckin((prev) => ({ ...prev, busy: false, note: '签到失败：' + String((error && error.message) || error) }));
-        }
-      }, [loadCheckin]);
-
-      useEffect(() => { void loadGateway(); void loadTasks(); void loadCheckin(); }, [loadGateway, loadTasks, loadCheckin]);
+      useEffect(() => { void loadGateway(); void loadTasks(); }, [loadGateway, loadTasks]);
       useEffect(() => {
         const timer = setInterval(() => { void loadTasks(); }, 3000);
         return () => clearInterval(timer);
@@ -765,21 +712,6 @@
 
       // 折进参考页面里渲染（同一个 wbp-section 列），所以这里只出分组、不再自建列。
       return h(React.Fragment, null,
-        h(toolsGroup, { title: '每日签到', desc: '宿主每天自动签到一次；这里显示每个账号今天签没签，也可以手动补一次。' },
-          h(toolsRow, {
-            title: checkin.phase === 'ready'
-              ? '今日已签到 ' + checkin.rows.filter((row) => row.today).length + '/' + checkin.rows.length
-              : (checkin.phase === 'error' ? '签到状态读取失败' : '读取中…'),
-            desc: checkin.note || (checkin.day !== '' ? '最近一次记录：' + checkin.day : null),
-          }, h(toolsButton, { label: checkin.busy ? '签到中…' : '立即签到', disabled: checkin.busy, onClick: runCheckin })),
-          checkin.rows.length === 0 ? null : h('div', { className: 'wbp-rows' },
-            checkin.rows.map((row) => h('div', { key: row.uid, className: 'wbp-row wbp-rowFlush' },
-              h('div', { className: 'wbp-rowText' },
-                h('span', { className: 'wbp-rowTitle' }, row.name),
-                h('span', { className: 'wbp-rowDesc', style: row.today ? { color: 'var(--dsw-alias-state-success-primary, #16a34a)' } : undefined },
-                  row.today
-                    ? '今日已签到'
-                    : (row.state === 'failed' ? '上次失败：' + (row.reason || '未知原因') : '今日未签到'))))))),
         h(toolsGroup, { title: '网关', desc: '自托管网关进程（WorkBuddy / CodeBuddy 账号池反代）。抽风时重启一次即可，端口僵死会被清掉。' },
           h(toolsRow, {
             title: gateway.phase === 'loading' ? '读取中…' : gateway.text,
@@ -2585,6 +2517,11 @@ window.__ModuleLoader__.load({
 								title: account.name,
 								children: account.name
 							}),
+									account.checkinToday === true ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										className: "wbp-usagePlanStatus",
+										style: { color: "var(--dsw-alias-state-success-primary, #16a34a)" },
+										children: "今日已签到"
+									}) : null,
 							tone === "ok" ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 								className: "wbp-usagePlanStatus",
 								children: stateLabel
