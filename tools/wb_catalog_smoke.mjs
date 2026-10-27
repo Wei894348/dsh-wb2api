@@ -152,6 +152,82 @@ function catalogWith (list, policy) {
     `cn:dup→${cn?.realm} / global:dup→${gl?.realm} / cn:nope→${miss === undefined ? 'undefined' : 'hit'}`)
 }
 
+// ── 13-16. 裸名归属 + 去重 + 落盘快照（2026-10-27「模型下拉抽风」排查）────────
+// 现场症状：国际模型出现在国内版里、有些模型少了、偶尔一个模型都选不了（重启网关无效）。
+// 根因：网关对「只有单一 realm 可用」的模型会吐**裸名**，而裸名一律按 CN 处理；
+// 它还会在带前缀的同名条目之外再吐一条裸名 —— 去重后少一条。
+
+{
+  // 裸名 + global 同名：必须归国际版，且不能变成一条 cn 一条 global
+  const BARE_GLOBAL = [
+    { id: 'glm-5.3', context_length: 1000 },
+    { id: 'global:glm-5.3', context_length: 1000 },
+  ]
+  const models = await catalogWith(BARE_GLOBAL, 'keep').get(true)
+  const realms = models.map((m) => `${m.id}:${m.realm}`).join(',')
+  const ok = models.length === 1 && models[0].realm === 'global'
+  record('裸名 + global 同名 → 只留国际版一条', ok, realms)
+}
+
+{
+  // 裸名 + cn 同名：带前缀的才权威，裸名重复条目必须丢
+  const BARE_CN = [
+    { id: 'cn:glm-5.3', context_length: 1000 },
+    { id: 'glm-5.3', context_length: 1000 },
+  ]
+  const models = await catalogWith(BARE_CN, 'keep').get(true)
+  const ok = models.length === 1 && models[0].realm === 'cn'
+  record('裸名 + cn 同名 → 去重成一条 cn', ok, models.map((m) => `${m.id}:${m.realm}`).join(','))
+}
+
+{
+  // 落盘快照：第一次拉成功后，换一个「上游 401」的实例冷启动，仍要有模型可选
+  const { mkdtempSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const snapshotPath = join(mkdtempSync(join(tmpdir(), 'wb-cat-')), 'catalog.json')
+  const seed = new ModelCatalog({
+    baseURL: 'http://127.0.0.1:7863/v1',
+    apiKey: 'k',
+    snapshotPath,
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ data: MODEL_FIXTURE }) }),
+  })
+  const seeded = await seed.get(true)
+  const cold = new ModelCatalog({
+    baseURL: 'http://127.0.0.1:7863/v1',
+    apiKey: 'k',
+    snapshotPath,
+    fetchImpl: async () => ({ ok: false, status: 401, json: async () => ({}) }),
+  })
+  let coldModels = []
+  let coldError = null
+  try {
+    coldModels = await cold.get()
+  } catch (error) {
+    coldError = error
+  }
+  const ok = seeded.length === coldModels.length && coldModels.length > 0 && coldError === null
+  record('冷启动 + 上游 401 → 用落盘快照顶上（不抛空列表）', ok,
+    `${coldModels.length} 条${coldError ? ` / 抛错: ${coldError.message}` : ''}`)
+}
+
+{
+  // 没有任何快照时，401 仍然要抛 —— 让 chat.js 那一层决定怎么降级
+  const { mkdtempSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const snapshotPath = join(mkdtempSync(join(tmpdir(), 'wb-cat-')), 'missing.json')
+  const cold = new ModelCatalog({
+    baseURL: 'http://127.0.0.1:7863/v1',
+    apiKey: 'k',
+    snapshotPath,
+    fetchImpl: async () => ({ ok: false, status: 401, json: async () => ({}) }),
+  })
+  let threw = false
+  try { await cold.get() } catch { threw = true }
+  record('无快照 + 401 → 仍然抛错（由适配器兜成空列表）', threw, threw ? 'threw' : 'returned silently')
+}
+
 // 可选：真网关。只读 /v1/models，不打付费上游。
 if (process.argv.includes('--live')) {
   const { readFileSync } = await import('node:fs')
