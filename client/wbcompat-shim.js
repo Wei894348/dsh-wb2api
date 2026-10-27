@@ -785,6 +785,7 @@
       '.wb2api-tools .wbp-row:first-child{padding-top:0}',
       '.wb2api-tools .wbp-rows>.wbp-row:last-child{border-bottom:.5px solid var(--dsw-alias-border-l2)}',
       '.wb2api-card-collapsed .wbp-footRow{display:none}',
+      '.wb2api-cards-collapsed .wbp-footRow{display:none}',
       '.wb2api-card-collapsed{gap:0}',
     ].join('');
     document.head.appendChild(tag);
@@ -852,23 +853,86 @@
     return span
   }
 
+  /** 找出侧栏里所有「额度卡片」节点：不依赖某一层固定结构。 */
+  function findSidebarCards() {
+    if (typeof document === 'undefined' || document === null) return []
+    var direct = document.querySelectorAll('.wbp-foot')
+    if (direct.length > 0) return Array.prototype.slice.call(direct)
+    var loose = []
+    var all = document.querySelectorAll('[class*="wbp-foot"]')
+    for (var i = 0; i < all.length; i += 1) {
+      var names = typeof all[i].className === 'string' ? all[i].className.split(/\s+/) : []
+      if (names.indexOf('wbp-foot') !== -1) loose.push(all[i])
+    }
+    return loose
+  }
+
+  /** 折叠只影响明细行：卡片本体、标题行都保留。 */
+  function setCollapsedClass(collapsed) {
+    if (typeof document === 'undefined' || document === null) return
+    var body = document.body
+    if (body !== null && body !== undefined) {
+      if (collapsed) body.classList.add('wb2api-cards-collapsed')
+      else body.classList.remove('wb2api-cards-collapsed')
+    }
+    var cards = findSidebarCards()
+    for (var i = 0; i < cards.length; i += 1) {
+      if (collapsed) cards[i].classList.add('wb2api-card-collapsed')
+      else cards[i].classList.remove('wb2api-card-collapsed')
+    }
+  }
+
+  /** 箭头本体。固定在窗口左下角的那一枚用 `floating` 形态。 */
+  function makeCardArrow(floating) {
+    var span = document.createElement('span')
+    span.id = CARD_ARROW_ID
+    span.setAttribute('role', 'button')
+    span.setAttribute('tabindex', '0')
+    span.style.cssText = floating
+      ? 'position:fixed;left:10px;bottom:10px;z-index:60;cursor:pointer;user-select:none;'
+        + 'padding:2px 7px;border-radius:8px;background:var(--dsw-alias-bg-layer-1,#1b1d21);'
+        + 'color:var(--dsw-alias-label-secondary,#b9bdc4);font-size:11px;line-height:16px;'
+        + 'box-shadow:0 2px 10px rgba(0,0,0,.28);'
+      : 'flex:none;padding:0 4px;cursor:pointer;user-select:none;'
+        + 'color:var(--dsw-alias-label-tertiary,#8a8f98);font-size:10px;line-height:16px;'
+    var toggle = function (event) {
+      event.preventDefault()
+      event.stopPropagation()
+      setCardCollapsed(!cardCollapsedPref())
+    }
+    span.addEventListener('click', toggle)
+    span.addEventListener('keydown', function (event) {
+      if (event.key === 'Enter' || event.key === ' ') toggle(event)
+    })
+    return span
+  }
+
   /**
-   * 把箭头挂进卡片自己的标题行（`.wbp-footTop`），不挂外层容器 ——
-   * 外层容器在窄栏/折叠时会裁切溢出内容，绝对定位的按钮会被切掉。
+   * 把箭头挂到卡片上；找不到卡片时退回到窗口左下角的浮动箭头。
+   *
+   * 之前写死 `.wbp-footTop`，实际布局里只要少一层节点箭头就整块不出现 —— 用户侧
+   * 表现为「重启了也没有」。现在按三条路兜底：标题行 → 卡片首部 → 浮动箭头。
    */
   function syncCardToggle() {
     if (typeof document === 'undefined' || document === null) return
     try {
-      var card = document.querySelector('.wbp-foot')
-      var stale = document.getElementById('wb2api-card-toggle')
-      if (card === null) {
-        if (stale !== null && stale.parentElement !== null) stale.remove()
-        return
+      var collapsed = cardCollapsedPref()
+      var cards = findSidebarCards()
+      var host = null
+      if (cards.length > 0) host = cards[0].querySelector('.wbp-footTop') || cards[0]
+      else if (document.body !== null && document.body !== undefined) host = document.body
+      if (host === null) return
+      var arrow = document.getElementById(CARD_ARROW_ID)
+      if (arrow === null || arrow.parentElement !== host) {
+        if (arrow !== null && arrow.parentElement !== null) arrow.remove()
+        arrow = makeCardArrow(cards.length === 0)
+        host.appendChild(arrow)
       }
-      var top = card.querySelector('.wbp-footTop')
-      if (top === null) return
-      if (top.querySelector('#wb2api-card-toggle') === null) top.appendChild(cardToggleSpan())
-      applyCardCollapsed(card, cardCollapsedPref())
+      arrow.textContent = collapsed ? '▸' : '▾'
+      arrow.title = collapsed ? '展开额度明细' : '收起额度明细'
+      arrow.setAttribute('aria-label', arrow.title)
+      arrow.setAttribute('aria-expanded', collapsed ? 'false' : 'true')
+      setCollapsedClass(collapsed)
     } catch (_error) { /* 页面结构变化不该影响功能 */ }
   }
 
