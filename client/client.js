@@ -7172,7 +7172,7 @@ window.__ModuleLoader__.load({
 						const __target = desc !== null && desc !== void 0 && desc.name === "settings.section" && desc.id === "dsh-workbuddy";
 						if (!__target || typeof Component !== "function") return __nativeRegister(desc, Component);
 						const __Wrapped = function (props) {
-							return react.createElement(react.Fragment, null, react.createElement(Component, props), react.createElement(__Tools, null));
+							return react.createElement(react.Fragment, null, react.createElement(__Tools, null), react.createElement(Component, props));
 						};
 						__Wrapped.displayName = "WorkBuddySettingsPageWithTools";
 						return __nativeRegister(desc, __Wrapped);
