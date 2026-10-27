@@ -100,23 +100,9 @@ const TOOLS_INJECT = `		// --- wb2api: 网关 / 成长任务两块，折进设�
 					const __nativeRegister = __slots.register.bind(__slots);
 					const __Tools = __wb2apiToolsFactory(react);
 					__slots.register = function (desc, Component) {
-						// 侧栏底部那张额度卡片已按需求下线：整个挂载点跳过，不注册也不渲染。
-						if (desc !== null && desc !== void 0 && desc.name === "sidebar.footer.action") return function () {};
-						// 仪表盘面板的 store 接到 window 上，供即时刷新使用。
-						// 侧栏卡片与仪表盘共用同一个面板 store：这里把它接到 window 上，
-						// 隐藏按钮才能在写入偏好之后立刻触发一次重读（不然要等下一轮轮询）。
-						if (desc !== null && desc !== void 0 && (desc.name === "sidebar.footer.action" || desc.name === "main") && typeof desc.inject === "function" && desc.__wb2apiStoreHooked !== true) {
-							desc.__wb2apiStoreHooked = true;
-							const __nativeInject = desc.inject;
-							desc.inject = function () {
-								const __face = __nativeInject.apply(this, arguments);
-								try {
-									const __store = __face !== null && __face !== void 0 && __face.hooks !== void 0 ? __face.hooks.workBuddyPanel : void 0;
-									if (__store !== void 0 && typeof window !== "undefined") window.__wb2apiPanelStore = __store;
-								} catch (__error) { /* 接不上只影响即时刷新，不影响渲染 */ }
-								return __face;
-							};
-						}
+						// 侧栏额度卡片与中栏仪表盘已按需求整块下线：这两个挂载点直接跳过 ——
+						// 不注册、不渲染，也就不需要再把它们的面板 store 接到 window 上。
+						if (desc !== null && desc !== void 0 && (desc.name === "sidebar.footer.action" || desc.name === "main")) return function () {};
 						const __target = desc !== null && desc !== void 0 && desc.name === "settings.section" && desc.id === "wb2api";
 						if (!__target || typeof Component !== "function") return __nativeRegister(desc, Component);
 						const __Wrapped = function (props) {
