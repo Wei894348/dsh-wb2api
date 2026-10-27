@@ -28,6 +28,17 @@
 (function () {
   'use strict';
 
+  // 诊断用（无害）：宿主侧加载异常时只有 console 能看到栈，出问题先看这一行。
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('error', function (event) {
+      try {
+        var error = event.error || event.message;
+        console.error('[wb2api-diag] uncaught:', error && (error.stack || String(error)),
+          'at', String(event.filename) + ':' + String(event.lineno) + ':' + String(event.colno));
+      } catch (_ignore) { /* 诊断失败不影响加载 */ }
+    });
+  }
+
   var PREFIX = '/plugins/dsh-workbuddy-connect-functy';
   var API = '/dsh-wb2api';
   /** 写路由的握手 key：UI 从文档里取它再回填到 X-WorkBuddy-Probe-Key。 */
@@ -714,86 +725,15 @@
   }
 
   /**
-   * 把工具块**并进参考项目那一页**，而不是另开一个设置分区。
+   * 工具块（网关 / 成长任务）的工厂暴露给构建产物里那段注入代码。
    *
-   * 做法是包一层 `ctx.slots.register`：参考实现在 apply() 里注册
-   * `settings.section#dsh-workbuddy`，我们拦下那一次注册，把组件换成
-   * 「原页面 + 工具块」的 Fragment。于是设置导航里仍然只有一个 WorkBuddy 条目，
-   * 重启网关与任务领取排在同一列的末尾，用的是同一套 wbp- 行长什么样就是什么样。
+   * **不再碰 `window.__ModuleLoader__`。** 宿主 0.2.1 的浏览器加载器是 bootstrap
+   * facade 形态，早先那套「换掉 loader.load、再包 exports.apply」在本版本上把宿主
+   * 加载器换坏过一次（DSH 直接起不来）。现在由 tools/build_client.mjs 把一小段
+   * 补丁注入 vendor 的 `apply` 内部完成「合页」：拦 `ctx.slots.register`，把设置页
+   * 裹成「原页面 + 工具块」的 Fragment —— 效果和之前一致，但不碰模块加载面。
    */
-  function mergeToolsInto(ctx, React) {
-    if (!ctx || !ctx.slots || typeof ctx.slots.register !== 'function') return;
-    const slots = ctx.slots;
-    if (slots.__wb2apiToolsMerged === true) return;
-    slots.__wb2apiToolsMerged = true;
-    const nativeRegister = slots.register.bind(slots);
-    const Tools = makeToolsComponent(React);
-    slots.register = function (desc, Component) {
-      const isWorkBuddyPage = desc !== null && typeof desc === 'object'
-        && desc.name === 'settings.section' && desc.id === 'dsh-workbuddy';
-      if (!isWorkBuddyPage || typeof Component !== 'function') return nativeRegister(desc, Component);
-      function WorkBuddyPageWithTools(props) {
-        return React.createElement(React.Fragment, null,
-          React.createElement(Component, props),
-          React.createElement(Tools, null));
-      }
-      WorkBuddyPageWithTools.displayName = 'WorkBuddySettingsPageWithTools';
-      return nativeRegister(desc, WorkBuddyPageWithTools);
-    };
-  }
-
-  /**
-   * 拦截模块加载器：拿到 vendor bundle 的 factory 与它 require 到的 react，
-   * 再把它的 `apply` 包一层 —— vendor 文件因此不用改一个字节。
-   */
-  function patchModuleLoader(loader) {
-    if (loader === null || typeof loader !== 'object' || typeof loader.load !== 'function') return loader;
-    if (loader.__wb2apiPatched === true) return loader;
-    loader.__wb2apiPatched = true;
-    const nativeLoad = loader.load.bind(loader);
-    loader.load = function (entry) {
-      if (entry !== null && typeof entry === 'object' && typeof entry.factory === 'function') {
-        const factory = entry.factory;
-        entry.factory = function (require) {
-          const moduleExports = factory(require);
-          try {
-            const React = require('react');
-            const originalApply = moduleExports.apply;
-            if (typeof originalApply === 'function' && moduleExports.__wb2apiWrapped !== true) {
-              moduleExports.__wb2apiWrapped = true;
-              moduleExports.apply = function (ctx) {
-                // 先接管 register，再让插件自己 apply —— 它注册设置页时会被裹上一层，
-                // 网关/任务两组就长在同一个页面里，导航里只有一个 WorkBuddy 条目。
-                mergeToolsInto(ctx, React);
-                return originalApply.call(this, ctx);
-              };
-            }
-          } catch (error) {
-            console.warn('[wb2api] 工具分区挂载失败', error);
-          }
-          return moduleExports;
-        };
-      }
-      return nativeLoad(entry);
-    };
-    return loader;
-  }
-
-  (function interceptModuleLoader() {
-    // 已经存在的加载器要先接住再挂访问器：宿主脚本先于插件 bundle 执行，
-    // 直接把 getter 换成 null 会把宿主那一个吞掉（本文件自己就被它加载）。
-    const existing = window.__ModuleLoader__;
-    let current = existing === undefined || existing === null ? null : patchModuleLoader(existing);
-    try {
-      Object.defineProperty(window, '__ModuleLoader__', {
-        configurable: true,
-        get() { return current; },
-        set(value) { current = patchModuleLoader(value); },
-      });
-    } catch (error) {
-      if (current === null) console.warn('[wb2api] 无法拦截模块加载器', error);
-    }
-  })();
+  window.__wb2apiToolsFactory = makeToolsComponent;
 
   // 让同一页面的其它脚本能手动清缓存（调试用）。
   window.__wb2apiShim = {
@@ -7146,6 +7086,33 @@ window.__ModuleLoader__.load({
 			});
 		}
 		//#endregion
+		// --- wb2api: 网关重启 / 任务领取，折进参考实现自己的设置页 -----------------
+		const __wb2apiToolsFactory = typeof window !== "undefined" && typeof window.__wb2apiToolsFactory === "function"
+			? window.__wb2apiToolsFactory
+			: void 0;
+		const __wb2apiNativeApply = apply;
+		apply = function (ctx) {
+			try {
+				const __slots = ctx !== null && ctx !== void 0 ? ctx.slots : void 0;
+				if (__wb2apiToolsFactory !== void 0 && __slots !== void 0 && typeof __slots.register === "function" && __slots.__wb2apiToolsMerged !== true) {
+					__slots.__wb2apiToolsMerged = true;
+					const __nativeRegister = __slots.register.bind(__slots);
+					const __Tools = __wb2apiToolsFactory(react);
+					__slots.register = function (desc, Component) {
+						const __target = desc !== null && desc !== void 0 && desc.name === "settings.section" && desc.id === "dsh-workbuddy";
+						if (!__target || typeof Component !== "function") return __nativeRegister(desc, Component);
+						const __Wrapped = function (props) {
+							return react.createElement(react.Fragment, null, react.createElement(Component, props), react.createElement(__Tools, null));
+						};
+						__Wrapped.displayName = "WorkBuddySettingsPageWithTools";
+						return __nativeRegister(desc, __Wrapped);
+					};
+				}
+			} catch (error) {
+				console.warn("[wb2api] 工具块挂载失败", error);
+			}
+			return __wb2apiNativeApply.call(this, ctx);
+		};
 		exports.CARD_VARIANTS = CARD_VARIANTS;
 		exports.PANEL_ID = PANEL_ID;
 		exports.apply = apply;

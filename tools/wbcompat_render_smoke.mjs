@@ -246,7 +246,8 @@ async function renderOne(row) {
       root.render(h(row.Component, props));
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 250)); });
+    // 设置页自己会去拉 /credits（宿主侧首拉可能要打上游，几秒），等够再断言。
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 4000)); });
   } finally {
     console.error = originalError;
   }

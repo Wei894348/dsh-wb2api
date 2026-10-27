@@ -62,6 +62,46 @@ for (const [from, to] of copyPatches) {
   bundle = bundle.split(from).join(to)
 }
 
+/**
+ * 注入：把「网关 / 任务」两组合进参考实现自己的设置页。
+ *
+ * 为什么不在 shim 里包 `window.__ModuleLoader__`：宿主 0.2.1 的浏览器加载器已经
+ * 换成 bootstrap facade（`.create`），替换它会连宿主加载器一起换坏 —— 实测让
+ * DSH 直接起不来。改成在 vendor 的 `apply` 上包一层：`apply` 是函数声明、可重新
+ * 赋值，`react` 又在同一作用域里，所以不需要碰模块加载面也能拿到 ctx 并包住
+ * `slots.register`，页面结构仍是「一个 WorkBuddy 设置页」。
+ */
+const TOOLS_ANCHOR = '\t\texports.CARD_VARIANTS = CARD_VARIANTS;'
+const TOOLS_INJECT = `		// --- wb2api: 网关重启 / 任务领取，折进参考实现自己的设置页 -----------------
+		const __wb2apiToolsFactory = typeof window !== "undefined" && typeof window.__wb2apiToolsFactory === "function"
+			? window.__wb2apiToolsFactory
+			: void 0;
+		const __wb2apiNativeApply = apply;
+		apply = function (ctx) {
+			try {
+				const __slots = ctx !== null && ctx !== void 0 ? ctx.slots : void 0;
+				if (__wb2apiToolsFactory !== void 0 && __slots !== void 0 && typeof __slots.register === "function" && __slots.__wb2apiToolsMerged !== true) {
+					__slots.__wb2apiToolsMerged = true;
+					const __nativeRegister = __slots.register.bind(__slots);
+					const __Tools = __wb2apiToolsFactory(react);
+					__slots.register = function (desc, Component) {
+						const __target = desc !== null && desc !== void 0 && desc.name === "settings.section" && desc.id === "dsh-workbuddy";
+						if (!__target || typeof Component !== "function") return __nativeRegister(desc, Component);
+						const __Wrapped = function (props) {
+							return react.createElement(react.Fragment, null, react.createElement(Component, props), react.createElement(__Tools, null));
+						};
+						__Wrapped.displayName = "WorkBuddySettingsPageWithTools";
+						return __nativeRegister(desc, __Wrapped);
+					};
+				}
+			} catch (error) {
+				console.warn("[wb2api] 工具块挂载失败", error);
+			}
+			return __wb2apiNativeApply.call(this, ctx);
+		};`
+if (!bundle.includes(TOOLS_ANCHOR)) throw new Error('vendor 里找不到注入锚点：exports.CARD_VARIANTS')
+bundle = bundle.replace(TOOLS_ANCHOR, `${TOOLS_INJECT}\n${TOOLS_ANCHOR}`)
+
 const shim = readFileSync(shimPath, 'utf8')
 
 const banner = `// WorkBuddy 反代（workbuddy2api）设置面板 —— 浏览器半侧。
