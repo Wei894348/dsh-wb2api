@@ -274,7 +274,7 @@ for (const row of registrations) {
 
 // ---- 断言 ----
 const joined = results.map((item) => item.outcome.text).join('\n');
-const need = ['Shantanu', 'wei894348', '快乐不打烊', 'glm-5.3', 'deepseek-v4.1-flash', '重启网关', '领取任务积分'];
+const need = ['Shantanu', 'wei894348', '快乐不打烊', 'glm-5.3', 'deepseek-v4.1-flash', '重启网关', '领取任务积分', '每日签到', '今日已签到'];
 console.log('\n期待出现的片段:');
 for (const token of need) console.log('  ', token, joined.includes(token) ? 'OK' : 'MISS');
 const styled = results.reduce((sum, item) => sum + item.outcome.marks, 0);
