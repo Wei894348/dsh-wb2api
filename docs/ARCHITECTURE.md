@@ -108,7 +108,8 @@ start()
  ├─ 1 先探 /healthz
  │    ├─ 已有健康网关照用（state=external，不重复拉起、不抢端口）
  │    ├─ 端口无监听 → 继续
- │    └─ 有服务但 /healthz 非 2xx → 抛错（端口被别的程序占了）
+ │    └─ 有服务但 /healthz 非 2xx → 抛错（端口被别的程序占了；
+ │       例外：503 且响应体带 service 字段 = 网关活着但没可用账号，见 4.2）
  ├─ 2 resolveBinary() 定位可执行文件 → resolveWorkingDir() 定 cwd → subprocess.spawn
  └─ 3 轮询 /healthz 直到就绪或超时
 ```
@@ -142,12 +143,17 @@ start()
 | 探活结果 | 含义 |
 |---|---|
 | 连接被拒 / 超时 | 端口上没有网关（未运行），不算错误 |
-| HTTP 非 2xx | 端口被别人占了（占用的不是本网关），抛错 |
+| HTTP 非 2xx | 端口被别人占了（占用的不是本网关），抛错。**唯一例外**：503 且响应体带 `service` 字段 —— 那是网关自己在说「我活着，但没有可用账号」 |
 | 200 且 `healthy > 0` | 网关在跑，且至少有 `healthy` 个可用账号 |
 | 200 但 `healthy = 0` | **进程活着但没有可用账号**（没登录 / 全被禁用 / 全在冷却） |
 
 所以状态汇报里 `healthy/total` 才是「能不能出模型」的判据，只看「运行中」不够；
 `healthy` 的账号数与该网关实际读到的 `auths/` 目录直接相关。
+
+> **2026-10-26 修过一次误判**：零可用账号时网关返回 `503 {healthy:0,total:0,service:"workbuddy2api"}`。
+> 旧实现按 `response.ok` 一刀切，把它当成「端口被别的程序占用」—— 面板显示「网关未运行」、
+> `/wb2api-restart` 报失败，排查方向全跑到进程/端口上，而真正该看的是凭证。
+> 现在按 `service` 字段验明正身：**没有这份契约的非 2xx 才算端口冲突**。
 
 ### 4.3 `/v1/models` → dsh 模型目录（`catalog.js`）
 
@@ -196,6 +202,28 @@ dsh 的默认模型走这个网关（`settings` 里 `agent-default-model.provide
 不变（子插件身份名已改成 `wb2api-gateway`）：改名会打断现有模型配置。
 同一个 profile 里也不能再挂另一个注册同一 provider id 的插件（会报 `DUPLICATE_ADAPTER`）。
 
+### 4.6 面板「重启网关」按钮（`restart.js` + `link.js`）
+
+状态行紧挨着网关状态点有一个「重启网关」按钮，宿主入口 `POST /dsh-wb2api/restart`。
+它不是 `supervisor.restart()` 的薄封装 —— 「抽风」的两种形态它都救不了：
+
+| 形态 | 直接 `restart()` 会怎样 | 实际做法 |
+|---|---|---|
+| **僵死**：进程活着、端口在听、`/healthz` 不答 | 探活判「连不上」→ 拉新进程抢同一端口 → 绑不上 → `failed` | 按端口找 PID → 验镜像名 → 强杀 → 等端口释放 → 拉起 |
+| **孤儿**：上次 dsh 没退干净留下的网关 | 探活判「已有健康网关」→ `external`，而 `stop()` 按约定不杀别人的进程 → 等于没重启 | 同上（先验明正身再杀） |
+
+流程（`doRestart`）：graceful `stop()` → 等端口释放（2.5s）→ 没释放则 `netstat -ano` / `lsof`
+找监听者 → `tasklist` / `ps` 验镜像名 → `taskkill /T /F` / `SIGKILL` → 再等（8s）→
+`restarts = 0` 后 `start()` → 刷模型目录 → 把 `state / pid / health / killed / steps / tookMs` 还给面板。
+
+- **硬边界**：只有镜像名在白名单里（`wb2a-server` / `wb2api-server` / `wb2api` / `wb2a`，含 `.exe`）
+  才允许强杀；端口被别的程序占着就**报错交回人类**，一个字节都不动它 —— 与「不抢别人的端口」同一条底线。
+- **并发去重**：连点两下共用一个 `inflight` promise，两个 HTTP 请求等同一个结果。
+- **握手点**：`supervisor` 活在子插件 `lib/gw/` 里，路由挂在父插件 `lib/index.js`，两边通过
+  `lib/gw/link.js` 的模块级单例接头（路由表仍然只有一份；子插件卸载时 `detachGateway()`）。
+- **冒烟**：`tools/wb_restart_smoke.mjs`（一次性端口 + 临时工作目录，22 项：graceful / 孤儿强杀 /
+  非网关进程必须不杀 / HTTP 路由契约），全程不碰现场的 7863。
+
 ---
 
 ## 5. 自动化开关现状（2026-10-09）
@@ -203,6 +231,7 @@ dsh 的默认模型走这个网关（`settings` 里 `agent-default-model.provide
 | 入口 | 状态 |
 |---|---|
 | 面板「一键做任务」按钮 | ✅ 唯一的手动入口（宿主路由 `/dsh-wb2api/tasks/run`） |
+| 面板「重启网关」按钮 | ✅ 抽风时的救急入口（宿主路由 `/dsh-wb2api/restart`，见 4.6）—— 只在用户点的时候跑 |
 | 计划任务 `wb2api-tasks-night` / `-dawn` / `dsh-wb2api-daily` | ❌ 已删除（用户要求不自动跑） |
 | 用户自有的签到计划任务（如每天 08:30 打 `/dsh-wb2api/checkin`） | 保留：只签到 + 领已完成任务，不碰任务引擎 |
 | `wb_daily.mjs` | 保留但**默认不跑任务引擎**，要跑加 `--tasks` |
@@ -220,4 +249,5 @@ dsh 的默认模型走这个网关（`settings` 里 `agent-default-model.provide
 | 401 / 「登录身份过期」 | 该号 accessToken 失效：桌面端重新登录后重跑 `tools/wb_import.mjs --write` |
 | dsh 本体模型不可用 | 那是 7863 网关的事（`/healthz` 看 `healthy`），与任务引擎无关 |
 | 状态显示网关「运行中」但发不出模型 | 探活只证端口通：看 `/healthz` 的 `healthy`，`healthy = 0` 就是没可用账号（`/wb2api-login` 加号或 `/wb2api-account auto` 恢复） |
+| 网关抽风（请求一直转圈 / 502 / 模型列表空 / 明明有额度却不可用） | 先点状态行的「重启网关」（`POST /dsh-wb2api/restart`，见 4.6）：它会把僵死/孤儿进程一起清掉再拉起。还不行就看 `~/.dsh/wb2api/data/` 里的 `state.json` 与网关 stderr |
 | dsh 启动报 `DUPLICATE_ADAPTER` | 该 profile 里挂了两个注册同一 provider id 的插件：移除其中一个后重启 dsh |

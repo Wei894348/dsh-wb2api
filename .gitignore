@@ -20,3 +20,13 @@ runtime/data/
 wb-restart-check.log
 .DS_Store
 Thumbs.db
+
+# 渲染冒烟用的临时依赖（jsdom/react），不入库
+.smoke/
+
+
+# 本地备份/临时文件（不入库）
+client/client.wb2api-legacy.js.bak
+.git-commit-template.txt
+.smoke/
+

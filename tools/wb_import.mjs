@@ -168,6 +168,8 @@ for (const cand of seen.values()) {
   console.log(`     来源: ${cand.file}`);
 
   if (!WRITE) continue;
+  // --only=<uid 前缀> 真的生效：不匹配就整条跳过，避免 --force 顺手把别的账号刷成桌面端的旧快照。
+  if (ONLY !== '' && !cand.uid.startsWith(ONLY)) { console.log('     → 跳过（不在 --only 范围）'); continue; }
   if (inPool && !FORCE) { console.log('     → 跳过（已在池中，--force 可覆盖）'); continue; }
   mkdirSync(poolDir, { recursive: true });
   const target = join(poolDir, `workbuddy-${cand.uid}.json`);

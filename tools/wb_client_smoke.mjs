@@ -141,12 +141,16 @@ function contains(node, needle, seen = new Set(), depth = 0) {
 }
 
 let failed = 0;
-for (const [label, needle] of [
-  ['初始（按钮未点）', '一键做任务'],
-  ['任务执行中', '任务执行中…（确认待办 → 执行动作 → 自动领奖）'],
-  ['任务执行完成', '任务执行完成：领奖 2 项，+400 分 +10 能，1 项出错'],
+for (const [label, needle, nextMode] of [
+  ['初始（按钮未点）', '一键做任务', 'idle'],
+  ['任务执行中', '任务执行中…（确认待办 → 执行动作 → 自动领奖）', 'running'],
+  ['任务执行完成', '任务执行完成：领奖 2 项，+400 分 +10 能，1 项出错', 'summary'],
+  // 2026-10-26 新增：状态行里的「重启网关」——抽风时那颗救命按钮。
+  // 它挂在 statusRow 的子节点里，正好走 contains() 的递归路径。
+  ['状态行·重启按钮', '重启网关', 'idle'],
+  ['状态行·重启按钮提示', '抽风', 'idle'],
 ]) {
-  mode = label === '初始（按钮未点）' ? 'idle' : (label === '任务执行中' ? 'running' : 'summary');
+  mode = nextMode;
   const tree = Panel(element.props);
   const hit = contains(tree, needle);
   console.log(`渲染[${label}]: ${hit ? 'OK' : '缺失'}（找「${needle}」）`);

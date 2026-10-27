@@ -1,5 +1,57 @@
 # 变更记录
 
+## 1.7.0（2026-10-26）
+
+**界面复刻：浏览器半边换成 functy23/dsh-workbuddy-connect-functy 的仪表盘 UI**
+
+- **六个界面挂载点全部照搬**（`client/client.js` 由 `tools/build_client.mjs` 生成）：
+  `main#workbuddy-panel`（中栏仪表盘）、`sidebar.footer.action#workbuddy-panel`（侧栏额度卡）、
+  `settings.section#dsh-workbuddy`（设置分区页，账号/模型两页签）、
+  `settings.models.provider-card@llm-workbuddy-functy`、`conversation.composer.dock#workbuddy-credit-badge`、
+  `conversation.input.right#workbuddy-probe`。外观、文案、`wbp-` 样式表与上游逐字一致。
+- **中间加了一层 `client/wbcompat-shim.js`**：复刻过来的客户端只认
+  `/plugins/dsh-workbuddy-connect-functy/{status,accounts,probe,ai/*}` 六个路由和一份
+  `WorkBuddyWebStatus` 文档；shim 在浏览器侧截住这些请求，用现有 `/dsh-wb2api/*`
+  （state / credits / models / login / import / account/* / keepalive / checkin）的数据拼出文档。
+  好处是**宿主零改动**：换一份 `client/client.js` 就能上线，刷新页面即可回滚。
+- **CN / 国际两个变体**映射到本账号池的 `realm`：`cn` → WorkBuddy 卡片，`global` → WorkBuddy AI 卡片；
+  积分包按 `source`（套餐名）合并，模型按 `cn:` / `global:` 前缀分流。
+- **写动作映射**：`enable / remove / refresh-credits / test / add（OAuth 开始）/ poll / add-cookie`
+  全部落到现有路由；`label / reorder / context / adopt-desktop` 与推理探测返回
+  `{state:'failed', reason}` 并在界面里照原样式展示。
+  侧栏额度样式、额度卡开关、输入框额度徽章、探测控件开关写 `localStorage('wb2api.ui.prefs')`，
+  下次读文档时回填。
+- **`package.json` 的 `dsh.client.inject` 换成上游那 9 个包**（primitives 由宿主直接解析，
+  与上游一致不列出）；`client/vendor/` 存上游原始 bundle，`client/client.wb2api-legacy.js.bak`
+  留旧面板备份。
+- **验证**：`tools/wbcompat_smoke.mjs`（用真宿主数据跑 shim：两个变体的文档、账号/积分/模型、
+  偏好写回）、`tools/wbcompat_module_smoke.mjs`（假 module loader 加载 bundle，断言
+  `name / inject` 与六个注册点全部落地）。
+
+## 1.6.0（2026-10-26）
+
+**新增：面板「重启网关」按钮（网关抽风时一键救活）**
+
+- **`POST /dsh-wb2api/restart` + 状态行的「重启网关」按钮**（`lib/gw/restart.js`）。
+  三步：graceful `stop()` → 端口不释放时按端口找出监听者、**验明镜像名属于网关**才强杀
+  （Windows `netstat` + `tasklist` + `taskkill /T /F`；POSIX `lsof`/`ps`/`SIGKILL`）→
+  重新拉起并复检。响应带回 `state / pid / health / killed / steps / tookMs`，面板拼成
+  「网关已重启 · 可用账号 5/6 · 清掉 1 个僵死进程 · 用时 2.3 秒」。
+- **为什么不是 `supervisor.restart()` 的薄封装**：僵死进程端口还在、`/healthz` 不答，
+  重启会被「端口占用」卡成 `failed`；孤儿网关在 supervisor 眼里是 `external`，而
+  `stop()` 按约定不杀别人的进程 —— 于是「重启」等于什么都没做。强杀有硬边界：
+  只有镜像名在白名单里才动手，端口被 `node.exe` / `nginx` 之类占着一律报错交回人类。
+- **握手点 `lib/gw/link.js`**：supervisor 活在子插件 `lib/gw/` 里、路由挂在父插件
+  `lib/index.js`，两边用模块级单例接头 —— 路由表仍然只有一份，客户端 API 面不变。
+- **修 `/healthz` 503 的误判**（`proc.js` + `lib/index.js` 的 `probeGateway`）：
+  网关「活着但没有可用账号」时返回 `503 {healthy:0,total:0,service:"workbuddy2api"}`。
+  旧实现把非 2xx 一律当成「端口被别的程序占用」，于是面板显示「网关未运行」、
+  `/wb2api-restart` 报失败 —— 修错方向。现按 `service` 字段验明正身，判为
+  「已启动 · 可用账号 0」，红点变黄提示，重启按钮也不再误报失败。
+- **冒烟**：`tools/wb_restart_smoke.mjs`（一次性端口 + 临时工作目录，22 项：graceful 重启 /
+  孤儿强杀 / 非网关进程必须一个都不杀 / HTTP 路由契约），全程不碰现场 7863；
+  `tools/wb_client_smoke.mjs` 增加按钮与提示文案的渲染断言。
+
 ## 1.5.9（2026-10-21）
 
 **修复：运行时外置 + 模型倍率展示回归**

@@ -1,9 +1,812 @@
 // WorkBuddy 反代（workbuddy2api）设置面板 —— 浏览器半侧。
 //
-// 设置 → 「WorkBuddy 反代」分区：网关状态 / 授权登录 / 凭证 JSON 上传 / 账号管理 / 模型目录。
-// 手写 __ModuleLoader__ factory（无构建步骤），骨架对齐 @rain-kl/dsh-preset-plus。
+// 界面 = functy23/dsh-workbuddy-connect-functy 的 React 界面，逐字节取自
+// client/vendor/，只把模块身份改成 dsh-plugin-wb2api-ui（DSH 要求 id === 包名）。
 //
-// 所有上游调用都走宿主 node 半侧挂的 /dsh-wb2api/* 路由 —— accessToken 永远不进浏览器。
+// 数据面不走上游宿主：client/wbcompat-shim.js 在 window.fetch 上拦下
+// /plugins/dsh-workbuddy-connect-functy/* 六个路由，转成本插件宿主侧的 /dsh-wb2api/*
+// 与账号池数据，再按上游的 WorkBuddyWebStatus 文档形状回给界面。
+// 因此改本插件的功能只动 shim，不动 vendor。
+//
+// 重新生成：node tools/build_client.mjs
+
+// wbcompat-shim —— 让 functy23/dsh-workbuddy-connect-functy 的浏览器半边跑在
+// 本插件（dsh-plugin-wb2api-ui）的宿主数据上。
+//
+// 为什么要这一层：复刻过来的 UI 是一份完整的 React 客户端，它只认
+// `/plugins/dsh-workbuddy-connect-functy/{status,accounts,probe,ai/*}` 六个路由
+// 和一份 WorkBuddyWebStatus 文档。本插件宿主侧的数据已经挂在 `/dsh-wb2api/*`
+// （state / credits / models / checkin / login / import / account/*），
+// 再往宿主里加一套路由就要重启 DSH 才能生效。这里在浏览器侧把 fetch 截住，
+// 用现有路由的数据拼出那份文档、把写动作翻译成现有路由的调用 —— 只换一个
+// client/client.js 就能上线，刷新页面即可回滚。
+//
+// 约定（与宿主路由一一对应）：
+//   GET  .../status, .../ai/status   ← /dsh-wb2api/{state,credits,models}
+//   POST .../accounts, .../ai/accounts ← /dsh-wb2api/{account/*,credits,login/*,import,keepalive}
+//   POST .../probe, .../ai/probe      ← /dsh-wb2api/{checkin,credits} + localStorage 偏好
+(function () {
+  'use strict';
+
+  var PREFIX = '/plugins/dsh-workbuddy-connect-functy';
+  var API = '/dsh-wb2api';
+  /** 写路由的握手 key：UI 从文档里取它再回填到 X-WorkBuddy-Probe-Key。 */
+  var PROBE_KEY = 'wb2api-local';
+  var PREFS_KEY = 'wb2api.ui.prefs';
+  var DATA_TTL_MS = 4000;
+
+  function readPrefs() {
+    try {
+      var raw = window.localStorage.getItem(PREFS_KEY);
+      var parsed = raw === null ? null : JSON.parse(raw);
+      return parsed !== null && typeof parsed === 'object' ? parsed : {};
+    } catch (_error) {
+      return {};
+    }
+  }
+
+  function writePref(key, value) {
+    var prefs = readPrefs();
+    prefs[key] = value;
+    try {
+      window.localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+    } catch (_error) { /* 隐私模式：偏好只在本次会话里生效 */ }
+  }
+
+  function toJsonResponse(value, status) {
+    return new Response(JSON.stringify(value), {
+      status: status === undefined ? 200 : status,
+      headers: { 'content-type': 'application/json; charset=utf-8' },
+    });
+  }
+
+  async function getJson(url) {
+    var response = await fetch(url, { headers: { accept: 'application/json' }, credentials: 'same-origin' });
+    var body = await response.json().catch(function () { return undefined; });
+    if (!response.ok) {
+      throw new Error((body && typeof body.error === 'string' ? body.error : 'HTTP ' + response.status));
+    }
+    return body;
+  }
+
+  async function postJson(url, payload) {
+    var response = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(payload === undefined ? {} : payload),
+    });
+    var body = await response.json().catch(function () { return undefined; });
+    if (!response.ok) {
+      throw new Error((body && typeof body.error === 'string' ? body.error : 'HTTP ' + response.status));
+    }
+    return body;
+  }
+
+  // --- 数据读取 -------------------------------------------------------------
+
+  var cache = { at: 0, value: null };
+
+  async function loadData(force) {
+    var now = Date.now();
+    if (!force && cache.value !== null && now - cache.at < DATA_TTL_MS) return cache.value;
+    var statePromise = getJson(API + '/state');
+    var creditsPromise = getJson(API + '/credits' + (force ? '?force=1' : '')).catch(function () { return null; });
+    var modelsPromise = getJson(API + '/models').catch(function () { return null; });
+    var checkinPromise = getJson(API + '/checkin-status').catch(function () { return null; });
+    var state = await statePromise;
+    var creditsBody = await creditsPromise;
+    var modelsBody = await modelsPromise;
+    var checkinBody = await checkinPromise;
+    var value = {
+      state: state,
+      credits: creditsBody && creditsBody.credits ? creditsBody.credits : null,
+      models: modelsBody && Array.isArray(modelsBody.models) ? modelsBody.models : [],
+      checkin: checkinBody,
+    };
+    cache.at = Date.now();
+    cache.value = value;
+    return value;
+  }
+
+  function realmOfVariant(variantId) {
+    return variantId === 'workbuddy-ai' ? 'global' : 'cn';
+  }
+
+  function segmentTotal(segments) {
+    var sum = 0;
+    for (var i = 0; i < segments.length; i += 1) {
+      var size = Number(segments[i].total);
+      if (Number.isFinite(size)) sum += size;
+    }
+    return Number(sum.toFixed(2));
+  }
+
+  function mergePackages(rows) {
+    var byKey = new Map();
+    for (var i = 0; i < rows.length; i += 1) {
+      var row = rows[i];
+      var segments = Array.isArray(row.segments) ? row.segments : [];
+      for (var j = 0; j < segments.length; j += 1) {
+        var segment = segments[j];
+        var remain = Number(segment.remaining);
+        if (!Number.isFinite(remain) || remain <= 0) continue;
+        var size = Number(segment.total);
+        var name = typeof segment.source === 'string' && segment.source !== '' ? segment.source : '积分';
+        var key = name;
+        var previous = byKey.get(key);
+        if (previous === undefined) {
+          byKey.set(key, {
+            packageName: name,
+            remain: remain,
+            size: Number.isFinite(size) ? Math.max(size, remain) : remain,
+          });
+        } else {
+          previous.remain = Number((previous.remain + remain).toFixed(2));
+          previous.size = Number((previous.size + (Number.isFinite(size) ? Math.max(size, remain) : remain)).toFixed(2));
+        }
+      }
+    }
+    var packages = Array.from(byKey.values());
+    packages.sort(function (a, b) { return b.size - a.size; });
+    return packages;
+  }
+
+  function buildAccounts(state, creditRows, realm, now) {
+    var creditByFile = new Map();
+    for (var i = 0; i < creditRows.length; i += 1) creditByFile.set(creditRows[i].file, creditRows[i]);
+
+    var pool = Array.isArray(state.accounts) ? state.accounts : [];
+    var mine = pool.filter(function (account) {
+      return (account.realm === 'global' ? 'global' : 'cn') === realm;
+    });
+
+    var accounts = mine.map(function (account) {
+      var credit = creditByFile.get(account.file);
+      var ok = credit !== undefined && credit.state === 'ok';
+      var segments = ok && Array.isArray(credit.segments) ? credit.segments : [];
+      var expiresAtMs = Number(account.expiresAt) > 0 ? Number(account.expiresAt) * 1000 : 0;
+      var row = {
+        id: account.file,
+        uid: account.uid,
+        name: typeof account.nickname === 'string' && account.nickname !== ''
+          ? account.nickname
+          : String(account.uid || '').slice(0, 8),
+        origin: 'desktop',
+        domain: typeof account.domain === 'string' ? account.domain : '',
+        renewable: true,
+        enabled: account.disabled !== true,
+        available: account.disabled !== true && account.expired !== true,
+        expiresAtMs: expiresAtMs,
+        lastUsedAtMs: 0,
+        addedAtMs: Number.isFinite(Number(account.mtime)) ? Math.round(Number(account.mtime)) : 0,
+      };
+      if (account.nickname) row.nickname = account.nickname;
+      if (ok) {
+        row.credits = Number(Number(credit.total).toFixed(2));
+        row.creditsTotal = segmentTotal(segments);
+        if (credit.fetchedAt) row.creditsAtMs = Number(credit.fetchedAt);
+        if (credit.todayUsage && Number(credit.todayUsage.used) > 0) {
+          row.creditsUsed = Number(Number(credit.todayUsage.used).toFixed(2));
+        }
+      } else if (credit !== undefined) {
+        row.creditsError = typeof credit.error === 'string' && credit.error !== ''
+          ? credit.error
+          : '读取失败';
+        if (/401|403|凭证|授权/.test(row.creditsError)) row.sessionDead = false;
+      }
+      if (account.disabled === true) row.enabled = false;
+      void now;
+      return row;
+    });
+
+    var primary;
+    for (var k = 0; k < accounts.length; k += 1) {
+      if (accounts[k].available) { primary = accounts[k].id; break; }
+    }
+    if (primary === undefined && accounts.length > 0) primary = accounts[0].id;
+
+    var section = { accounts: accounts };
+    if (primary !== undefined) section.primary = primary;
+    return { section: section, rows: accounts, mine: mine };
+  }
+
+  function buildModels(models, realm) {
+    var prefix = realm === 'global' ? 'global:' : 'cn:';
+    var rows = [];
+    for (var i = 0; i < models.length; i += 1) {
+      var model = models[i];
+      if (typeof model.id !== 'string' || model.id.indexOf(prefix) !== 0) continue;
+      var row = {
+        id: model.id,
+        name: typeof model.displayName === 'string' && model.displayName !== '' ? model.displayName : model.id.slice(prefix.length),
+        contextWindow: Number(model.contextLength) || undefined,
+        maxContextWindow: Number(model.contextLength) || undefined,
+      };
+      // 倍率：宿主 /models 现在带 creditsMult（"0.79x"），卡片按参考实现的口径
+      // 显示成 "x0.79"；0 倍率另给 free 徽章。
+      if (typeof model.creditsMult === 'string' && model.creditsMult !== '') {
+        var mult = model.creditsMult.replace(/x$/i, '');
+        row.credits = 'x' + mult;
+        if (/^0(?:\.0+)?$/.test(mult)) row.free = true;
+      }
+      if (typeof model.description === 'string' && model.description !== '') row.description = model.description;
+      if (model.supportsImages === true) row.inputModalities = ['text', 'image'];
+      rows.push(row);
+    }
+    return rows;
+  }
+
+  function buildDocument(data, variantId) {
+    var realm = realmOfVariant(variantId);
+    var credits = data.credits;
+    var creditRows = credits && Array.isArray(credits.accounts) ? credits.accounts : [];
+    var built = buildAccounts(data.state, creditRows, realm, Date.now());
+    var prefs = readPrefs();
+
+    var doc = { status: 'signed-out', accounts: built.section, probeKey: PROBE_KEY };
+    var mineCredits = creditRows.filter(function (row) {
+      var pool = built.mine.filter(function (account) { return account.file === row.file; });
+      return pool.length > 0;
+    });
+
+    if (built.mine.length > 0) {
+      var packages = mergePackages(mineCredits);
+      var total = 0;
+      for (var i = 0; i < packages.length; i += 1) total += packages[i].remain;
+
+      var primaryFile = built.section.primary;
+      var primaryAccount = null;
+      for (var j = 0; j < built.mine.length; j += 1) {
+        if (built.mine[j].file === primaryFile) { primaryAccount = built.mine[j]; break; }
+      }
+
+      doc.status = 'signed-in';
+      if (primaryAccount !== null) {
+        if (primaryAccount.nickname) doc.nickname = primaryAccount.nickname;
+        if (primaryAccount.domain) doc.domain = primaryAccount.domain;
+        doc.expiresAt = Number(primaryAccount.expiresAt) * 1000 || undefined;
+      }
+      doc.source = 'desktop';
+      doc.credits = {
+        total: Number(total.toFixed(2)),
+        accounts: packages,
+      };
+      if (credits && credits.unlimited > 0) doc.credits.unlimited = true;
+      var errored = mineCredits.filter(function (row) { return row.state !== 'ok'; });
+      if (errored.length > 0) {
+        doc.creditsError = String(errored[0].error || '部分账号读取失败').slice(0, 240);
+      }
+      doc.models = buildModels(data.models, realm);
+      doc.catalog = { source: 'live', fetchedAt: Date.now() };
+
+      // 签到：参考实现的设置页本来就有「每日签到」分组（自动开关 + 每账号一行 +
+      // 「立即签到」）。这里把宿主 autocheckin 的记录翻译成它的 WorkBuddyWebCheckin，
+      // 于是签到是**原生界面**，不额外画控件。
+      if (data.checkin && Array.isArray(data.checkin.rows)) {
+        var byUid = {};
+        for (var m = 0; m < built.mine.length; m += 1) byUid[built.mine[m].uid] = built.mine[m].file;
+        var checkinRows = [];
+        for (var n = 0; n < data.checkin.rows.length; n += 1) {
+          var source = data.checkin.rows[n];
+          var accountId = byUid[source.uid];
+          if (accountId === undefined) continue;
+          var row = { accountId: accountId };
+          if (typeof source.day === 'string') row.day = source.day;
+          if (Number(source.atMs) > 0) row.atMs = Number(source.atMs);
+          if (typeof source.state === 'string') row.state = source.state;
+          if (typeof source.reason === 'string' && source.reason !== '') row.reason = source.reason;
+          checkinRows.push(row);
+        }
+        doc.checkin = { auto: data.checkin.auto === true, rows: checkinRows };
+      }
+    }
+
+    if (prefs.sidebarCreditStyle === 'remaining' || prefs.sidebarCreditStyle === 'usage') {
+      doc.sidebarCreditStyle = prefs.sidebarCreditStyle;
+    }
+    if (typeof prefs.sidebarCreditVisible === 'boolean') doc.sidebarCreditVisible = prefs.sidebarCreditVisible;
+    if (typeof prefs.composerCreditVisible === 'boolean') doc.composerCreditVisible = prefs.composerCreditVisible;
+    if (typeof prefs.probeControlVisible === 'boolean') doc.probeControlVisible = prefs.probeControlVisible;
+    if (typeof prefs.useMaximumContextWindow === 'boolean') doc.useMaximumContextWindow = prefs.useMaximumContextWindow;
+    return doc;
+  }
+
+  // --- 写动作 ---------------------------------------------------------------
+
+  function decodeJwtPayload(token) {
+    try {
+      var parts = String(token).split('.');
+      if (parts.length < 2) return null;
+      var base = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+      while (base.length % 4 !== 0) base += '=';
+      return JSON.parse(window.atob(base));
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  async function handleAccounts(action, realm) {
+    var kind = action && action.action;
+
+    if (kind === 'refresh-credits') {
+      cache.value = null;
+      await getJson(API + '/credits?force=1');
+      return { state: 'ok' };
+    }
+    if (kind === 'enable') {
+      await postJson(API + '/account/toggle', { file: String(action.id || ''), enabled: action.enabled === true });
+      return { state: 'ok' };
+    }
+    if (kind === 'remove') {
+      await postJson(API + '/account/delete', { file: String(action.id || '') });
+      return { state: 'ok' };
+    }
+    if (kind === 'reorder') return { state: 'ok' };
+    if (kind === 'test') {
+      var testPool = await getJson(API + '/state');
+      var target = null;
+      var list = Array.isArray(testPool.accounts) ? testPool.accounts : [];
+      for (var i = 0; i < list.length; i += 1) {
+        if (list[i].file === action.id) { target = list[i]; break; }
+      }
+      if (target === null) return { state: 'failed', reason: '找不到这个账号' };
+      var alive = await postJson(API + '/keepalive', { uid: target.uid });
+      var result = alive && alive.result ? alive.result : null;
+      var rows = result && Array.isArray(result.results) ? result.results : [];
+      var own = rows.length > 0 ? rows[0] : null;
+      return {
+        state: 'ok',
+        test: {
+          ok: own === null ? true : own.ok === true,
+          message: own === null ? '保活请求已发出' : String(own.message || (own.ok === true ? '通过' : '失败')),
+        },
+      };
+    }
+    if (kind === 'add') {
+      var started = await postJson(API + '/login/begin', { realm: realm });
+      var expires = Number(started.expiresAt) > 0
+        ? Number(started.expiresAt) * 1000
+        : (Number(started.expiresAtMs) > 0 ? Number(started.expiresAtMs) : Date.now() + 300000);
+      return {
+        state: 'ok',
+        challenge: {
+          state: String(started.state || ''),
+          authUrl: String(started.authUrl || started.url || ''),
+          expiresAtMs: expires,
+        },
+      };
+    }
+    if (kind === 'poll') {
+      try {
+        var polled = await postJson(API + '/login/poll', { realm: realm, state: String(action.state || '') });
+        var account = polled && polled.account ? polled.account : null;
+        if (account === null) return { state: 'waiting' };
+        cache.value = null;
+        return {
+          state: 'added',
+          name: String(account.nickname || account.uid || '账号'),
+          created: true,
+        };
+      } catch (error) {
+        var message = error instanceof Error ? error.message : String(error);
+        // 「还没扫码 / 还没确认」不是故障：上游用 code=11217 + msg="login ing"
+        // 表示登录进行中，宿主按可重试处理。宽一点匹配，别把等待渲染成错误。
+        if (/202|pending|11217|login\s*ing|未确认|未完成|尚未|等待/i.test(message)) return { state: 'waiting' };
+        throw error;
+      }
+    }
+    if (kind === 'cancel') return { state: 'ok' };
+    if (kind === 'add-cookie') {
+      var token = String(action.token || '').trim();
+      if (token === '') return { state: 'failed', reason: '令牌为空' };
+      var claims = decodeJwtPayload(token);
+      var uid = claims && typeof claims.sub === 'string' ? claims.sub : '';
+      if (uid === '') return { state: 'failed', reason: '令牌里没有 sub，无法确定账号' };
+      var issuerHost = claims && typeof claims.iss === 'string' ? claims.iss.replace(/^https?:\/\//, '').split('/')[0] : '';
+      var isGlobal = /workbuddy\.ai$/i.test(issuerHost);
+      var expiresAt = claims && Number(claims.exp) > 0 ? Number(claims.exp) : 0;
+      var nickname = claims && typeof claims.preferred_username === 'string' ? claims.preferred_username : uid.slice(0, 8);
+      await postJson(API + '/import', {
+        document: {
+          account: { uid: uid, nickname: nickname, enterpriseId: '' },
+          auth: {
+            accessToken: token,
+            refreshToken: '',
+            expiresAt: expiresAt,
+            domain: issuerHost || (isGlobal ? 'www.workbuddy.ai' : 'www.codebuddy.cn'),
+            realm: isGlobal ? 'global' : 'cn',
+          },
+        },
+      });
+      cache.value = null;
+      return { state: 'added', name: nickname, created: true };
+    }
+    if (kind === 'adopt-desktop') {
+      return {
+        state: 'failed',
+        reason: '本插件不走面板内接管：请在宿主机跑 tools/wb_import.mjs --write（WorkBuddy 桌面端登录态导入）。',
+      };
+    }
+    if (kind === 'label') {
+      return { state: 'failed', reason: '本插件的账号池没有自定义标签字段' };
+    }
+    if (kind === 'context') {
+      return { state: 'failed', reason: '本插件不按模型切换上下文长度' };
+    }
+    return { state: 'failed', reason: '未知动作：' + String(kind) };
+  }
+
+  async function handleProbe(action) {
+    var kind = action && action.action;
+    if (kind === 'refresh') {
+      cache.value = null;
+      await getJson(API + '/credits?force=1').catch(function () { return null; });
+      return { state: 'ok' };
+    }
+    if (kind === 'check-in') {
+      var body = {};
+      if (typeof action.account === 'string' && action.account !== '') {
+        var pool = await getJson(API + '/state');
+        var rows = Array.isArray(pool.accounts) ? pool.accounts : [];
+        for (var i = 0; i < rows.length; i += 1) {
+          if (rows[i].uid === action.account || rows[i].file === action.account) {
+            body.uid = rows[i].uid;
+            break;
+          }
+        }
+      }
+      var result = await postJson(API + '/checkin', body);
+      cache.value = null;
+      return { state: 'ok', name: result && result.result ? '签到已执行' : undefined };
+    }
+    if (kind === 'set-sidebar-credit-style') {
+      if (action.creditStyle === 'remaining' || action.creditStyle === 'usage') writePref('sidebarCreditStyle', action.creditStyle);
+      return { state: 'ok' };
+    }
+    if (kind === 'set-sidebar-credit-visible') {
+      writePref('sidebarCreditVisible', action.enabled !== false);
+      return { state: 'ok' };
+    }
+    if (kind === 'set-composer-credit-visible') {
+      writePref('composerCreditVisible', action.enabled !== false);
+      return { state: 'ok' };
+    }
+    if (kind === 'set-probe-control-visible') {
+      writePref('probeControlVisible', action.enabled !== false);
+      return { state: 'ok' };
+    }
+    if (kind === 'set-maximum-context-window') {
+      writePref('useMaximumContextWindow', action.enabled !== false);
+      return { state: 'ok' };
+    }
+    if (kind === 'open-link') {
+      var url = String(action.url || '');
+      if (/^https?:\/\//i.test(url)) window.open(url, '_blank', 'noopener');
+      return { state: 'ok' };
+    }
+    if (kind === 'clear' || kind === 'set-model-visibility' || kind === 'set-model-allowlist') {
+      return { state: 'ok' };
+    }
+    if (kind === 'probe') {
+      return { state: 'failed', reason: '本插件不做推理能力探测（模型清单直接取自网关 /v1/models）' };
+    }
+    return { state: 'ok' };
+  }
+
+  function variantOf(url) {
+    var path = String(url);
+    if (path.indexOf(PREFIX) !== 0) return null;
+    var rest = path.slice(PREFIX.length);
+    var global = rest.indexOf('/ai/') === 0;
+    var tail = global ? rest.slice(4) : rest;
+    var name = tail.replace(/^\//, '').split('?')[0];
+    if (name !== 'status' && name !== 'accounts' && name !== 'probe') return null;
+    return { kind: name, variantId: global ? 'workbuddy-ai' : 'workbuddy', realm: global ? 'global' : 'cn' };
+  }
+
+  var originalFetch = window.fetch.bind(window);
+
+  window.fetch = async function (input, init) {
+    var url = typeof input === 'string' ? input : (input && input.url ? input.url : String(input));
+    var route = variantOf(url);
+    if (route === null) return originalFetch(input, init);
+
+    var method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+
+    if (route.kind === 'status' && method === 'GET') {
+      try {
+        var data = await loadData(false);
+        return toJsonResponse(buildDocument(data, route.variantId));
+      } catch (error) {
+        var message = error instanceof Error ? error.message : String(error);
+        return toJsonResponse({ status: 'error', message: message }, 200);
+      }
+    }
+
+    if (route.kind === 'accounts' && method === 'POST') {
+      var action = {};
+      try {
+        action = JSON.parse(String((init && init.body) || '{}'));
+      } catch (_error) {
+        return toJsonResponse({ state: 'failed', reason: '请求体不是 JSON' }, 200);
+      }
+      try {
+        return toJsonResponse(await handleAccounts(action, route.realm));
+      } catch (error) {
+        var reason = error instanceof Error ? error.message : String(error);
+        return toJsonResponse({ state: 'failed', reason: reason }, 200);
+      }
+    }
+
+    if (route.kind === 'probe' && method === 'POST') {
+      var probeAction = {};
+      try {
+        probeAction = JSON.parse(String((init && init.body) || '{}'));
+      } catch (_error) {
+        return toJsonResponse({ state: 'failed', reason: '请求体不是 JSON' }, 200);
+      }
+      try {
+        return toJsonResponse(await handleProbe(probeAction));
+      } catch (error) {
+        var probeReason = error instanceof Error ? error.message : String(error);
+        return toJsonResponse({ state: 'failed', reason: probeReason }, 200);
+      }
+    }
+
+    return originalFetch(input, init);
+  };
+
+  // --- 参考界面里没有的入口：补一个「WorkBuddy 工具」分区 --------------------
+  //
+  // 参考项目的设置页只有「账号 / 模型」两页，网关重启与成长任务领取没有落点。
+  // 这里用它**自己的样式类**（wbp-*）在同一个 settings.section 槽位里再挂一页，
+  // 骨架与它逐行一致（.wbp-section → .wbp-group → .wbp-row），所以看上去是同一
+  // 套界面的一部分；代码留在这层，vendor bundle 保持逐字节原样。
+
+  function makeToolsComponent(React) {
+    const h = React.createElement;
+    const { useState, useEffect, useCallback } = React;
+
+    /**
+     * 三件套与参考界面同一套类名：一行 = 文案块 + 右侧控件，一组 = 标题 + 行容器。
+     * 定义在 makeToolsComponent 里而不是模块级，这样它们拿到的 props 就是槽位
+     * 直接传进来的那一个（模块级签名写成 (React, props) 会被 React 当成 props，
+     * 拿到的 React 其实是 props —— 冒烟里当场炸成 "h is not a function"）。
+     */
+    function toolsRow(props) {
+      return h('div', { className: 'wbp-row' },
+        h('div', { className: 'wbp-rowText' },
+          h('span', { className: 'wbp-rowTitle' }, props.title),
+          props.desc ? h('span', { className: 'wbp-rowDesc' }, props.desc) : null),
+        h('div', { className: 'wbp-rowControl' }, props.children));
+    }
+
+    function toolsGroup(props) {
+      return h('div', { className: 'wbp-group' },
+        h('div', { className: 'wbp-groupHead' },
+          h('h3', { className: 'wbp-groupTitle' }, props.title)),
+        props.desc ? h('p', { className: 'wbp-groupDesc' }, props.desc) : null,
+        h('div', { className: 'wbp-rows' }, props.children));
+    }
+
+    function toolsButton(props) {
+      return h('button', {
+        type: 'button',
+        className: 'wbp-linkButton',
+        disabled: props.disabled === true,
+        onClick: props.onClick,
+      }, props.label);
+    }
+
+    return function WorkBuddyTools() {
+      const [gateway, setGateway] = useState({ phase: 'idle', text: '—', note: '', busy: false });
+      const [tasks, setTasks] = useState({ running: false, pending: null, summary: null, logs: [], note: '' });
+      // 凭证 JSON 粘贴：参考界面的「添加账号」只有扫码 / 令牌两条路，本插件一直
+      // 支持整份凭证 JSON（含 refreshToken），这里补一个输入框，走宿主 /import。
+
+      const loadGateway = useCallback(async () => {
+        setGateway((prev) => ({ ...prev, phase: 'loading' }));
+        try {
+          const response = await fetch('/dsh-wb2api/state', { headers: { accept: 'application/json' } });
+          const body = await response.json();
+          const pool = body && body.gateway ? body.gateway : {};
+          const accounts = Array.isArray(body && body.accounts) ? body.accounts : [];
+          const usable = accounts.filter((account) => account.disabled !== true).length;
+          const health = pool.health ? pool.health : {};
+          setGateway({
+            phase: 'ready',
+            busy: false,
+            text: (pool.running === true ? '运行中' : '未运行')
+              + ' · ' + String(pool.baseURL || '—')
+              + ' · 可用账号 ' + usable + '/' + accounts.length,
+            note: health.service
+              ? '健康 ' + String(health.healthy === undefined ? '—' : health.healthy) + '/' + String(health.total === undefined ? '—' : health.total)
+              : '',
+          });
+        } catch (error) {
+          setGateway({ phase: 'error', busy: false, text: '读取网关状态失败', note: String((error && error.message) || error) });
+        }
+      }, []);
+
+      const restartGateway = useCallback(async () => {
+        setGateway((prev) => ({ ...prev, busy: true, note: '正在重启网关…' }));
+        try {
+          const response = await fetch('/dsh-wb2api/restart', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', accept: 'application/json' },
+            body: '{}',
+          });
+          const body = await response.json().catch(() => ({}));
+          const state = typeof body.state === 'string' ? body.state : (response.ok ? 'ok' : 'failed');
+          const health = body && body.health ? body.health : null;
+          const took = Number(body && body.tookMs);
+          const parts = ['重启 ' + state];
+          if (health) parts.push('可用账号 ' + String(health.healthy === undefined ? '—' : health.healthy) + '/' + String(health.total === undefined ? '—' : health.total));
+          if (Number.isFinite(took) && took > 0) parts.push('用时 ' + (took / 1000).toFixed(1) + ' 秒');
+          setGateway((prev) => ({ ...prev, busy: false, note: parts.join(' · ') }));
+          await loadGateway();
+        } catch (error) {
+          setGateway((prev) => ({ ...prev, busy: false, note: '重启失败：' + String((error && error.message) || error) }));
+        }
+      }, [loadGateway]);
+
+      const loadTasks = useCallback(async () => {
+        try {
+          const response = await fetch('/dsh-wb2api/tasks/status', { headers: { accept: 'application/json' } });
+          const body = await response.json();
+          setTasks({
+            running: body.running === true,
+            pending: body.pending || null,
+            summary: body.summary || null,
+            logs: Array.isArray(body.logs) ? body.logs.slice(-6) : [],
+            note: typeof body.error === 'string' && body.error !== '' ? body.error : '',
+          });
+        } catch (error) {
+          setTasks((prev) => ({ ...prev, note: String((error && error.message) || error) }));
+        }
+      }, []);
+
+      const runTasks = useCallback(async () => {
+        setTasks((prev) => ({ ...prev, running: true, note: '已开始执行，进度见下方日志' }));
+        try {
+          const response = await fetch('/dsh-wb2api/tasks/run', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', accept: 'application/json' },
+            body: '{}',
+          });
+          const body = await response.json().catch(() => ({}));
+          if (body && body.started === false) {
+            setTasks((prev) => ({ ...prev, running: body.running === true, note: String(body.message || '已有一轮在执行') }));
+          }
+        } catch (error) {
+          setTasks((prev) => ({ ...prev, running: false, note: '启动失败：' + String((error && error.message) || error) }));
+        }
+      }, []);
+
+      useEffect(() => { void loadGateway(); void loadTasks(); }, [loadGateway, loadTasks]);
+      useEffect(() => {
+        const timer = setInterval(() => { void loadTasks(); }, 3000);
+        return () => clearInterval(timer);
+      }, [loadTasks]);
+
+      const pendingTotal = tasks.pending && Number.isFinite(Number(tasks.pending.total)) ? Number(tasks.pending.total) : null;
+      const taskTitle = tasks.running
+        ? '任务执行中…'
+        : pendingTotal === null
+          ? (tasks.summary ? '上一轮已完成' : '当前没有待办')
+          : '待办 ' + pendingTotal + ' 项';
+
+      // 折进参考页面里渲染（同一个 wbp-section 列），所以这里只出分组、不再自建列。
+      return h(React.Fragment, null,
+        h(toolsGroup, { title: '网关', desc: '自托管网关进程（WorkBuddy / CodeBuddy 账号池反代）。抽风时重启一次即可，端口僵死会被清掉。' },
+          h(toolsRow, {
+            title: gateway.phase === 'loading' ? '读取中…' : gateway.text,
+            desc: gateway.note || null,
+          }, h(toolsButton, { label: gateway.busy ? '重启中…' : '重启网关', disabled: gateway.busy, onClick: restartGateway }))),
+        h(toolsGroup, { title: '成长任务', desc: '一键确认待办 → 执行 → 达标自动领奖。执行在宿主后台跑，可以离开本页。' },
+          h(toolsRow, { title: taskTitle, desc: tasks.note || null },
+            h(toolsButton, { label: tasks.running ? '领取中…' : '领取任务积分', disabled: tasks.running, onClick: runTasks })),
+          tasks.logs.length === 0 ? null : h('div', { className: 'wbp-rows' },
+            tasks.logs.map((line, index) => h('div', { key: String(index), className: 'wbp-row wbp-rowFlush' },
+              h('div', { className: 'wbp-rowText' }, h('span', { className: 'wbp-hint' }, String(line))))))));
+    };
+  }
+
+  /**
+   * 把工具块**并进参考项目那一页**，而不是另开一个设置分区。
+   *
+   * 做法是包一层 `ctx.slots.register`：参考实现在 apply() 里注册
+   * `settings.section#dsh-workbuddy`，我们拦下那一次注册，把组件换成
+   * 「原页面 + 工具块」的 Fragment。于是设置导航里仍然只有一个 WorkBuddy 条目，
+   * 重启网关与任务领取排在同一列的末尾，用的是同一套 wbp- 行长什么样就是什么样。
+   */
+  function mergeToolsInto(ctx, React) {
+    if (!ctx || !ctx.slots || typeof ctx.slots.register !== 'function') return;
+    const slots = ctx.slots;
+    if (slots.__wb2apiToolsMerged === true) return;
+    slots.__wb2apiToolsMerged = true;
+    const nativeRegister = slots.register.bind(slots);
+    const Tools = makeToolsComponent(React);
+    slots.register = function (desc, Component) {
+      const isWorkBuddyPage = desc !== null && typeof desc === 'object'
+        && desc.name === 'settings.section' && desc.id === 'dsh-workbuddy';
+      if (!isWorkBuddyPage || typeof Component !== 'function') return nativeRegister(desc, Component);
+      function WorkBuddyPageWithTools(props) {
+        return React.createElement(React.Fragment, null,
+          React.createElement(Component, props),
+          React.createElement(Tools, null));
+      }
+      WorkBuddyPageWithTools.displayName = 'WorkBuddySettingsPageWithTools';
+      return nativeRegister(desc, WorkBuddyPageWithTools);
+    };
+  }
+
+  /**
+   * 拦截模块加载器：拿到 vendor bundle 的 factory 与它 require 到的 react，
+   * 再把它的 `apply` 包一层 —— vendor 文件因此不用改一个字节。
+   */
+  function patchModuleLoader(loader) {
+    if (loader === null || typeof loader !== 'object' || typeof loader.load !== 'function') return loader;
+    if (loader.__wb2apiPatched === true) return loader;
+    loader.__wb2apiPatched = true;
+    const nativeLoad = loader.load.bind(loader);
+    loader.load = function (entry) {
+      if (entry !== null && typeof entry === 'object' && typeof entry.factory === 'function') {
+        const factory = entry.factory;
+        entry.factory = function (require) {
+          const moduleExports = factory(require);
+          try {
+            const React = require('react');
+            const originalApply = moduleExports.apply;
+            if (typeof originalApply === 'function' && moduleExports.__wb2apiWrapped !== true) {
+              moduleExports.__wb2apiWrapped = true;
+              moduleExports.apply = function (ctx) {
+                // 先接管 register，再让插件自己 apply —— 它注册设置页时会被裹上一层，
+                // 网关/任务两组就长在同一个页面里，导航里只有一个 WorkBuddy 条目。
+                mergeToolsInto(ctx, React);
+                return originalApply.call(this, ctx);
+              };
+            }
+          } catch (error) {
+            console.warn('[wb2api] 工具分区挂载失败', error);
+          }
+          return moduleExports;
+        };
+      }
+      return nativeLoad(entry);
+    };
+    return loader;
+  }
+
+  (function interceptModuleLoader() {
+    // 已经存在的加载器要先接住再挂访问器：宿主脚本先于插件 bundle 执行，
+    // 直接把 getter 换成 null 会把宿主那一个吞掉（本文件自己就被它加载）。
+    const existing = window.__ModuleLoader__;
+    let current = existing === undefined || existing === null ? null : patchModuleLoader(existing);
+    try {
+      Object.defineProperty(window, '__ModuleLoader__', {
+        configurable: true,
+        get() { return current; },
+        set(value) { current = patchModuleLoader(value); },
+      });
+    } catch (error) {
+      if (current === null) console.warn('[wb2api] 无法拦截模块加载器', error);
+    }
+  })();
+
+  // 让同一页面的其它脚本能手动清缓存（调试用）。
+  window.__wb2apiShim = {
+    invalidate: function () { cache.value = null; },
+    prefs: readPrefs,
+    prefix: PREFIX,
+    /** 供冒烟脚本直接喂数据验映射（浏览器里没人用）。 */
+    buildDocument: buildDocument,
+    buildModels: buildModels,
+  };
+})();
+
+
 window.__ModuleLoader__.load({
 	id: "dsh-plugin-wb2api-ui",
 	factory: (require) => {
@@ -11,1703 +814,6343 @@ window.__ModuleLoader__.load({
 		var exports = module.exports;
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 		let react = require("react");
-		const h = react.createElement;
-		const { useState, useEffect, useCallback, useRef } = react;
-
-		const name = "dsh-plugin-wb2api-ui";
-		const inject = ["slots"];
-
-		/** 宿主路由前缀。 */
-		const API = "/dsh-wb2api";
-		/** 授权轮询节奏与上限（与 node 半侧的登录语义对齐：上游确认有延迟）。 */
-		const POLL_INTERVAL_MS = 3000;
-		const POLL_MAX = 20;
-
-		// 主题 token 全部对齐 DSH 自己的 --dsw-alias-* 命名空间。
-		// 注意两处**不要想当然**：
-		//   1) brand-primary 在暗色下解析成 bluish-50(near-white)，不是蓝色。
-		//      主按钮必须用 button-primary-fill + label-primary-foreground 配对，
-		//      否则暗色下白底白字、按钮文字直接看不见。
-		//   2) 警告色是 state-warn-primary，不是 state-warning-primary。
-		//   3) **label-dimmed 不能当提示文字色** —— 它在暗色主题下解成 bluish-750
-		//      (#43454a)，压在 bg-layer-3 (#353638) 上几乎没有对比度，提示等于没写。
-		//      提示 / 标签统一用 label-caption（暗色 #81858c，亮色 #adb2b8）。
-		const TOKENS = {
-			ink: "var(--dsw-alias-label-primary, #e5e7eb)",
-			secondary: "var(--dsw-alias-label-secondary, #cfd3d6)",
-			muted: "var(--dsw-alias-label-tertiary, #9ca3af)",
-			caption: "var(--dsw-alias-label-caption, #81858c)",
-			border: "var(--dsw-alias-border-l2, rgba(128,128,128,.25))",
-			// ⚠ 背景层**数字越大越亮**（暗色）：layer-1 #232324 < layer-2 #2c2c2e < layer-3 #353638。
-			// 卡片底色就是 layer-3（最亮那层），所以 panel2 是比它**更暗**的一层 ——
-			// 只能当"次一级表面"用，绝不能当"高亮"。要高亮请用下面的 `overlay`。
-			panel: "var(--dsw-alias-bg-layer-3, rgba(255,255,255,.035))",
-			panel2: "var(--dsw-alias-bg-layer-2, rgba(255,255,255,.06))",
-			/**
-			 * 「高亮一层」用的叠加色。
-			 *
-			 * **别用 `bg-layer-2` 当高亮** —— 暗色下层级是「数字越大越亮」：
-			 * `layer-1 #232324 < layer-2 #2c2c2e < layer-3 #353638`，
-			 * 而卡片底色就是 layer-3（最亮的那层）。拿 layer-2 做高亮等于**变暗**，
-			 * 两者只差一档、在深色区几乎看不出 —— 表现就是「高亮没生效」。
-			 *
-			 * `interactive-bg-hover` 才是设计上给"浮起/悬停"用的叠加层
-			 * （暗色 `#ffffff14` 白光、亮色 `#2631480f` 深色半透明），
-			 * 且**必须叠在底色上**才有效果 —— 它是半透明的，单独铺会露出页面底色。
-			 */
-			overlay: "var(--dsw-alias-interactive-bg-hover, rgba(255,255,255,.08))",
-			accent: "var(--dsw-alias-link, #4d93f8)",
-			fill: "var(--dsw-alias-button-primary-fill, #4d93f8)",
-			onFill: "var(--dsw-alias-label-primary-foreground, #ffffff)",
-			danger: "var(--dsw-alias-state-error-primary, #ef6b73)",
-			ok: "var(--dsw-alias-state-success-primary, #3fbf6f)",
-			warn: "var(--dsw-alias-state-warn-primary, #e2a03f)",
-			/**
-			 * 积分条的紫。
-			 *
-			 * 主题里**没有紫色 token** —— `brand-primary` / `link` / `deepseek-450`
-			 * 全是蓝（`#679efe` 一族）。这个值是从 WorkDaddy 账号页的条上取的。
-			 * 留一个 CSS 变量入口：想换色调只需在主题里定义 `--dsw-wb2api-bar`，
-			 * 不必回来改代码。
-			 */
-			bar: "var(--dsw-wb2api-bar, #a78bfa)",
+		let react_dom = require("react-dom");
+		let _deepseek_ai_dsh_client_ui_primitives = require("@deepseek-ai/dsh-client-ui-primitives");
+		let react_jsx_runtime = require("react/jsx-runtime");
+		//#region src/status-paths.ts
+		/**
+		* How long a benched account stays benched, in the unit that reads best.
+		*
+		* Shared rather than written on each side because both halves describe the same
+		* field of the same document, and the CLI and the settings page disagreeing
+		* about how long a cooldown has left would read as one of them being wrong. The
+		* *wording* stays local, because only each side knows its language.
+		*
+		* The hour unit exists because an upstream-stated reset can be most of a day
+		* away, and "1078 分钟" is a number nobody converts in their head.
+		*/
+		function describeWait(untilMs, now) {
+			const minutes = Math.max(1, Math.ceil(Math.max(0, untilMs - now) / 6e4));
+			return minutes < 60 ? {
+				unit: "minute",
+				value: minutes
+			} : {
+				unit: "hour",
+				value: Math.ceil(minutes / 60)
+			};
+		}
+		/** Plugin-owned status endpoint consumed by its browser half. */
+		const WORKBUDDY_STATUS_PATH = "/plugins/dsh-workbuddy-connect-functy/status";
+		/**
+		* Plugin-owned probe control endpoint.
+		*
+		* Separate from the status route because it accepts writes: the status route's
+		* loopback Host/Origin guard protects against a DNS-rebinding *page*, which is
+		* not the same as authorizing a state-changing action. This route therefore
+		* also requires the in-process key the browser half receives with the status
+		* document.
+		*/
+		const WORKBUDDY_PROBE_PATH = "/plugins/dsh-workbuddy-connect-functy/probe";
+		/**
+		* The international (WorkBuddy AI) variant's own pair of routes.
+		*
+		* Kept as separate constants rather than a computed suffix so both halves
+		* reference literal strings: the browser bundle and the host bundle are built
+		* independently, and a shared expression is one build-config drift away from
+		* the desk asking a route the host never mounted.
+		*/
+		const WORKBUDDY_AI_STATUS_PATH = "/plugins/dsh-workbuddy-connect-functy/ai/status";
+		const WORKBUDDY_AI_PROBE_PATH = "/plugins/dsh-workbuddy-connect-functy/ai/probe";
+		/**
+		* Account-management routes, one pair per variant.
+		*
+		* Separate from the probe route because they act on different state (the
+		* account pool, not probe records) and because a browser that fails to reach
+		* one must not lose the other. Both are writes and therefore carry the same
+		* in-process key as the probe route.
+		*/
+		const WORKBUDDY_ACCOUNT_PATH = "/plugins/dsh-workbuddy-connect-functy/accounts";
+		const WORKBUDDY_AI_ACCOUNT_PATH = "/plugins/dsh-workbuddy-connect-functy/ai/accounts";
+		/** Whether a value is one of the closed set of sidebar credit styles. */
+		function isWorkBuddySidebarCreditStyle(value) {
+			return value === "remaining" || value === "usage";
+		}
+		/** Both products, in display order. */
+		const CARD_VARIANTS = [{
+			id: "workbuddy",
+			titleKey: "title",
+			introKey: "intro",
+			signedOutKey: "signedOutHint",
+			statusPath: WORKBUDDY_STATUS_PATH,
+			probePath: WORKBUDDY_PROBE_PATH,
+			accountPath: WORKBUDDY_ACCOUNT_PATH,
+			appName: "WorkBuddy"
+		}, {
+			id: "workbuddy-ai",
+			titleKey: "titleAI",
+			introKey: "introAI",
+			signedOutKey: "signedOutHintAI",
+			statusPath: WORKBUDDY_AI_STATUS_PATH,
+			probePath: WORKBUDDY_AI_PROBE_PATH,
+			accountPath: WORKBUDDY_AI_ACCOUNT_PATH,
+			appName: "WorkBuddy AI"
+		}];
+		//#endregion
+		//#region src/client/qr-code.ts
+		/** Mode indicator for 8-bit byte mode. */
+		const MODE_BYTE = 4;
+		/**
+		* Data capacity, in bytes, for levels M by version (1-20), byte mode.
+		*
+		* From the Model 2 capacity tables: total codewords minus the error-correction
+		* codewords for that version, minus the mode/length header, rounded down. Held
+		* as a table because the block structures below are also tabulated and driving
+		* one from the other invites an off-by-one that only shows up at one version.
+		*/
+		const BYTE_CAPACITY_M = [
+			14,
+			26,
+			42,
+			62,
+			84,
+			106,
+			122,
+			152,
+			180,
+			213,
+			251,
+			287,
+			331,
+			362,
+			412,
+			450,
+			504,
+			560,
+			624,
+			666
+		];
+		const BLOCKS_M = [
+			{
+				ecPerBlock: 10,
+				groups: [[1, 16]]
+			},
+			{
+				ecPerBlock: 16,
+				groups: [[1, 28]]
+			},
+			{
+				ecPerBlock: 26,
+				groups: [[1, 44]]
+			},
+			{
+				ecPerBlock: 18,
+				groups: [[2, 32]]
+			},
+			{
+				ecPerBlock: 24,
+				groups: [[2, 43]]
+			},
+			{
+				ecPerBlock: 16,
+				groups: [[4, 27]]
+			},
+			{
+				ecPerBlock: 18,
+				groups: [[4, 31]]
+			},
+			{
+				ecPerBlock: 22,
+				groups: [[2, 38], [2, 39]]
+			},
+			{
+				ecPerBlock: 22,
+				groups: [[3, 36], [2, 37]]
+			},
+			{
+				ecPerBlock: 26,
+				groups: [[4, 43], [1, 44]]
+			},
+			{
+				ecPerBlock: 30,
+				groups: [[1, 50], [4, 51]]
+			},
+			{
+				ecPerBlock: 22,
+				groups: [[6, 36], [2, 37]]
+			},
+			{
+				ecPerBlock: 22,
+				groups: [[8, 37], [1, 38]]
+			},
+			{
+				ecPerBlock: 24,
+				groups: [[4, 40], [5, 41]]
+			},
+			{
+				ecPerBlock: 24,
+				groups: [[5, 41], [5, 42]]
+			},
+			{
+				ecPerBlock: 28,
+				groups: [[7, 45], [3, 46]]
+			},
+			{
+				ecPerBlock: 28,
+				groups: [[10, 46], [1, 47]]
+			},
+			{
+				ecPerBlock: 26,
+				groups: [[9, 43], [4, 44]]
+			},
+			{
+				ecPerBlock: 26,
+				groups: [[3, 44], [11, 45]]
+			},
+			{
+				ecPerBlock: 26,
+				groups: [[3, 41], [13, 42]]
+			}
+		];
+		/**
+		* Alignment pattern centre coordinates per version.
+		*
+		* The spec's own table; the arithmetic rule that generates it has exceptions at
+		* the low versions and the table is shorter to read than the rule.
+		*/
+		const ALIGNMENT_CENTRES = [
+			[],
+			[6, 18],
+			[6, 22],
+			[6, 26],
+			[6, 30],
+			[6, 34],
+			[
+				6,
+				22,
+				38
+			],
+			[
+				6,
+				24,
+				42
+			],
+			[
+				6,
+				26,
+				46
+			],
+			[
+				6,
+				28,
+				50
+			],
+			[
+				6,
+				30,
+				54
+			],
+			[
+				6,
+				32,
+				58
+			],
+			[
+				6,
+				34,
+				62
+			],
+			[
+				6,
+				26,
+				46,
+				66
+			],
+			[
+				6,
+				26,
+				48,
+				70
+			],
+			[
+				6,
+				26,
+				50,
+				74
+			],
+			[
+				6,
+				30,
+				54,
+				78
+			],
+			[
+				6,
+				30,
+				56,
+				82
+			],
+			[
+				6,
+				30,
+				58,
+				86
+			],
+			[
+				6,
+				34,
+				62,
+				90
+			]
+		];
+		function encodeQrCode(text, options = {}) {
+			const bytes = new TextEncoder().encode(text);
+			const version = smallestVersion(bytes.length);
+			if (version === void 0) throw new Error(`QR payload of ${String(bytes.length)} bytes exceeds the supported capacity`);
+			const size = version * 4 + 17;
+			return {
+				size,
+				modules: placeCodewords(buildCodewords(bytes, version), version, size, options.mask)
+			};
+		}
+		/** The lowest version whose level-M byte capacity fits, or undefined. */
+		function smallestVersion(byteLength) {
+			for (let index = 0; index < BYTE_CAPACITY_M.length; index += 1) if (byteLength <= BYTE_CAPACITY_M[index]) return index + 1;
+		}
+		/**
+		* The final codeword sequence: mode + length + data + terminator + padding,
+		* split into blocks, each block extended with its own Reed–Solomon codewords,
+		* then interleaved in the spec's order.
+		*/
+		function buildCodewords(bytes, version) {
+			const layout = BLOCKS_M[version - 1];
+			const totalData = layout.groups.reduce((sum, [count, per]) => sum + count * per, 0);
+			const bits = [];
+			pushBits(bits, MODE_BYTE, 4);
+			pushBits(bits, bytes.length, version < 10 ? 8 : 16);
+			for (const byte of bytes) pushBits(bits, byte, 8);
+			const capacityBits = totalData * 8;
+			pushBits(bits, 0, Math.min(4, capacityBits - bits.length));
+			pushBits(bits, 0, (8 - bits.length % 8) % 8);
+			const data = [];
+			for (let index = 0; index < bits.length; index += 8) {
+				let value = 0;
+				for (let offset = 0; offset < 8; offset += 1) value = value << 1 | (bits[index + offset] ?? 0);
+				data.push(value);
+			}
+			const PAD = [236, 17];
+			for (let index = 0; data.length < totalData; index += 1) data.push(PAD[index % 2]);
+			const blocks = [];
+			let cursor = 0;
+			for (const [count, per] of layout.groups) for (let block = 0; block < count; block += 1) {
+				blocks.push(data.slice(cursor, cursor + per));
+				cursor += per;
+			}
+			const ecBlocks = blocks.map((block) => reedSolomon(block, layout.ecPerBlock));
+			const out = [];
+			const maxData = Math.max(...blocks.map((block) => block.length));
+			for (let index = 0; index < maxData; index += 1) for (const block of blocks) {
+				const value = block[index];
+				if (value !== void 0) out.push(value);
+			}
+			for (let index = 0; index < layout.ecPerBlock; index += 1) for (const block of ecBlocks) {
+				const value = block[index];
+				if (value !== void 0) out.push(value);
+			}
+			return out;
+		}
+		/** Append the low `count` bits of `value`, most significant first. */
+		function pushBits(bits, value, count) {
+			for (let shift = count - 1; shift >= 0; shift -= 1) bits.push(value >> shift & 1);
+		}
+		/**
+		* Reed–Solomon codewords over GF(256) with the QR primitive polynomial 0x11d.
+		*
+		* The remainder of the message times `x^ecLength` divided by the generator
+		* polynomial, computed with the shift register the spec describes.
+		*/
+		function reedSolomon(data, ecLength) {
+			const generator = generatorPolynomial(ecLength).slice(1);
+			const remainder = new Array(ecLength).fill(0);
+			for (const byte of data) {
+				const factor = byte ^ remainder[0];
+				remainder.shift();
+				remainder.push(0);
+				for (let index = 0; index < ecLength; index += 1) remainder[index] = remainder[index] ^ gfMultiply(factor, generator[index]);
+			}
+			return remainder;
+		}
+		/**
+		* The degree-`ecLength` generator polynomial, as coefficients with the leading
+		* 1 dropped: `(x - a^0)(x - a^1)...(x - a^(ecLength-1))`.
+		*/
+		function generatorPolynomial(ecLength) {
+			let polynomial = [1];
+			for (let index = 0; index < ecLength; index += 1) {
+				const next = new Array(polynomial.length + 1).fill(0);
+				for (let term = 0; term < polynomial.length; term += 1) {
+					next[term] = next[term] ^ polynomial[term];
+					next[term + 1] = next[term + 1] ^ gfMultiply(polynomial[term], gfPower(index));
+				}
+				polynomial = next;
+			}
+			return polynomial;
+		}
+		/** Multiply two GF(256) elements modulo the QR primitive polynomial. */
+		function gfMultiply(left, right) {
+			let result = 0;
+			let a = left;
+			let b = right;
+			while (b > 0) {
+				if ((b & 1) === 1) result ^= a;
+				a <<= 1;
+				if (a > 255) a ^= 285;
+				b >>= 1;
+			}
+			return result;
+		}
+		/** `2` raised to the `power`-th in GF(256), used to build the generator. */
+		function gfPower(power) {
+			let value = 1;
+			for (let index = 0; index < power; index += 1) value = gfMultiply(value, 2);
+			return value;
+		}
+		function placeCodewords(codewords, version, size, forced) {
+			if (forced !== void 0) {
+				const matrix = new Matrix(size);
+				drawFunctionPatterns(matrix, version);
+				drawCodewords(matrix, codewords);
+				applyMask(matrix, forced);
+				drawFormatBits(matrix, forced);
+				return matrix.modules.slice();
+			}
+			const matrix = new Matrix(size);
+			drawFunctionPatterns(matrix, version);
+			drawCodewords(matrix, codewords);
+			let best;
+			let bestScore = Number.POSITIVE_INFINITY;
+			for (let mask = 0; mask < 8; mask += 1) {
+				const candidate = new Matrix(size);
+				drawFunctionPatterns(candidate, version);
+				drawCodewords(candidate, codewords);
+				applyMask(candidate, mask);
+				drawFormatBits(candidate, mask);
+				const score = penalty(candidate);
+				if (score < bestScore) {
+					bestScore = score;
+					best = candidate.modules.slice();
+				}
+			}
+			if (best === void 0) throw new Error("QR mask selection produced no candidate");
+			return best;
+		}
+		/** A square of modules with typed access, so the builder reads as coordinates. */
+		var Matrix = class {
+			size;
+			modules;
+			/** Which modules are function patterns and must not be masked or overwritten. */
+			reserved;
+			constructor(size) {
+				this.size = size;
+				this.modules = new Array(size * size).fill(false);
+				this.reserved = new Array(size * size).fill(false);
+			}
+			get(x, y) {
+				return this.modules[y * this.size + x] === true;
+			}
+			set(x, y, dark) {
+				if (x < 0 || y < 0 || x >= this.size || y >= this.size) return;
+				this.modules[y * this.size + x] = dark;
+			}
+			mark(x, y) {
+				if (x < 0 || y < 0 || x >= this.size || y >= this.size) return;
+				this.reserved[y * this.size + x] = true;
+			}
 		};
-
-		// ---- 交互样式：hover / 过渡 / 动画 / 滚动条 ----------------------------------
-		// 内联样式做不了 :hover / @keyframes，这里注入一次全局 <style>（幂等）。
-		// 颜色全部走 --dsw-alias-* 主题变量并带兜底值，深浅主题都不会破。
-		const CSS_TEXT = [
-			".wb2ui-account{transition:box-shadow .15s ease,background .15s ease}",
-			".wb2ui-account:hover{box-shadow:0 0 0 1px var(--dsw-alias-border-l2,rgba(128,128,128,.28)),0 3px 14px rgba(0,0,0,.14)}",
-			".wb2ui-icobtn{transition:background .15s ease,border-color .15s ease,color .15s ease}",
-			".wb2ui-icobtn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.08))!important;border-color:var(--dsw-alias-link,#4d93f8)!important;color:var(--dsw-alias-link,#4d93f8)!important}",
-			".wb2ui-icobtn.danger:hover:not(:disabled){border-color:var(--dsw-alias-state-error-primary,#ef6b73)!important;color:var(--dsw-alias-state-error-primary,#ef6b73)!important}",
-			".wb2ui-btn{transition:filter .15s ease,transform .06s ease}",
-			".wb2ui-btn:hover:not(:disabled){filter:brightness(1.09)}",
-			".wb2ui-btn:active:not(:disabled){transform:translateY(1px)}",
-			".wb2ui-ghost{transition:box-shadow .15s ease}",
-			".wb2ui-ghost:hover:not(:disabled){box-shadow:inset 0 0 0 999px var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.08))}",
-			".wb2ui-tab{transition:color .15s ease,border-color .15s ease}",
-			".wb2ui-tab:hover:not(:disabled){color:var(--dsw-alias-label-primary,#e5e7eb)!important}",
-			".wb2ui-chip{transition:filter .15s ease}",
-			".wb2ui-chip:hover{filter:brightness(1.15)}",
-			".wb2ui-link:hover{text-decoration:underline}",
-			".wb2ui-model{transition:box-shadow .15s ease}",
-			".wb2ui-model:hover{box-shadow:0 0 0 1px var(--dsw-alias-border-l2,rgba(128,128,128,.28))}",
-			".wb2ui-skel{animation:wb2ui-pulse 1.4s ease-in-out infinite}",
-			"@keyframes wb2ui-pulse{0%,100%{opacity:.1}50%{opacity:.26}}",
-			".wb2ui-pulsedot{animation:wb2ui-pulse-dot 1.1s ease-in-out infinite}",
-			"@keyframes wb2ui-pulse-dot{0%,100%{opacity:.35}50%{opacity:1}}",
-			".wb2ui-scroll::-webkit-scrollbar{width:8px}",
-			".wb2ui-scroll::-webkit-scrollbar-thumb{background:var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:4px}",
-			".wb2ui-scroll::-webkit-scrollbar-track{background:transparent}",
-			".wb2ui-segrow{transition:background .12s ease;border-radius:6px;margin:0 -4px;padding:2px 4px}",
-			".wb2ui-segrow:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.06))}",
-		].join("\n");
-		/** 注入交互样式。apply 会被 HMR 反复触发，按 id 幂等。 */
-		function injectStyles() {
-			if (typeof document === "undefined") return;
-			let tag = document.getElementById("wb2ui-styles");
-			if (tag === null) {
-				tag = document.createElement("style");
-				tag.id = "wb2ui-styles";
-				document.head.appendChild(tag);
+		/** Finder patterns, separators, timing, alignment, and the dark module. */
+		function drawFunctionPatterns(matrix, version) {
+			const size = matrix.size;
+			for (const [originX, originY] of [
+				[0, 0],
+				[size - 7, 0],
+				[0, size - 7]
+			]) for (let y = -1; y <= 7; y += 1) for (let x = -1; x <= 7; x += 1) {
+				const px = originX + x;
+				const py = originY + y;
+				const inside = x >= 0 && x <= 6 && y >= 0 && y <= 6;
+				const edge = inside && (x === 0 || x === 6 || y === 0 || y === 6);
+				const core = x >= 2 && x <= 4 && y >= 2 && y <= 4;
+				matrix.set(px, py, inside && (edge || core));
+				matrix.mark(px, py);
 			}
-			tag.textContent = CSS_TEXT;
+			for (let index = 8; index < size - 8; index += 1) {
+				const dark = index % 2 === 0;
+				matrix.set(index, 6, dark);
+				matrix.mark(index, 6);
+				matrix.set(6, index, dark);
+				matrix.mark(6, index);
+			}
+			const centres = ALIGNMENT_CENTRES[version - 1];
+			for (const centreY of centres) for (const centreX of centres) {
+				if (centreX === 6 && centreY === 6 || centreX === 6 && centreY === size - 7 || centreX === size - 7 && centreY === 6) continue;
+				for (let y = -2; y <= 2; y += 1) for (let x = -2; x <= 2; x += 1) {
+					const dark = Math.max(Math.abs(x), Math.abs(y)) !== 1;
+					matrix.set(centreX + x, centreY + y, dark);
+					matrix.mark(centreX + x, centreY + y);
+				}
+			}
+			reserveFormatAreas(matrix, version);
+			matrix.set(8, size - 8, true);
+			matrix.mark(8, size - 8);
 		}
-
-		/** 头像色板：按 uid 稳定取色，白字在深浅主题下都可读。 */
-		const AVATAR_COLORS = ["#4d93f8", "#a78bfa", "#3fbf6f", "#e2a03f", "#ef6b73", "#38bdf8", "#34d399", "#f472b6"];
-		function avatarColor(uid) {
-			let hash = 0;
-			const s = String(uid || "");
-			for (let i = 0; i < s.length; i++) hash = (hash * 31 + s.charCodeAt(i)) >>> 0;
-			return AVATAR_COLORS[hash % AVATAR_COLORS.length];
+		/** Mark the format/version modules as reserved so data never lands on them. */
+		function reserveFormatAreas(matrix, version) {
+			const size = matrix.size;
+			for (let index = 0; index < 9; index += 1) {
+				matrix.mark(index, 8);
+				matrix.mark(8, index);
+			}
+			for (let index = 0; index < 8; index += 1) {
+				matrix.mark(size - 1 - index, 8);
+				matrix.mark(8, size - 1 - index);
+			}
+			if (version >= 7) for (let y = 0; y < 6; y += 1) for (let x = size - 11; x < size - 8; x += 1) {
+				matrix.mark(x, y);
+				matrix.mark(y, x);
+			}
 		}
-
-		const WRAP = { width: "100%", maxWidth: "920px", display: "flex", flexDirection: "column", gap: "16px", color: TOKENS.ink, fontFamily: "inherit" };
-		const CARD = { border: "1px solid " + TOKENS.border, borderRadius: "16px", padding: "16px 18px", display: "flex", flexDirection: "column", gap: "11px", background: TOKENS.panel };
-		const ROW = { display: "flex", alignItems: "center", gap: "9px", flexWrap: "wrap" };
-		const BTN = { padding: "8px 16px", borderRadius: "9px", border: "1px solid transparent", cursor: "pointer", fontSize: "13px", fontWeight: 600, background: TOKENS.fill, color: TOKENS.onFill };
-		const GHOST = { padding: "7px 12px", borderRadius: "9px", border: "1px solid " + TOKENS.border, cursor: "pointer", fontSize: "12px", fontWeight: 500, background: "transparent", color: TOKENS.ink };
-		const SMALL = { padding: "5px 11px", borderRadius: "999px", border: "1px solid " + TOKENS.border, cursor: "pointer", fontSize: "11.5px", background: TOKENS.panel2, color: TOKENS.secondary };
-		const INPUT = { width: "100%", padding: "8px 11px", fontSize: "12.5px", boxSizing: "border-box", background: TOKENS.panel2, color: TOKENS.ink, border: "1px solid " + TOKENS.border, borderRadius: "9px", outline: "none" };
-		const TEXTAREA = Object.assign({}, INPUT, { minHeight: "96px", fontFamily: "ui-monospace, 'Cascadia Mono', Consolas, monospace", fontSize: "11.5px", lineHeight: 1.55, resize: "vertical" });
-		const SELECT = { padding: "8px 12px", fontSize: "12.5px", borderRadius: "9px", border: "1px solid " + TOKENS.border, background: TOKENS.panel2, color: TOKENS.ink };
-		const TITLE = { fontSize: "13.5px", fontWeight: 700, letterSpacing: ".3px" };
-		const HINT = { fontSize: "11.5px", color: TOKENS.caption, lineHeight: 1.6 };
-
-		/** 一次宿主调用；失败一律抛错，由调用方决定怎么显示。 */
-		async function call(path, init) {
-			const response = await fetch(API + path, Object.assign({ cache: "no-store" }, init || {}));
-			let body;
+		/**
+		* Walk the symbol in the spec's zigzag — right to left in two-column pairs,
+		* alternating upward and downward — placing the codeword bits.
+		*/
+		function drawCodewords(matrix, codewords) {
+			const size = matrix.size;
+			let bitIndex = 0;
+			let upward = true;
+			for (let right = size - 1; right >= 1; right -= 2) {
+				if (right === 6) right = 5;
+				for (let step = 0; step < size; step += 1) {
+					const y = upward ? size - 1 - step : step;
+					for (const x of [right, right - 1]) {
+						if (matrix.reserved[y * size + x] === true) continue;
+						const byte = codewords[bitIndex >> 3];
+						const dark = byte === void 0 ? false : (byte >> 7 - (bitIndex & 7) & 1) === 1;
+						matrix.set(x, y, dark);
+						bitIndex += 1;
+					}
+				}
+				upward = !upward;
+			}
+		}
+		/** XOR the mask pattern over every non-function module. */
+		function applyMask(matrix, mask) {
+			const size = matrix.size;
+			for (let y = 0; y < size; y += 1) for (let x = 0; x < size; x += 1) {
+				if (matrix.reserved[y * size + x] === true) continue;
+				if (!maskApplies(mask, x, y)) continue;
+				matrix.modules[y * size + x] = !matrix.get(x, y);
+			}
+		}
+		/** The eight mask conditions of the spec, by index. */
+		function maskApplies(mask, x, y) {
+			switch (mask) {
+				case 0: return (x + y) % 2 === 0;
+				case 1: return y % 2 === 0;
+				case 2: return x % 3 === 0;
+				case 3: return (x + y) % 3 === 0;
+				case 4: return (Math.floor(y / 2) + Math.floor(x / 3)) % 2 === 0;
+				case 5: return x * y % 2 + x * y % 3 === 0;
+				case 6: return (x * y % 2 + x * y % 3) % 2 === 0;
+				case 7: return ((x + y) % 2 + x * y % 3) % 2 === 0;
+				default: return false;
+			}
+		}
+		/** Write the format information for `mask` (and the version blocks, if any). */
+		function drawFormatBits(matrix, mask) {
+			const size = matrix.size;
+			const data = 0 | mask;
+			let shifted = data << 10;
+			for (let index = 14; index >= 10; index -= 1) if ((shifted >> index & 1) === 1) shifted ^= 1335 << index - 10;
+			const bits = (data << 10 | shifted) ^ 21522;
+			const bit = (index) => (bits >> index & 1) === 1;
+			for (let index = 0; index <= 5; index += 1) matrix.set(8, index, bit(index));
+			matrix.set(8, 7, bit(6));
+			matrix.set(8, 8, bit(7));
+			matrix.set(7, 8, bit(8));
+			for (let index = 9; index <= 14; index += 1) matrix.set(14 - index, 8, bit(index));
+			for (let index = 0; index <= 7; index += 1) matrix.set(size - 1 - index, 8, bit(index));
+			for (let index = 8; index <= 14; index += 1) matrix.set(8, size - 15 + index, bit(index));
+			matrix.set(8, size - 8, true);
+			const version = (size - 17) / 4;
+			if (version < 7) return;
+			let versionRemainder = version;
+			for (let index = 0; index < 12; index += 1) versionRemainder = versionRemainder << 1 ^ (versionRemainder >> 11 & 1) * 7973;
+			const versionBits = version << 12 | versionRemainder;
+			for (let index = 0; index < 18; index += 1) {
+				const dark = (versionBits >> index & 1) === 1;
+				const a = Math.floor(index / 3);
+				const b = index % 3;
+				matrix.set(size - 11 + b, a, dark);
+				matrix.set(a, size - 11 + b, dark);
+			}
+		}
+		/** The spec's four penalty rules, summed. Lower is a better mask. */
+		function penalty(matrix) {
+			const size = matrix.size;
+			let score = 0;
+			for (let y = 0; y < size; y += 1) {
+				let runColour = matrix.get(0, y);
+				let runLength = 1;
+				for (let x = 1; x < size; x += 1) {
+					const colour = matrix.get(x, y);
+					if (colour === runColour) runLength += 1;
+					else {
+						if (runLength >= 5) score += runLength - 2;
+						runColour = colour;
+						runLength = 1;
+					}
+				}
+				if (runLength >= 5) score += runLength - 2;
+			}
+			for (let x = 0; x < size; x += 1) {
+				let runColour = matrix.get(x, 0);
+				let runLength = 1;
+				for (let y = 1; y < size; y += 1) {
+					const colour = matrix.get(x, y);
+					if (colour === runColour) runLength += 1;
+					else {
+						if (runLength >= 5) score += runLength - 2;
+						runColour = colour;
+						runLength = 1;
+					}
+				}
+				if (runLength >= 5) score += runLength - 2;
+			}
+			for (let y = 0; y < size - 1; y += 1) for (let x = 0; x < size - 1; x += 1) {
+				const colour = matrix.get(x, y);
+				if (colour === matrix.get(x + 1, y) && colour === matrix.get(x, y + 1) && colour === matrix.get(x + 1, y + 1)) score += 3;
+			}
+			const DARK_LIGHT_RUN = 1488;
+			const LIGHT_DARK_RUN = 93;
+			for (let y = 0; y < size; y += 1) {
+				let across = 0;
+				let down = 0;
+				for (let index = 0; index < size; index += 1) {
+					across = across << 1 & 2047 | (matrix.get(index, y) ? 1 : 0);
+					if (index >= 10 && (across === DARK_LIGHT_RUN || across === LIGHT_DARK_RUN)) score += 40;
+					down = down << 1 & 2047 | (matrix.get(y, index) ? 1 : 0);
+					if (index >= 10 && (down === DARK_LIGHT_RUN || down === LIGHT_DARK_RUN)) score += 40;
+				}
+			}
+			let dark = 0;
+			for (const module of matrix.modules) if (module) dark += 1;
+			const steps = Math.abs(Math.ceil(dark * 100 / (size * size) / 5) - 10);
+			score += steps * 10;
+			return score;
+		}
+		//#endregion
+		//#region src/json-value.ts
+		/**
+		* The one shape predicate every parser in this plugin shares.
+		*
+		* A decoded JSON value is only safe to index when it is a plain object: `null`
+		* is a valid JSON document, an array is one too, and a scalar is one as well.
+		* Each of those reaches a `wrapped['field']` read as a TypeError, or worse,
+		* silently as `undefined` — so every site that reads a field off parsed text
+		* has to say the same thing first. Saying it once here is what keeps a new
+		* route, store or decoder from having to remember it.
+		*
+		* @module dsh-workbuddy-connect/json-value
+		*/
+		/**
+		* Whether a decoded value is a plain JSON object.
+		*
+		* Arrays are excluded deliberately rather than incidentally: `typeof []`
+		* is `'object'`, so a check that forgets them lets a response shaped as a
+		* list be indexed by field name.
+		*/
+		function isJsonObject(value) {
+			return typeof value === "object" && value !== null && !Array.isArray(value);
+		}
+		//#endregion
+		//#region src/client/status-document.ts
+		/** Reading and shape-checking a product's status document. */
+		/**
+		* Whether a parsed status response really is a status document.
+		*
+		* A 200 is not a promise about the body: it may be empty, literal `null`, a
+		* non-JSON page from a proxy, or an array. Both halves of the browser plugin
+		* read the same route, so both must agree on what is valid — storing an
+		* unreadable value puts something in state that the next render dereferences.
+		*
+		* The check is deliberately limited to the discriminator (plus `error`'s
+		* `message`, which the error paragraph renders): validating optional fields
+		* here would reject documents the host legitimately omits fields from, which
+		* is exactly the shape a host older than the field produces.
+		*/
+		function isWorkBuddyWebStatus(value) {
+			if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+			const wrapped = value;
+			const status = wrapped["status"];
+			if (status === "signed-out" || status === "signed-in") return true;
+			return status === "error" && typeof wrapped["message"] === "string";
+		}
+		/**
+		* Read one product's status document.
+		*
+		* Every browser-half reader issues the identical request — the variant's own
+		* path, `accept: application/json`, same-origin credentials, the caller's abort
+		* signal — and every one of them then has to decide what a body that is not a
+		* status document means. Both halves of that live here, so a reader only has to
+		* state its own degradation policy.
+		*
+		* @param variant - which product's route to read.
+		* @param signal - aborts the request with the caller's lifetime.
+		*/
+		async function readWorkBuddyStatus(variant, signal) {
+			let response;
 			try {
-				body = await response.json();
+				response = await fetch(variant.statusPath, {
+					headers: { accept: "application/json" },
+					credentials: "same-origin",
+					...signal === void 0 ? {} : { signal }
+				});
 			} catch {
-				body = { ok: false, error: "宿主返回了非 JSON 响应（HTTP " + response.status + "）" };
+				return { state: "unreadable" };
 			}
-			if (body && body.ok) return body;
-			const error = new Error((body && body.error) || ("HTTP " + response.status));
-			// 202 = 登录尚未完成，可重试；不是故障。
-			error.pending = Boolean(body && body.pending) || response.status === 202;
-			/**
-			 * 404 = 这条路由根本没挂上，而不是请求内容有问题。
-			 *
-			 * 面板的 client 半侧由 dsh 每 500ms 热替换，host 半侧却只在启动时
-			 * 加载一次。所以「改完 lib/index.js 还没重启」这段时间里，界面是新的、
-			 * 路由是旧的 —— 新加的接口一律 404。不把这种情况单列出来，用户会
-			 * 拿去查 token、查网络、查上游，而真正该做的是重启 dsh。
-			 */
-			error.missing = response.status === 404;
-			throw error;
+			const body = await response.json().catch(() => void 0);
+			if (!response.ok) return {
+				state: "refused",
+				message: isJsonObject(body) && typeof body["error"] === "string" ? body["error"] : `HTTP ${String(response.status)}`
+			};
+			return isWorkBuddyWebStatus(body) ? {
+				state: "read",
+				status: body
+			} : { state: "unreadable" };
 		}
-
-		const postJson = (path, payload) => call(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
-
-		/** Unix 秒 → 本地日期；0 视为未知。 */
-		function when(unixSeconds) {
-			if (!unixSeconds) return "未知";
-			const d = new Date(unixSeconds * 1000);
-			const pad = (n) => String(n).padStart(2, "0");
-			return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + pad(d.getHours()) + ":" + pad(d.getMinutes());
-		}
-
-		/** 毫秒 → 本地日期。段数据的 `expiresAt` 是毫秒（上游 `DeductionEndTime` 就是毫秒）。 */
-		function whenMs(ms) {
-			if (!ms) return "未知";
-			const d = new Date(Number(ms));
-			if (Number.isNaN(d.getTime())) return "未知";
-			const pad = (n) => String(n).padStart(2, "0");
-			return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + pad(d.getHours()) + ":" + pad(d.getMinutes());
-		}
-
 		/**
-		 * 去掉模型 id 的区域前缀。
-		 *
-		 * 网关按 `{区域}:{模型}` 命名（`cn:auto`、`cn:fast-model`），区域由网关配置
-		 * 决定、不随账号变 —— 在模型列表里逐个重复是没有信息量的噪音。
-		 * 只剥一段冒号前缀，`cn:foo:bar` 这类仍保留后半段。
-		 */
-		function shortModelId(id) {
-			return String(id).replace(/^[a-z]+:/u, "");
+		* One plugin-wide preference, read from whichever document states it.
+		*
+		* A preference that belongs to the plugin rather than to a product is written to
+		* both products' documents, so a reader has to pick one. The pick is not
+		* arbitrary: a document that failed to load must not answer for the pair, or one
+		* broken route would silently reset a saved preference to its default. So only a
+		* document that is a real answer *and* actually states the field counts, and the
+		* caller's `read` decides whether the field is stated — which is how a
+		* preference whose absent value means "keep it as it was" stays distinguishable
+		* from one whose absent value means "off".
+		*
+		* @param statuses - the latest document per variant id; a variant that never
+		*   answered is absent.
+		* @param read - pulls this preference out of one answered document.
+		* @returns the first stated value, or `undefined` when no document states one.
+		*/
+		function statedPreference(statuses, read) {
+			for (const variant of CARD_VARIANTS) {
+				const status = statuses[variant.id];
+				if (status === void 0 || status.status === "error") continue;
+				const value = read(status);
+				if (value !== void 0) return value;
+			}
 		}
-
-		/** 上下文窗口的紧凑写法：131072 → 128k。 */
-		function compact(n) {
-			if (!n) return "—";
-			if (n >= 1048576) return Math.round(n / 1048576) + "M";
-			if (n >= 1024) return Math.round(n / 1024) + "k";
-			return String(n);
-		}
-
+		//#endregion
+		//#region src/client/open-external.ts
 		/**
-		 * 积分数值：千分位 + **最多两位小数**。
-		 *
-		 * 两位不是随手取的：上游的 `*Precise` 字段就是两位精度（`2912.08`），
-		 * 只留一位会把 `.08` 抹成 `.1`，面板跟自己算的对不上。
-		 */
-		function formatCredits(n) {
-			if (typeof n !== "number" || !Number.isFinite(n)) return "—";
-			return n.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+		* Whether a URL is one this module will try to open.
+		*
+		* Mirrors the host's own rule so a bad link is refused before it travels
+		* anywhere: only absolute `http` and `https`, never a custom scheme
+		* (an app launcher), never `file:`, never `javascript:`.
+		*/
+		function isExternalWebLink(url) {
+			if (typeof url !== "string" || url.trim() === "") return false;
+			try {
+				const parsed = new URL(url);
+				return parsed.protocol === "http:" || parsed.protocol === "https:";
+			} catch {
+				return false;
+			}
 		}
-
+		/** Strategy 1: the platform's window-opening API. */
+		function viaWindow(win, url) {
+			try {
+				win.open(url, "_blank", "noopener,noreferrer");
+				return true;
+			} catch {
+				return false;
+			}
+		}
 		/**
-		 * 积分健康度配色。
-		 *
-		 * 分档只表达「还剩多少可用」，不是额度预警线：0 一定是耗尽，低于 200
-		 * 提示一下，其余按正常走。绝对值分档而非比例，因为每个包的容量差异太大
-		 * （6 到 1500 都有），比例会让大包小包同样显示成「充足」。
-		 */
-		function creditsTone(row) {
-			if (!row || row.state !== "ok") return null;
-			if (row.unlimited) return TOKENS.accent;
-			const n = Number(row.total) || 0;
-			if (n <= 0) return TOKENS.danger;
-			if (n < 200) return TOKENS.warn;
-			return TOKENS.ok;
+		* Strategy 4: an anchor with a blank target, clicked on the spot.
+		*
+		* Created, clicked and removed inside one call so nothing is left in the DOM,
+		* and `display:none` rather than a detached node: a detached anchor's click
+		* is ignored by some engines. The element is removed on the next turn rather
+		* than synchronously, because the navigation it starts is not complete yet.
+		*/
+		function viaAnchor(doc, url) {
+			try {
+				const anchor = doc.createElement("a");
+				anchor.href = url;
+				anchor.target = "_blank";
+				anchor.rel = "noopener noreferrer";
+				anchor.style.display = "none";
+				(doc.body ?? doc.documentElement).appendChild(anchor);
+				anchor.click();
+				setTimeout(() => {
+					anchor.remove();
+				}, 0);
+				return true;
+			} catch {
+				return false;
+			}
 		}
-
-		/** 毫秒时间戳 → 「N 秒前 / N 分钟前 / N 小时前」。 */
-		function timeAgo(ms) {
-			if (!ms) return "";
-			const sec = Math.max(0, Math.round((Date.now() - ms) / 1000));
-			if (sec < 60) return sec + " 秒前";
-			const min = Math.round(sec / 60);
-			if (min < 60) return min + " 分钟前";
-			return Math.round(min / 60) + " 小时前";
+		/** Strategy 3: DSH's own destination for a link — the right sidebar's browser. */
+		function viaSidebar(context, url) {
+			if (context === void 0) return false;
+			try {
+				const tabs = context.get("sidebarRightTabs");
+				if (typeof tabs?.get !== "function" || tabs.get("browser") === void 0) return false;
+				const sidebar = context.get("sidebarRight");
+				if (typeof sidebar?.openTab !== "function") return false;
+				sidebar.openTab("browser", {
+					params: { url },
+					revealIfOpened: true
+				});
+				return true;
+			} catch {
+				return false;
+			}
 		}
-
-		/** 状态行里的一个小徽章。 */
-		function Chip(props) {
-			// WorkDaddy 风格的**满色药丸**：彩色文字 + 同色淡底 + 同色细边，
-			// 不再是"透明底 + 灰边框"——后者在深色主题下糊成一条线。
-			// color-mix 把 token 色直接调成 13% 底 / 30% 边，不用手工配每档颜色。
-			const toneInk = props.toneInk || TOKENS.muted;
-			const tinted = props.tone !== undefined;
-			return h("span", {
-				className: "wb2ui-chip",
-				// 可选 tooltip：失败原因这类细节不该挤进徽章文案，但也不能丢。
-				title: props.title,
-				// 可选点击：启用/禁用这类操作做成「点徽章」比再占一个按钮位省地方。
-				onClick: props.onClick,
-				style: {
-					cursor: props.onClick === undefined ? "default" : "pointer",
-					display: "inline-flex", alignItems: "center", gap: "4px",
-					padding: "3px 10px", borderRadius: "999px", fontSize: "11.5px", fontWeight: 600,
-					whiteSpace: "nowrap", lineHeight: 1.5, fontVariantNumeric: "tabular-nums",
-					border: "1px solid " + (tinted ? "color-mix(in srgb, " + toneInk + " 30%, transparent)" : TOKENS.border),
-					color: toneInk,
-					background: tinted ? "color-mix(in srgb, " + toneInk + " 13%, transparent)" : TOKENS.panel2,
-				},
-			}, props.children);
-		}
-
-		/**
-		 * 「标签 + 大数字」—— 参考图里「账号数 4」「总积分 9,433.24」就是这个结构。
-		 *
-		 * 数字用 `tabular-nums`（等宽数字）：额度是每 60 秒刷新一次的，
-		 * 比例数字不跳字宽，刷新时不会左右抖动。
-		 */
-		function Stat(props) {
-			return h("span", { style: { display: "inline-flex", alignItems: "baseline", gap: "7px", flexShrink: 0 } },
-				h("span", { style: { fontSize: "13px", color: TOKENS.caption } }, props.label),
-				h("b", {
-					style: {
-						fontSize: "17px", fontWeight: 700, lineHeight: 1.2,
-						color: props.tone || TOKENS.ink, fontVariantNumeric: "tabular-nums",
+		/** Strategy 2: ask the host to hand the link to the operating system. */
+		async function viaHost(options, url) {
+			const { key, probePath } = options;
+			if (key === void 0 || key === "" || probePath === void 0) return false;
+			const send = options.fetch ?? globalThis.fetch;
+			if (typeof send !== "function") return false;
+			try {
+				const response = await send(probePath, {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						"X-WorkBuddy-Probe-Key": key
 					},
-				}, props.value),
-			);
-		}
-
-		/** 竖线分隔符 —— 参考图里「账号数」和「总积分」之间那根。 */
-		function Divider() {
-			return h("span", { style: { width: "1px", height: "15px", background: TOKENS.border, flexShrink: 0 } });
-		}
-
-		/**
-		 * 网关给的 ISO 时间 → 「剩 3 分 20 秒」。
-		 *
-		 * 已过去 / 解析不出来都返回**空串**，调用方据此判断「这个状态已经结束了」。
-		 * Go 的时间零值是 `0001-01-01T00:00:00Z`，`Date.parse` 把它解成很远的过去，
-		 * 所以这条分支顺带把零值也处理掉了。
-		 */
-		function remainingText(iso) {
-			const at = Date.parse(String(iso === undefined || iso === null ? "" : iso));
-			if (!Number.isFinite(at)) return "";
-			const seconds = Math.round((at - Date.now()) / 1000);
-			if (seconds <= 0) return "";
-			if (seconds >= 3600) return Math.floor(seconds / 3600) + " 小时 " + Math.round((seconds % 3600) / 60) + " 分";
-			if (seconds >= 60) return Math.floor(seconds / 60) + " 分 " + (seconds % 60) + " 秒";
-			return seconds + " 秒";
-		}
-
-		/**
-		 * 网关侧对这个账号的实时判定 —— 「现在还轮不轮得到它」。
-		 *
-		 * 三种受限状态分开说，因为**下一步动作完全不同**：
-		 *
-		 * | 状态 | 含义 | 该做什么 |
-		 * |---|---|---|
-		 * | 熔断中 | 连续失败太多次，被摘出轮换 | 等，而且要去看日志 —— 可能不只是限流 |
-		 * | 冷却中 | 通常是上游限流 | 什么都不用做，到点自动回来 |
-		 * | 手动停用 | 是**你**主动关的 | 想恢复就去点启用 |
-		 *
-		 * 一切正常时**不渲染任何东西** —— 加个「可用」徽章只会让正常情况变吵，
-		 * 而徽章的意义恰恰在于「出现即异常」。
-		 */
-		function poolBadge(live) {
-			if (live === undefined || live === null) return null;
-			if (live.manualDisabled === true) return h(Chip, { tone: TOKENS.warn, toneInk: TOKENS.warn }, "手动停用");
-			const breakerLeft = remainingText(live.breakerUntil);
-			if (breakerLeft !== "") return h(Chip, { tone: TOKENS.danger, toneInk: TOKENS.danger }, "熔断中 · 剩 " + breakerLeft);
-			const coolingLeft = remainingText(live.until);
-			if (live.cooling === true && coolingLeft !== "") {
-				return h(Chip, { tone: TOKENS.warn, toneInk: TOKENS.warn }, "冷却中 · 剩 " + coolingLeft);
+					credentials: "same-origin",
+					body: JSON.stringify({
+						action: "open-link",
+						url
+					})
+				});
+				if (!response.ok) return false;
+				const value = await response.json().catch(() => void 0);
+				return typeof value === "object" && value !== null && value.state === "opened";
+			} catch {
+				return false;
 			}
-			if (live.disabled === true) return h(Chip, { tone: TOKENS.warn, toneInk: TOKENS.warn }, "网关侧停用");
-			return null;
 		}
-
 		/**
-		 * 今日签到徽章。
-		 *
-		 * 三种状态分开渲染，因为它们对用户意味着不同的事：
-		 * - **签到成功 / 今日已签到** —— 任务达成（`code 10001` 也是达成，不算失败，
-		 *   否则第二天打开面板会看到一片红，以为坏了）；
-		 * - **签到失败** —— 红色，失败原因放 tooltip（详情不该挤进徽章）；
-		 * - **今天还没跑过** —— 什么都不显示。空白比「未签到」诚实：面板只有在
-		 *   跑过之后才有发言权。
-		 */
-		function checkinBadge(record) {
-			// 跑失败了要单独说 —— 「未签到」和「签了但失败」是两件事，
-			// 后者用户得去看原因（token 失效之类），合起来就看不出来了。
-			if (record !== undefined && record !== null && record.ok !== true) {
-				return h(Chip, { tone: TOKENS.danger, toneInk: TOKENS.danger, title: record.message }, "签到失败");
+		* Open one link, trying every strategy this build has, in order.
+		*
+		* @returns whether any strategy claimed the link. `false` means every one
+		* failed, which is the caller's cue to show the address, not to claim success.
+		*/
+		async function openExternalLink(url, options = {}) {
+			if (!isExternalWebLink(url)) return false;
+			const win = typeof window === "undefined" ? void 0 : window;
+			const doc = options.document ?? (typeof document === "undefined" ? void 0 : document);
+			if (win !== void 0 && viaWindow(win, url)) return true;
+			if (await viaHost(options, url)) return true;
+			if (viaSidebar(options.context, url)) return true;
+			return doc !== void 0 && viaAnchor(doc, url);
+		}
+		//#endregion
+		//#region src/client/model-select.ts
+		/**
+		* Whether `text` matches `query` as a case-insensitive substring over the
+		* model id AND display name. An empty/blank query matches everything.
+		*/
+		function matchesModelQuery(model, query) {
+			const needle = query.trim().toLowerCase();
+			if (needle === "") return true;
+			return model.id.toLowerCase().includes(needle) || model.name.toLowerCase().includes(needle);
+		}
+		/**
+		* Build the dropdown options: the catalog (already in picker order) plus any
+		* selected id the catalog no longer carries, flagged stale so the UI can mark
+		* it — a saved selection never silently loses an entry, and the user can see
+		* which ones went stale upstream.
+		*
+		* When `query` is non-blank, catalog rows are filtered by
+		* {@link matchesModelQuery}; stale rows are kept only while they match too, so
+		* a search for a live model does not surface unrelated retired ids.
+		*/
+		function buildModelSelectOptions(catalog, selected, query = "") {
+			const catalogIds = new Set(catalog.map((model) => model.id));
+			const options = catalog.filter((model) => matchesModelQuery(model, query)).map((model) => ({
+				value: model.id,
+				label: model.name,
+				stale: false
+			}));
+			const seen = new Set(catalogIds);
+			for (const id of selected) {
+				if (id === "" || seen.has(id)) continue;
+				seen.add(id);
+				if (catalogIds.has(id)) continue;
+				if (!matchesModelQuery({
+					id,
+					name: id
+				}, query)) continue;
+				options.push({
+					value: id,
+					label: id,
+					stale: true
+				});
 			}
-			const checked = Boolean(record && record.ok === true);
-			return h(Chip,
-				checked ? { tone: TOKENS.ok, toneInk: TOKENS.ok } : { tone: TOKENS.border, toneInk: TOKENS.caption },
-				checked ? "今日已签到" : "今日未签到");
+			return options;
 		}
-
 		/**
-		 * 连续登录天数。
-		 *
-		 * 读不到就**不显示**（而不是显示 0）—— 「还没读到」和「确实是 0 天」
-		 * 对用户意味着完全不同的事。
-		 */
-		function streakLabel(row) {
-			const days = row && row.streakDays;
-			if (!Number.isSafeInteger(days) || days < 0) return null;
-			// WorkDaddy 的熊猫徽章：满色药丸 + 🐼 图标，比裸文本醒目。
-			return h(Chip, { tone: TOKENS.bar, toneInk: TOKENS.bar }, "🐼 连续登录 " + days + " 天");
-		}
-
-		/**
-		 * 任务徽章 —— **只在有可领的时候出现**。
-		 *
-		 * 与签到不同：签到是每天都要回答的一个是非题，任务是「有没有便宜可占」。
-		 * 没有可领的时候显示「0 个可领」只是噪音，还占着位置把真正要看的挤走。
-		 */
-		function taskBadge(row) {
-			const summary = row && row.summary;
-			if (summary === undefined) return null;
-			if (summary.claimable > 0) {
-				return h(Chip, { tone: TOKENS.bar, toneInk: TOKENS.bar, title: "可领 " + summary.pendingCredits + " 积分" },
-					"可领 " + summary.claimable + " 个任务");
+		* Group dropdown options under headings (`headingOf` maps a model id to its
+		* heading, or undefined for ungrouped rows).
+		*
+		* WorkBuddy has no tiers today, so every caller passes a function that answers
+		* `undefined`: the group is then exactly one trailing section, which is what
+		* the dropdown renders when it is handed a single group. The mechanism stays
+		* because the alternative — an ungrouped flat list with a separate code path —
+		* is the thing that has to be rewritten the day the upstream does rank its
+		* models. Retired ids always render unheaded (their group is unknowable).
+		*/
+		function groupModelSelectOptions(options, headingOf) {
+			const groups = [];
+			const byHeading = /* @__PURE__ */ new Map();
+			for (const option of options) {
+				const heading = option.stale ? void 0 : headingOf(option.value);
+				let group = byHeading.get(heading);
+				if (group === void 0) {
+					group = {
+						heading,
+						options: []
+					};
+					byHeading.set(heading, group);
+					groups.push(group);
+				}
+				group.options.push(option);
 			}
-			return null;
+			return groups;
 		}
-
 		/**
-		 * 凭证有效期的**三档语义** —— 照 WorkDaddy 的 `tokenState`。
-		 *
-		 * 只给一个日期是不够的：`2026-11-21` 到底是「还早」还是「快到了」，
-		 * 用户得自己心算。分档之后**颜色本身就在说话** —— 快到期的会自己冒出来，
-		 * 不用逐个读日期。
-		 *
-		 * | 剩余 | 文案 | 颜色 |
-		 * |---|---|---|
-		 * | 已过 | `已过期 <日期>` | 危险 |
-		 * | < 24 小时 | `即将过期 <日期>` | 警告 |
-		 * | < 7 天 | `<日期>` | 警告 |
-		 * | 其余 | `<日期>` | 次级 |
-		 *
-		 * 注意有效期是**凭证的**（accessToken 的 `expiresAt`），不是积分包的 ——
-		 * 后者在段明细里，两者差着量级，混起来会让人以为积分下个月才过期。
-		 */
-		function expiryState(seconds) {
-			const at = Number(seconds);
-			if (!Number.isFinite(at) || at <= 0) return { text: "未知", tone: TOKENS.caption };
-			const label = when(at);
-			const diff = at * 1000 - Date.now();
-			if (diff < 0) return { text: "已过期 " + label, tone: TOKENS.danger };
-			if (diff < 86400000) return { text: "即将过期 " + label, tone: TOKENS.warn };
-			if (diff < 7 * 86400000) return { text: label, tone: TOKENS.warn };
-			return { text: label, tone: TOKENS.secondary };
+		* Toggle one model id in a selection: remove it when present, append it when
+		* absent.
+		*
+		* A plain set operation with no policy of its own. The "never leave the list
+		* empty" rule belongs to the caller, because what an empty list MEANS is the
+		* host's answer to give: for WorkBuddy's allowlist an empty list is "no filter"
+		* rather than "nothing shown", so the picker refuses the removal instead of
+		* writing a list that reopens the whole catalog.
+		*/
+		function toggleModelSelection(selected, modelId) {
+			return selected.includes(modelId) ? selected.filter((value) => value !== modelId) : [...selected, modelId];
 		}
-
+		//#endregion
+		//#region src/client/model-picker.tsx
 		/**
-		 * 「标签 值」—— 标签暗、值亮。
-		 *
-		 * 账号卡上凡是「元数据 + 数据」的位置都用它，卡片因此有统一的阅读节奏：
-		 * 扫一眼标签定位，再读值。
-		 */
-		function Field(props) {
-			return h("span", { style: { display: "inline-flex", alignItems: "baseline", gap: "6px", minWidth: 0 } },
-				h("span", { style: { fontSize: "12px", color: TOKENS.caption, flexShrink: 0 } }, props.label),
-				h("span", {
-					style: Object.assign({
-						fontSize: "12.5px", color: TOKENS.secondary,
-						whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
-					}, props.style || {}),
-				}, props.value),
-			);
+		* The model picker: a searchable checkbox dropdown over one account's catalog.
+		*
+		* Ported from the Command Code provider's `ModelMultiSelect` +
+		* `VisibleModelsRow` (the settings page's model filter), with two changes
+		* that are WorkBuddy's rather than the reference's:
+		*
+		* 1. **The selection means "only show these".** Command Code's picker chooses
+		*    which models route to which account; here the list IS the picker filter the
+		*    host stores under `uid:enterpriseId`, and an EMPTY selection is "no
+		*    filter" rather than "nothing shown". The dropdown therefore refuses to
+		*    remove the last remaining entry and marks the row instead — writing an
+		*    empty list would silently reopen the whole catalog, which is the opposite
+		*    of what the click asked for.
+		* 2. **Commits are deferred to close.** A checkbox menu that wrote on every
+		*    click would send one host write per tick; the draft is handed over once, on
+		*    close, and the owner decides whether that write is immediate (the
+		*    per-account editors) or staged for the settings page's save bar.
+		*
+		* The dropdown's data shaping lives in `model-select.ts` (React-free, so
+		* the search/stale/grouping rules are unit-testable without a DOM); this module
+		* is only the surface.
+		*
+		* @module dsh-workbuddy-connect/client/model-picker
+		*/
+		/**
+		* The catalog rows a picker may offer.
+		*
+		* Only the two fields a dropdown row needs are required: the rest of
+		* {@link WorkBuddyWebModelBadge} (rates, context windows, promotions) belongs to
+		* the model LIST, and a picker that rendered them would be a second copy of the
+		* page. Structural rather than an interface the caller has to satisfy: the page
+		* hands over the badges it already has.
+		*/
+		function selectableModels(models) {
+			return (models ?? []).map((model) => ({
+				id: model.id,
+				name: model.name
+			}));
 		}
-
 		/**
-		 * 方形图标按钮 —— 卡片右上角的操作位。
-		 *
-		 * 昵称长度完全不受控，文字按钮会把长昵称挤到换行。图标把操作区锁成固定
-		 * 宽度，昵称那边就可以安心用 `ellipsis`。代价是语义靠图标承载，所以
-		 * `title` 与 `aria-label` 必须写全 —— 那既是 tooltip，也是可访问名。
-		 */
-		function IconButton(props) {
-			const danger = props.danger === true;
-			return h("button", {
-				type: "button",
-				className: "wb2ui-icobtn" + (props.danger === true ? " danger" : ""),
-				title: props.title,
-				"aria-label": props.title,
-				disabled: props.disabled,
-				onClick: props.onClick,
-				style: {
-					width: "32px", height: "32px", flexShrink: 0, padding: 0,
-					display: "inline-flex", alignItems: "center", justifyContent: "center",
-					borderRadius: "9px",
-					border: "1px solid " + (danger ? TOKENS.danger : TOKENS.border),
-					background: TOKENS.panel2,
-					color: danger ? TOKENS.danger : TOKENS.muted,
-					cursor: props.disabled ? "not-allowed" : "pointer",
-					opacity: props.disabled ? 0.4 : 1,
+		* One account's "only show these models" control.
+		*
+		* @param selected - the committed selection (the host's allowlist, or a staged
+		* draft the owner is holding).
+		* @param onPick - called once per open/close cycle, only when the set changed.
+		*/
+		function ModelPicker({ id, selected, labelled, catalog, disabled, label, t, onPick }) {
+			const [open, setOpen] = (0, react.useState)(false);
+			const [query, setQuery] = (0, react.useState)("");
+			/** Ticks made since this menu opened; undefined while nothing is staged. */
+			const [draft, setDraft] = (0, react.useState)(void 0);
+			const current = draft ?? selected;
+			(0, react.useEffect)(() => {
+				if (open) setQuery("");
+			}, [open]);
+			/**
+			* Close, committing the draft once.
+			*
+			* Committed here rather than per click: the reference implementation writes on
+			* close for the same reason (one host write per visit instead of one per tick),
+			* and the "changed" comparison keeps a look-and-close from sending an
+			* identical list back.
+			*/
+			const close = () => {
+				setOpen(false);
+				if (draft === void 0) return;
+				const next = draft;
+				setDraft(void 0);
+				if (next.length !== selected.length || next.some((id) => !selected.includes(id))) onPick(next);
+			};
+			const options = (0, react.useMemo)(() => buildModelSelectOptions(catalog, current, query), [
+				catalog,
+				current,
+				query
+			]);
+			const items = (0, react.useMemo)(() => groupModelSelectOptions(options, () => void 0), [options]).flatMap((group) => [...group.heading === void 0 ? [] : [{
+				type: "label",
+				id: `wbp-model-group-${group.heading}`,
+				text: group.heading
+			}], ...group.options.map((option) => ({
+				id: option.value,
+				label: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+					className: "wbp-checkRow",
+					children: [
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+							type: "checkbox",
+							className: "wbp-check",
+							checked: current.includes(option.value),
+							readOnly: true,
+							tabIndex: -1
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: "wbp-checkName",
+							children: option.label
+						}),
+						option.stale ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: "wbp-badge",
+							children: t("modelStale")
+						}) : null
+					]
+				})
+			}))]);
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Menu, {
+				open,
+				onClose: close,
+				onSelect: (modelId) => {
+					const next = toggleModelSelection(current, modelId);
+					if (next.length === 0) return;
+					setDraft(next);
 				},
-			}, props.children);
-		}
-
-		/** 图标公共属性。stroke 走 currentColor，颜色由按钮决定。 */
-		const ICON = { width: 15, height: 15, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round" };
-		/** 切换账号的双箭头。 */
-		const ICON_SWAP = h("svg", ICON, h("path", { d: "M3 7h14l-4-4" }), h("path", { d: "M21 17H7l4 4" }));
-		/** 删除的垃圾桶。 */
-		const ICON_TRASH = h("svg", ICON, h("path", { d: "M3 6h18" }), h("path", { d: "M8 6V4h8v2" }), h("path", { d: "M6 6l1.5 14h9L18 6" }));
-		/** 剩余额度前的闪电（实心，比描边在数字旁边更稳）。 */
-		const ICON_BOLT = h("svg", { width: 12, height: 12, viewBox: "0 0 24 24", fill: "currentColor" }, h("path", { d: "M13 2 4 14h6l-1 8 9-12h-6z" }));
-		/** 投放区里那个上传箭头。 */
-		const ICON_UPLOAD = h("svg", Object.assign({}, ICON, { width: 20, height: 20 }),
-			h("path", { d: "M12 15V3" }),
-			h("path", { d: "m7 8 5-5 5 5" }),
-			h("path", { d: "M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" }));
-
-		/** 圆点：运行状态用。 */
-		function Dot(props) {
-			return h("span", {
-				className: props.className,
-				style: { width: "7px", height: "7px", borderRadius: "50%", background: props.color, display: "inline-block" },
+				selectedIds: current,
+				items,
+				footer: options.length === 0 ? [{
+					type: "label",
+					id: "wbp-model-search-empty",
+					text: t("modelSearchEmpty")
+				}] : [],
+				portal: true,
+				listClassName: "wbp-modelMenu",
+				anchor: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+					className: "wbp-modelSelectAnchor",
+					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+						id,
+						type: "button",
+						className: "wbp-selector",
+						"aria-haspopup": "menu",
+						"aria-expanded": open,
+						"aria-label": label,
+						disabled: disabled || catalog.length === 0,
+						onClick: () => {
+							if (open) close();
+							else setOpen(true);
+						},
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: "wbp-selectorText",
+							children: (labelled ?? current).length === 0 ? t("modelPick") : t("modelPickCount", { count: (labelled ?? current).length })
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: "wbp-selectorCaret",
+							"aria-hidden": "true"
+						})]
+					}), open ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+						type: "search",
+						className: "wbp-input wbp-modelSearch",
+						placeholder: t("modelSearchPlaceholder"),
+						"aria-label": t("modelSearchPlaceholder"),
+						value: query,
+						disabled,
+						autoFocus: true,
+						onChange: (event) => {
+							setQuery(event.target.value);
+						}
+					}) : null]
+				})
 			});
 		}
-
-		function Section(props) {
-			return h("div", { style: CARD },
-				h("div", { style: ROW },
-					h("div", { style: TITLE }, props.title),
-					props.extra || null,
-				),
-				props.children,
-			);
-		}
-
+		//#endregion
+		//#region src/client/account-summary.ts
 		/**
-		 * 面板主体。
-		 *
-		 * 状态来源只有一个 `/state` 接口；登录与导入完成后重拉一次，不做本地拼接
-		 * —— 磁盘才是真源，本地拼出来的清单迟早和网关看到的不一致。
-		 */
-		function Panel() {
-			const [state, setState] = useState({ phase: "loading" });
-			const [notice, setNotice] = useState({ kind: "idle", text: "" });
-			const [busy, setBusy] = useState("");
-
-			// 添加账号：授权登录
-			const [realm, setRealm] = useState("cn");
-			const [login, setLogin] = useState({ phase: "idle", authUrl: "", attempt: 0, error: "" });
-			const pollTimer = useRef(null);
-
-			// 添加账号：上传 JSON
-			const [pasted, setPasted] = useState("");
-			const [dragging, setDragging] = useState(false);
-
-			/**
-			 * 「添加账号」区当前用哪种方式。
-			 *
-			 * 授权登录和导入 JSON 是**做同一件事的两条路**，之前各占一个 Section
-			 * 一路排下去，面板一打开是两整块空盒子。收成一个 Tab 区：
-			 * 一次只做一件事，也少占一屏。
-			 */
-			const [addTab, setAddTab] = useState("login");
-
-			/**
-			 * 鼠标停着的那个昵称（uid）—— 决定显示哪张卡的任务浮层。
-			 *
-			 * 配一个**延时隐藏**：浮层在卡片外面、鼠标从昵称移到浮层上会先离开昵称，
-			 * 立即隐藏的话浮层根本点不到。150ms 是「够移过去、又不显得粘」的值。
-			 */
-			const [taskUid, setTaskUid] = useState("");
-			const hideTaskTimer = useRef(null);
-			const showTaskFor = (uid) => {
-				if (hideTaskTimer.current !== null) clearTimeout(hideTaskTimer.current);
-				setTaskUid(uid);
+		* How rotation reads this account right now.
+		*
+		* Precedence is the pool's own, restated once so no surface can disagree: an
+		* account switched off is off whatever else is true, a judged-dead session is a
+		* failure, a live bench is a warning, and a lapsed pasted token is a failure the
+		* user has to act on.
+		*
+		* A bench states the REASON only. The countdown belongs to the meta line, which
+		* already says when the allowance returns; stating it in both places made a
+		* benched row read "rate limited" over "resets in 7 min" twice.
+		*/
+		function accountSummaryState(account, now, copy) {
+			if (account.enabled !== true) return {
+				tone: "off",
+				text: copy.disabled,
+				servable: false
 			};
-			const hideTaskSoon = () => {
-				if (hideTaskTimer.current !== null) clearTimeout(hideTaskTimer.current);
-				hideTaskTimer.current = setTimeout(() => setTaskUid(""), 160);
+			if (account.sessionDead === true) return {
+				tone: "error",
+				text: copy.sessionDead,
+				servable: false
 			};
-
-			// 删除确认
-			const [confirmFile, setConfirmFile] = useState("");
-
-			// 每个账号的剩余积分 —— 宿主侧持 token 去打上游 billing，浏览器只拿数字。
-			const [credits, setCredits] = useState({ phase: "idle", data: null, error: "" });
-			/** 当前展开包明细的账号（空串 = 全收起）。 */
-			const [expandedFile, setExpandedFile] = useState("");
-
-			const load = useCallback(() => {
-				return call("/state")
-					.then((data) => setState({ phase: "ready", data }))
-					.catch((error) => setState({ phase: "error", error: error.message }));
-			}, []);
-
-			/**
-			 * 拉积分。
-			 *
-			 * **刻意与 `/state` 分开请求**：这条要打上游（首次约 0.5 秒），混进
-			 * `/state` 会把整个面板的首屏一起拖慢。失败了也保留上一次的数字 ——
-			 * 显示一个旧数字比显示一片空白有用。
-			 */
-			const loadCredits = useCallback((force) => {
-				setCredits((prev) => ({ phase: "loading", data: prev.data, error: "" }));
-				return call("/credits" + (force ? "?force=1" : ""))
-					.then((result) => setCredits({ phase: "ready", data: result.credits, error: "" }))
-					.catch((error) => setCredits((prev) => ({ phase: "error", data: prev.data, error: error.message, missing: Boolean(error.missing) })));
-			}, []);
-
-			/**
-			 * 成长中心：任务清单 + 连续登录天数。
-			 *
-			 * 跟积分一样**单独一条请求** —— 每个账号要打两个接口，混进 `/state`
-			 * 会把首屏一起拖慢（四个账号就是八个上游请求）。
-			 */
-			const [growth, setGrowth] = useState({ phase: "idle", data: null, error: "" });
-			const loadGrowth = useCallback((force) => {
-				setGrowth((prev) => ({ phase: "loading", data: prev.data, error: "" }));
-				return call("/growth" + (force ? "?force=1" : ""))
-					.then((result) => setGrowth({ phase: "ready", data: result.growth, error: "" }))
-					.catch((error) => setGrowth((prev) => ({ phase: "error", data: prev.data, error: error.message })));
-			}, []);
-
-			useEffect(() => { load(); }, [load]);
-			// 挂载时拉一次积分。宿主侧有 60 秒缓存，来回切设置页不会反复打上游。
-			useEffect(() => { loadCredits(false); }, [loadCredits]);
-			useEffect(() => { loadGrowth(false); }, [loadGrowth]);
-			// 组件卸载时收掉轮询，避免离开设置页还在打上游。
-			useEffect(() => () => { if (pollTimer.current) clearTimeout(pollTimer.current); }, []);
-
-			const data = state.phase === "ready" ? state.data : null;
-			const accounts = (data && data.accounts) || [];
-			/**
-			 * 启用中的账号数。**「当前使用中」的判据是它等于 1** ——
-			 * 池里只剩一个，网关没有别的可换，那才是名副其实的"当前在用"。
-			 * 多个启用时是加权轮换，没有单一当前，就不该瞎指一个。
-			 */
-			const enabledAccountCount = accounts.filter((item) => !item.disabled).length;
-			const gateway = (data && data.gateway) || {};
-			const models = (data && data.models) || null;
-			// 网关侧的实时池状态（冷却 / 熔断）。读不到就是 null —— 面板照常渲染，
-			// 只是不带那层"现在能不能用"的信息。
-			const pool = (data && data.pool) || null;
-			/**
-			 * 今天的签到 / 保活结果。键形如 `checkin:<uid>` —— 跟积分一样是
-			 * **按 uid 索引**（网关和签到都只认 uid），跟 pool 用同一套。
-			 */
-			const activity = (data && data.activity) || {};
-
-			/**
-			 * 池状态按 **uid** 索引 —— 注意与积分那张表不同：
-			 *
-			 * | 索引 | 键 | 为什么 |
-			 * |---|---|---|
-			 * | 积分 | 文件名 | 文件损坏时 uid 可能缺失，但 file 永远在 |
-			 * | 池状态 | uid | 网关只认 uid，它不知道文件叫什么 |
-			 *
-			 * 两边都不改口径，调用处各自降级：对不上就是「网关未上报」。
-			 */
-			const poolByUid = {};
-			for (const row of (pool && pool.accounts) || []) poolByUid[row.uid] = row;
-
-			// 成长状态也按 uid 索引（接口侧只有 uid 这一个身份）。
-			const growthByUid = {};
-			for (const row of (growth.data && growth.data.accounts) || []) growthByUid[row.uid] = row;
-
-			/**
-			 * 「正在／最近被使用的账号」—— 给可观察的证据，不猜。
-			 *
-			 * 网关是**按池轮询**的，不存在「当前唯一账号」这种东西，所以不硬造一个。
-			 * 优先级：
-			 *
-			 * 1. `in_flight > 0` —— 有请求正压在它身上，这是最硬的证据；
-			 * 2. 否则取 `last_success` 最新的那个；
-			 * 3. 都没有（网关刚起来 / 一个请求还没发过）就是空串，**谁都不标**。
-			 *
-			 * 第 3 条是刻意的：猜一个「大概在用它」比不标更糟 —— 用户会拿它当事实。
-			 */
-			const activeUid = (() => {
-				if (pool === null) return "";
-				const rows = pool.accounts || [];
-				const flying = rows.find((row) => Number(row.inFlight) > 0);
-				if (flying !== undefined) return flying.uid;
-				let best = "";
-				let bestAt = 0;
-				for (const row of rows) {
-					const at = Date.parse(String(row.lastSuccess === undefined ? "" : row.lastSuccess));
-					// Go 的时间零值解析成很远的过去，天然排不上；不用特判。
-					if (Number.isFinite(at) && at > bestAt) {
-						bestAt = at;
-						best = row.uid;
-					}
+			const cooldown = account.cooldown;
+			if (cooldown !== void 0 && cooldown.untilMs > now) {
+				const wait = waitText(cooldown.untilMs, now, copy);
+				if (cooldown.reason === "session") return {
+					tone: "warn",
+					text: copy.sessionDead,
+					servable: false
+				};
+				return {
+					tone: "warn",
+					text: cooldown.reason === "credit" ? `${copy.exhausted} · ${wait}` : wait,
+					servable: false
+				};
+			}
+			if (account.expiresAtMs > 0 && account.expiresAtMs <= now && account.renewable !== true) return {
+				tone: "error",
+				text: copy.expired,
+				servable: false
+			};
+			return {
+				tone: "ok",
+				text: "",
+				servable: account.available
+			};
+		}
+		/**
+		* The grey line under an account's name: remaining / used / requests / token
+		* counts / cache hit / when the allowance returns.
+		*
+		* Every piece is conditional on the document actually carrying the fact. A
+		* balance that was never read is NAMED rather than omitted — it is the one state
+		* the reader can act on (press Refresh) — while a request tally of zero is
+		* omitted, because "no traffic yet" changes nothing they would do.
+		*
+		* The join is a middot: the line is one sentence of small figures, not a table,
+		* and the separator is what keeps it readable when it wraps.
+		*/
+		function accountSummaryMeta(account, now, copy) {
+			const parts = [];
+			const credit = account.credits;
+			if (credit === void 0) parts.push(account.creditsError === void 0 ? copy.creditsPending : copy.creditsFailed);
+			else if (account.creditsTotal !== void 0 && account.creditsTotal > 0) parts.push(copy.remainingOf({
+				remaining: formatCredit$1(credit),
+				total: formatCredit$1(account.creditsTotal)
+			}));
+			else parts.push(copy.remaining({ remaining: formatCredit$1(credit) }));
+			if (account.creditsUsed !== void 0) parts.push(copy.used({ used: formatCredit$1(account.creditsUsed) }));
+			const usage = account.usage;
+			if (usage !== void 0 && usage.requests > 0) {
+				parts.push(copy.requests({ count: String(usage.requests) }));
+				if (usage.reported > 0) {
+					parts.push(copy.inputTokens({ value: shortTokens(usage.promptTokens) }));
+					parts.push(copy.outputTokens({ value: shortTokens(usage.completionTokens) }));
+					if (usage.cacheHitRate !== void 0) parts.push(copy.cache({ percent: `${(usage.cacheHitRate * 100).toFixed(1)}%` }));
 				}
-				return best;
-			})();
-
-			// 积分按凭证文件名索引 —— 账号清单里 uid 可能缺失（文件损坏），file 永远在。
-			const creditByFile = {};
-			const creditsData = credits.data;
-			for (const row of (creditsData && creditsData.accounts) || []) creditByFile[row.file] = row;
-			const creditsReady = creditsData !== null && creditsData.counts.ok > 0;
-
-			/** 登录轮询：每 3 秒问一次，pending 就继续。 */
-			const pollOnce = useCallback((nextRealm, nextState, attempt) => {
-				postJson("/login/poll", { realm: nextRealm, state: nextState })
-					.then((result) => {
-						setLogin({ phase: "done", authUrl: "", attempt, error: "" });
-						setNotice({ kind: "ok", text: "登录成功：" + (result.account.nickname || result.account.uid) + "（" + result.account.realm + "）· 凭证已写入，网关 5 秒内自动加载" });
-						setBusy("");
-						load();
+			}
+			if (account.creditsResetAtMs !== void 0 && account.creditsResetAtMs > now && (account.cooldown === void 0 || account.cooldown.untilMs <= now)) parts.push(copy.resets({ when: waitText(account.creditsResetAtMs, now, copy) }));
+			else if (account.expiresAtMs > 0 && account.expiresAtMs > now && account.renewable !== true) parts.push(copy.tokenExpires({ when: waitText(account.expiresAtMs, now, copy) }));
+			return parts.join(" · ");
+		}
+		/** A credit figure, grouped the way every other surface in this plugin groups one. */
+		function formatCredit$1(value) {
+			return new Intl.NumberFormat(void 0, { maximumFractionDigits: 1 }).format(value);
+		}
+		/**
+		* A token count as the reader should see it: 1M reads better than 1000000.
+		*
+		* Only exact multiples are compacted. "1.5M" would imply a precision the tally
+		* does not have (it is a sum of per-answer figures), and rounding 999,999 up to
+		* "1M" would overstate it.
+		*/
+		function shortTokens(tokens) {
+			if (tokens >= 1e6 && tokens % 1e6 === 0) return `${String(tokens / 1e6)}M`;
+			if (tokens >= 1e3 && tokens % 1e3 === 0) return `${String(tokens / 1e3)}K`;
+			return String(tokens);
+		}
+		/** A wait, in the unit that reads best, worded by the caller's dictionary. */
+		function waitText(untilMs, now, copy) {
+			const wait = describeWait(untilMs, now);
+			return copy.wait({
+				value: wait.value,
+				unit: wait.unit
+			});
+		}
+		//#endregion
+		//#region src/client/ui-button.tsx
+		/**
+		* The one action button both WorkBuddy surfaces draw.
+		*
+		* A thin wrapper over the platform's `Button` (a PLATFORM SEED module the shell
+		* provides), so a row's controls are literally the platform's controls rather
+		* than a local reimplementation with its own colours and metrics. The wrapper
+		* exists to pin the two choices this plugin always makes — compact size, and a
+		* destructive member of the family for anything that deletes a stored sign-in.
+		*
+		* @module dsh-workbuddy-connect/client/ui-button
+		*/
+		/** Render one action button. */
+		function ActionButton({ label, tone, disabled, title, onClick }) {
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Button, {
+				variant: tone === "primary" ? "primary" : "ghost",
+				size: "sm",
+				disabled: disabled === true,
+				...title === void 0 ? {} : { title },
+				...tone === "danger" ? { className: "wbp-dangerButton" } : {},
+				onClick,
+				children: label
+			});
+		}
+		//#endregion
+		//#region src/client/ui-rows.tsx
+		/** Join class names, dropping the empty ones. */
+		function cx(...values) {
+			return values.filter((value) => typeof value === "string" && value !== "").join(" ");
+		}
+		/**
+		* One settings row, laid out like the harness's own General page: the title and
+		* description on the left, the control on the right, a hairline between rows.
+		*/
+		function SettingRow({ title, titleFor, tag, description, error, control, className, controlClassName }) {
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: cx("wbp-row", className),
+				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					className: "wbp-rowText",
+					children: [
+						/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: "wbp-rowTitleLine",
+							children: [titleFor !== void 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("label", {
+								className: "wbp-rowTitle",
+								htmlFor: titleFor,
+								children: title
+							}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "wbp-rowTitle",
+								children: title
+							}), tag]
+						}),
+						error !== void 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+							className: "wbp-rowError",
+							children: error
+						}) : null,
+						error === void 0 && description !== void 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+							className: "wbp-rowDesc",
+							children: description
+						}) : null
+					]
+				}), control !== void 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+					className: cx("wbp-rowControl", controlClassName),
+					children: control
+				}) : null]
+			});
+		}
+		/** A heading over a run of rows — the page's one grouping device. */
+		function SettingsGroup({ title, action, description, children }) {
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("section", {
+				className: "wbp-group",
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: "wbp-groupHead",
+						children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h3", {
+								className: "wbp-groupTitle",
+								children: title
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { className: "wbp-spacer" }),
+							action
+						]
+					}),
+					description === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: "wbp-groupDesc",
+						children: description
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: "wbp-rows",
+						children
 					})
-					.catch((error) => {
-						if (error.pending && attempt < POLL_MAX) {
-							setLogin({ phase: "waiting", authUrl: "", attempt, error: "" });
-							pollTimer.current = setTimeout(() => pollOnce(nextRealm, nextState, attempt + 1), POLL_INTERVAL_MS);
-							return;
-						}
-						setLogin({ phase: "idle", authUrl: "", attempt: 0, error: "" });
-						setNotice({ kind: "error", text: error.pending
-							? "等待授权超时（" + Math.round((POLL_INTERVAL_MS * POLL_MAX) / 1000) + " 秒内上游始终未确认）。请确认浏览器里已完成授权后重试。"
-							: "登录失败：" + error.message });
-						setBusy("");
-					});
-			}, [load]);
-
-			const beginLogin = useCallback(() => {
-				if (pollTimer.current) clearTimeout(pollTimer.current);
-				setBusy("login");
-				setNotice({ kind: "idle", text: "" });
-				setLogin({ phase: "starting", authUrl: "", attempt: 0, error: "" });
-				postJson("/login/begin", { realm })
-					.then((result) => {
-						setLogin({ phase: "waiting", authUrl: result.authUrl, attempt: 1, error: "" });
-						// 新窗口打开授权页；被拦时下面还有可点的链接。
-						try { window.open(result.authUrl, "_blank", "noopener,noreferrer"); } catch { /* 被拦不影响流程 */ }
-						pollTimer.current = setTimeout(() => pollOnce(realm, result.state, 1), POLL_INTERVAL_MS);
+				]
+			});
+		}
+		/**
+		* A capsule tag, drawn by the platform's own `Tag`.
+		*
+		* This used to be a local `<span>` with four hand-painted palettes. The
+		* platform atom already ships exactly these capsules (`outline`, `neutral`,
+		* tinted `success` / `warning` / `danger`), so delegating keeps the pills the
+		* same width, weight and tone as the tags elsewhere in the settings surface —
+		* and removes a palette that could drift out of the theme on its own.
+		*
+		* The tone names are this plugin's (`plain`/`muted`/`warn`/`error`/`ok`)
+		* because they say what the caller MEANS; the mapping below is the one place
+		* that translates them into the platform's vocabulary.
+		*/
+		function Badge({ tone = "plain", title, children }) {
+			const tag = /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Tag, {
+				tone: tone === "muted" ? "outline" : tone === "warn" ? "warning" : tone === "error" ? "danger" : tone === "ok" ? "success" : "neutral",
+				children
+			});
+			return title === void 0 ? tag : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+				title,
+				children: tag
+			});
+		}
+		/** A labelled figure in a filled panel — the dashboard's stat unit. */
+		function StatTile({ label, value, sub }) {
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: "wbp-usageStat",
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						className: "wbp-usageStatLabel",
+						children: label
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						className: "wbp-usageStatValue",
+						children: value
+					}),
+					sub === void 0 || sub === "" ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						className: "wbp-usageStatSub",
+						children: sub
 					})
-					.catch((error) => {
-						setLogin({ phase: "idle", authUrl: "", attempt: 0, error: "" });
-						setNotice({ kind: "error", text: "申请授权链接失败：" + error.message });
-						setBusy("");
-					});
-			}, [realm, pollOnce]);
-
-			const cancelLogin = useCallback(() => {
-				if (pollTimer.current) clearTimeout(pollTimer.current);
-				setLogin({ phase: "idle", authUrl: "", attempt: 0, error: "" });
-				setBusy("");
-				setNotice({ kind: "idle", text: "已停止等待授权（上游的 state 会自行过期，凭据未写入）。" });
-			}, []);
-
-			const importRaw = useCallback((raw) => {
-				const text = String(raw || "").trim();
-				if (text === "") {
-					setNotice({ kind: "error", text: "没有可导入的内容。" });
+				]
+			});
+		}
+		/**
+		* One account's status dot, drawn by the platform's own `StateDot`.
+		*
+		* The plugin used to paint its own 8px circle here, which meant a hand-rolled
+		* palette that had to be kept in step with the harness by hand. `StateDot` is
+		* the atom the rest of the settings surfaces use, so the row's mark is the
+		* same mark the session list and the job list draw.
+		*
+		* The mapping is the platform's vocabulary, not this plugin's: an available
+		* account is `done`, a benched one `warning`, a refused one `error`, and a
+		* switched-off one `idle`.
+		*/
+		function StatusDot({ tone, title }) {
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+				title,
+				children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.StateDot, { state: tone === "ok" ? "done" : tone === "warn" ? "warning" : tone === "error" ? "error" : "idle" })
+			});
+		}
+		/**
+		* The quota ring: one glyph serves the rail button, the footer card's head and
+		* the dashboard header. A faint track plus an arc whose sweep is the
+		* consumption, drawn from 12 o'clock. Circumference 2πr = 45.55 at r = 7.25.
+		*/
+		function Ring({ percent, warn, size }) {
+			const clamped = Math.min(100, Math.max(0, percent));
+			const circumference = 45.55;
+			const dashoffset = Math.round(circumference * (1 - clamped / 100) * 1e3) / 1e3;
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+				className: "wbp-glyph",
+				"aria-hidden": "true",
+				children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("svg", {
+					viewBox: "0 0 20 20",
+					width: size,
+					height: size,
+					focusable: "false",
+					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("circle", {
+						cx: "10",
+						cy: "10",
+						r: "7.25",
+						fill: "none",
+						stroke: "currentColor",
+						strokeWidth: "1.5",
+						opacity: "0.4"
+					}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("circle", {
+						cx: "10",
+						cy: "10",
+						r: "7.25",
+						fill: "none",
+						stroke: warn ? "var(--dsw-alias-state-error-primary)" : "currentColor",
+						strokeWidth: "2.5",
+						strokeLinecap: "round",
+						strokeDasharray: String(circumference),
+						strokeDashoffset: String(dashoffset),
+						transform: "rotate(-90 10 10)"
+					})]
+				})
+			});
+		}
+		/**
+		* The platform's segmented control: a translucent track with one raised pill
+		* sliding under the picked segment.
+		*
+		* The indicator's width and offset are computed arithmetically from the count
+		* and the index (two custom properties), so it slides without measuring the
+		* DOM — the platform's own technique.
+		*/
+		function SegmentedField({ label, value, options, disabled, onChange, className }) {
+			const index = Math.max(0, options.findIndex((option) => option.value === value));
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: cx("wbp-segmented", className),
+				role: "radiogroup",
+				"aria-label": label,
+				style: {
+					"--wbp-segment-count": options.length,
+					"--wbp-segment-index": index
+				},
+				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+					className: "wbp-segmentIndicator",
+					"aria-hidden": "true"
+				}), options.map((option) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+					type: "button",
+					role: "radio",
+					"aria-checked": value === option.value,
+					className: "wbp-segment",
+					disabled: disabled === true,
+					...option.title === void 0 ? {} : { title: option.title },
+					onClick: () => {
+						if (value !== option.value) onChange(option.value);
+					},
+					children: option.label
+				}, option.value))]
+			});
+		}
+		/** A switch row: the platform Switch's shape, as a labelled control. */
+		function ToggleField({ id, checked, disabled, label, onChange }) {
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+				id,
+				className: "wbp-toggle",
+				type: "checkbox",
+				role: "switch",
+				"aria-label": label,
+				checked,
+				disabled: disabled === true,
+				onChange: (event) => {
+					onChange(event.target.checked);
+				}
+			});
+		}
+		/**
+		* The "only show the ones I pick" control: the value editor, a switch, a count,
+		* and a way back.
+		*
+		* Modelled on the reference implementation's visible-models row
+		* (`VisibleModelsRow` in the Command Code provider): the assignment editor
+		* sits in the row's control column, and the switch beside it decides whether
+		* that assignment reaches the picker at all. Off is "show everything", on is
+		* "show what I picked", and turning it off clears the filter rather than leaving
+		* an invisible one behind.
+		*
+		* The editor arrives through {@link FilterRow.control} rather than being built
+		* in: this row owns the switch semantics, not the value's shape — a filter over
+		* a checkbox column, a multi-select menu, or a text box all read as the same row.
+		*/
+		function FilterRow({ id, enabled, label, description, summary, clearLabel, control, disabled, onToggle, onClear }) {
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)(SettingRow, {
+				title: label,
+				titleFor: id,
+				description,
+				className: "wbp-rowNested",
+				control: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+					control,
+					!enabled ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						className: "wbp-hint",
+						children: summary
+					}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+						type: "button",
+						className: "wbp-linkButton",
+						disabled: disabled === true,
+						onClick: onClear,
+						children: clearLabel
+					})] }),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)(ToggleField, {
+						id,
+						label,
+						checked: enabled,
+						disabled: disabled === true,
+						onChange: onToggle
+					})
+				] })
+			});
+		}
+		//#endregion
+		//#region src/client/WorkBuddySettingsPage.tsx
+		/**
+		* The WorkBuddy settings page: every pooled account, for both products, their
+		* meters, their model lists, and the filter over each one.
+		*
+		* Why this is a settings *page* rather than a card in the Plugins tab: the two
+		* products together are a resource the user checks and acts on — add an
+		* account, see what is left, delete one that lapsed — and that is a destination,
+		* not a footnote under a plugin list. The Plugins tab keeps the plugin's own
+		* card; this page is where the accounts live.
+		*
+		* Layout, ported from the reference implementation's settings page
+		* (`dsh-commandcode-provider`, whose `section.tsx` this page follows component
+		* for component):
+		*
+		*   [accounts heading]                             [+ Add account]
+		*   [account rows: state, ⋮ menu, balance meter, disclosure]
+		*   [per-product total credit tiles]
+		*   [<product> · Models]                            [Refresh]
+		*   [filter row: model picker + switch] [row per model: window, detection]
+		*   [sticky save bar, while the model filters are staged]
+		*
+		* What is WorkBuddy's rather than the reference's, and why:
+		*
+		* - **two products on one page.** The reference has one provider; here the two
+		*   rosters stay separate all the way down — separate pools, separate totals,
+		*   separate filters — because a sum across them would be a number that
+		*   describes nothing (the credits are not convertible and the accounts are not
+		*   interchangeable).
+		* - **immediate writes where the reference stages.** Account actions (enable,
+		*   test, remove, rename) and per-model detection/context writes go out at once:
+		*   they are imperative ("stop using this account now", "probe this model now"),
+		*   and staging an imperative behind a save button is how a user ends up staring
+		*   at a page that has not done what they asked. The MODEL FILTER is staged, as
+		*   the reference stages it — assembling "only these models" is a multi-step
+		*   edit whose intermediate states are not decisions.
+		* - **a picker trigger that states what the filter applies**, not what the
+		*   calendar holds: with the filter off the menu edits the whole catalog (there
+		*   is no stored list), while the row must not claim a selection that nothing is
+		*   filtering.
+		*
+		* @module dsh-workbuddy-connect/client/settings-page
+		*/
+		/**
+		* Bind one surface's dictionary to the shared account-summary words.
+		*
+		* The summary module owns WHICH facts a row states and in what order; the
+		* dictionary owns how each is worded. This is the one place the two meet, so a
+		* second surface reuses the same facts without copying the formatting.
+		*/
+		function accountSummaryCopy(t) {
+			return {
+				disabled: t("accountStateDisabled"),
+				sessionDead: t("accountStateSessionDead"),
+				exhausted: t("accountStateExhausted"),
+				limited: t("accountStateLimited"),
+				expired: t("accountExpired"),
+				creditsFailed: t("accountCreditsFailed"),
+				creditsPending: t("accountCreditsPending"),
+				remainingOf: ({ remaining, total }) => t("accountMetaRemainingOf", {
+					remaining,
+					total
+				}),
+				remaining: ({ remaining }) => t("accountMetaRemaining", { remaining }),
+				used: ({ used }) => t("accountMetaUsed", { used }),
+				requests: ({ count }) => t("accountMetaRequests", { count }),
+				inputTokens: ({ value }) => t("accountMetaInputTokens", { value }),
+				outputTokens: ({ value }) => t("accountMetaOutputTokens", { value }),
+				cache: ({ percent }) => t("accountMetaCache", { percent }),
+				resets: ({ when }) => t("accountMetaResets", { when }),
+				tokenExpires: ({ when }) => t("accountMetaTokenExpires", { when }),
+				wait: ({ value, unit }) => t(unit === "hour" ? "waitHours" : "waitMinutes", { value })
+			};
+		}
+		/** How often a QR challenge is checked. */
+		const POLL_INTERVAL_MS = 2e3;
+		/** How often the page re-reads both products while it is open. */
+		const REFRESH_INTERVAL_MS$1 = 6e4;
+		/**
+		* Where the last answered status documents are cached, per product.
+		*
+		* The same mechanism the reference implementation this page follows
+		* (`@mars-sea/dsh-commandcode-provider`) uses for its own cross-session cache:
+		* a namespaced `localStorage` key, read and written through a store that
+		* tolerates a missing or throwing storage (private modes, a WebView without one)
+		* by yielding nothing and dropping the write.
+		*
+		* Why the cache exists at all: this page's first paint is a read of the status
+		* route, and that route answers only after it has looked up every account's
+		* credit against the upstream. On a slow link that is seconds of blank page for
+		* figures the browser already had. Cached documents paint immediately, and the
+		* live read replaces them when it lands — the same stale-while-revalidate shape,
+		* with the screen never showing LESS than it already knew.
+		*
+		* What is deliberately NOT cached: nothing beyond what the status route already
+		* sends to this same origin (no token material — the route never carries any),
+		* and nothing that outlives the account it describes. A cache entry is keyed by
+		* product and replaced wholesale on every successful read; a stale entry is only
+		* ever a starting point, never a value that survives a failed read.
+		*/
+		const STATUS_CACHE_PREFIX = "dsh-workbuddy-connect-functy/status";
+		/** The cache key for one product's document. */
+		function statusCacheKey(variantId) {
+			return `${STATUS_CACHE_PREFIX}/${variantId}`;
+		}
+		/**
+		* Whether a cached document's `probe.results` entries are all renderable.
+		*
+		* {@link isWorkBuddyWebStatus} checks only the discriminator, so a stored
+		* document can carry a result row whose `efforts` is missing — a shape the
+		* renderer dereferences (`result.efforts.length`). The live route cannot
+		* produce one (the host's store validates every row it reads), but this cache
+		* is shared `localStorage`: a document written by an older build, or by any
+		* other client on this origin, is not covered by that guarantee and would crash
+		* the first paint, before the live read has any chance to replace it.
+		*
+		* A row that fails this check drops the WHOLE document rather than the row:
+		* the document is a single answer, and keeping a partially-trusted one would
+		* let the rest of it be read as though the missing row had never been there.
+		*/
+		function hasRenderableProbeResults(status) {
+			if (status.status !== "signed-in") return true;
+			const results = status.probe?.results;
+			if (results === void 0) return true;
+			return Array.isArray(results) && results.every((result) => result !== null && typeof result === "object" && Array.isArray(result.efforts));
+		}
+		/** Read one cached document, or `undefined` when there is none to trust. */
+		function readCachedStatus(variantId) {
+			try {
+				const raw = localStorage.getItem(statusCacheKey(variantId));
+				if (raw === null) return void 0;
+				const parsed = JSON.parse(raw);
+				if (!isWorkBuddyWebStatus(parsed)) return void 0;
+				return hasRenderableProbeResults(parsed) ? parsed : void 0;
+			} catch {
+				return;
+			}
+		}
+		/** Remember one document for the next visit; a failed write is simply dropped. */
+		function writeCachedStatus(variantId, status) {
+			try {
+				localStorage.setItem(statusCacheKey(variantId), JSON.stringify(status));
+			} catch {}
+		}
+		/**
+		* Paint a QR symbol into a canvas.
+		*
+		* An integer number of device pixels per module: a fractional scale softens the
+		* module edges, which is the one thing that makes a camera struggle to lock on.
+		*/
+		function QrCanvas({ text, modulePixels }) {
+			const ref = (0, react.useRef)(null);
+			(0, react.useEffect)(() => {
+				const canvas = ref.current;
+				if (canvas === null) return;
+				let code;
+				try {
+					code = encodeQrCode(text);
+				} catch {
 					return;
 				}
-				setBusy("import");
-				setNotice({ kind: "idle", text: "" });
-				postJson("/import", { raw: text })
-					.then((result) => {
-						const rows = result.imported || [];
-						setNotice({ kind: "ok", text: "已导入 " + rows.length + " 个账号：" + rows.map((r) => r.nickname || r.uid).join("、") + " · 网关 5 秒内自动加载" });
-						setPasted("");
-						load();
-						// 新账号的积分要重算（缓存里没有它们）。
-						loadCredits(true);
-					})
-					.catch((error) => setNotice({ kind: "error", text: "导入失败：" + error.message }))
-					.then(() => setBusy(""));
-			}, [load, loadCredits]);
-
-			const onPickFile = useCallback((event) => {
-				const file = event.target.files && event.target.files[0];
-				event.target.value = "";
-				if (!file) return;
-				const reader = new FileReader();
-				reader.onload = () => importRaw(reader.result);
-				reader.onerror = () => setNotice({ kind: "error", text: "读取文件失败。" });
-				reader.readAsText(file);
-			}, [importRaw]);
-
-			const onDrop = useCallback((event) => {
-				event.preventDefault();
-				setDragging(false);
-				const file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
-				if (!file) return;
-				const reader = new FileReader();
-				reader.onload = () => importRaw(reader.result);
-				reader.readAsText(file);
-			}, [importRaw]);
-
-			/**
-			 * 切换到某个账号 —— 只让它参与轮换；池里只剩它时再点则恢复全部。
-			 *
-			 * ## 为什么"切换"就是这个意思
-			 *
-			 * 网关只暴露四个路由（`/v1/chat/completions`、`/v1/models`、`/status`、
-			 * `/healthz`），**选号是它内部按权重做的，没有任何接口能指定账号**。
-			 * 官方插件的 `/wb2api-account` 用的也是同一套 —— README 原话「机制：
-			 * 重命名凭证文件，不改网关一行代码」，**只改名、从不删除**。
-			 *
-			 * 所以这不是我发明的取巧，是这个网关里「切换账号」的**全部含义**。
-			 *
-			 * ⚠ 两点如实告知用户：被排除的账号不再刷新 token（长期排除可能失效）；
-			 * 且"只用一个"不等于"优先用它" —— 它冷却时就真的没号可换了。
-			 */
-			const switchToAccount = useCallback((file, isCurrent) => {
-				setBusy("switch:" + file);
-				postJson("/account/only", { file: isCurrent ? "" : file })
-					.then((result) => {
-						setState((prev) => prev.phase === "ready" ? { phase: "ready", data: Object.assign({}, prev.data, { accounts: result.accounts }) } : prev);
-						if (result.verified === false) {
-							// 网关把凭证写回了旧路径 —— 不假装成功。
-							setNotice({ kind: "error", text: "切换可能被网关写回，请再点一次；若反复如此说明网关正在刷新 token。" });
-						} else {
-							setNotice({ kind: "ok", text: result.only === "" ? "已恢复全部账号参与加权轮换" : "已切换为只用该账号（其余暂停参与）" });
-						}
-						loadCredits(true);
-					})
-					.catch((error) => setNotice({ kind: "error", text: "切换失败：" + error.message }))
-					.then(() => setBusy(""));
-			}, [loadCredits]);
-
-			const toggleAccount = useCallback((file, enabled) => {
-				setBusy("toggle:" + file);
-				postJson("/account/toggle", { file, enabled })
-					.then((result) => {
-						setState((prev) => prev.phase === "ready" ? { phase: "ready", data: Object.assign({}, prev.data, { accounts: result.accounts }) } : prev);
-						// 禁用账号不查积分（网关不加载它们），所以状态行汇总要跟着变。
-						loadCredits(true);
-					})
-					.catch((error) => setNotice({ kind: "error", text: "操作失败：" + error.message }))
-					.then(() => setBusy(""));
-			}, [loadCredits]);
-
-			const deleteAccount = useCallback((file) => {
-				setBusy("delete:" + file);
-				postJson("/account/delete", { file })
-					.then((result) => {
-						setConfirmFile("");
-						setState((prev) => prev.phase === "ready" ? { phase: "ready", data: Object.assign({}, prev.data, { accounts: result.accounts }) } : prev);
-						// 少了账号，汇总数字要跟着掉下来。
-						loadCredits(true);
-					})
-					.catch((error) => setNotice({ kind: "error", text: "删除失败：" + error.message }))
-					.then(() => setBusy(""));
-			}, [loadCredits]);
-
-			/**
-			 * 手动跑一轮签到 / 保活。
-			 *
-			 * 跑完**重拉一次 `/state`** 而不是拿响应本地拼结果 —— 后端（和它落的盘）
-			 * 才是真源，本地拼一份迟早跟它分叉，然后就会出现「面板说有、刷新一下没了」。
-			 */
-			const runActivity = useCallback((kind) => {
-				const meta = kind === "checkin" ? { label: "签到", path: "/checkin" }
-					: kind === "growth" ? { label: "领取任务积分", path: "/growth/claim" }
-						: { label: "保活", path: "/keepalive" };
-				setBusy(kind);
-				postJson(meta.path, {})
-					.then((result) => {
-						const rows = result.result?.results || [];
-						const okCount = rows.filter((row) => row.ok).length;
-						setNotice({
-							kind: rows.length > 0 && okCount === rows.length ? "ok" : "error",
-							text: meta.label + "完成：" + okCount + "/" + rows.length + " 个账号成功"
-								+ (rows.length === 0 ? "（没有启用中的账号）" : ""),
-						});
-						load();
-						// 领完必须重拉任务列表，否则徽章还挂着「可领 N 个」——
-						// 用户会以为没领成功，然后再点一次。
-						if (kind === "growth") loadGrowth(true);
-					})
-					.catch((error) => setNotice({ kind: "error", text: meta.label + "失败：" + error.message }))
-					.then(() => setBusy(""));
-			}, [load, loadGrowth]);
-
-			/**
-			 * 「一键做任务」：先确认有无待办 → 执行动作 → 达标自动领奖。
-			 *
-			 * 真正跑在宿主那侧的后台任务里（一轮可能几分钟），这里只起跑 + 轮询状态：
-			 * 进度与结果**一律以宿主返回的 status 为准** —— 本地拼一份进度迟早跟它分叉，
-			 * 然后就是「面板说有、刷新一下没了」。宿主那侧调的是包内自带的任务引擎
-			 * （`engine/wb_up/run.mjs`，随本包发布），动作实现不在本插件里重复一份。
-			 */
-			const [taskRun, setTaskRun] = useState({ running: false, logs: [], summary: null, pending: null, error: "" });
-			const taskTimer = useRef(null);
-
-			const stopTaskPoll = useCallback(() => {
-				if (taskTimer.current) { clearTimeout(taskTimer.current); taskTimer.current = null; }
-			}, []);
-
-			const pollTasks = useCallback(() => {
-				call("/tasks/status")
-					.then((status) => {
-						setTaskRun(status);
-						if (status.running) {
-							taskTimer.current = setTimeout(pollTasks, 2500);
-							return;
-						}
-						stopTaskPoll();
-						load();
-						loadCredits(true);
-						loadGrowth(true);
-					})
-					.catch((error) => {
-						stopTaskPoll();
-						setTaskRun((prev) => Object.assign({}, prev, { running: false, error: error.message, missing: error.missing === true }));
-					});
-			}, [load, loadCredits, loadGrowth, stopTaskPoll]);
-
-			const runTasks = useCallback(() => {
-				setBusy("tasks");
-				postJson("/tasks/run", {})
-					.then((result) => {
-						if (result.started === false) {
-							setNotice({ kind: "error", text: result.message || "已有一轮任务在执行中" });
-							setBusy("");
-							return;
-						}
-						setTaskRun({ running: true, logs: [], summary: null, pending: null, error: "" });
-						setNotice({ kind: "ok", text: "已开始：确认待办 → 执行任务 → 自动领奖" });
-						stopTaskPoll();
-						taskTimer.current = setTimeout(pollTasks, 1500);
-						setBusy("");
-					})
-					.catch((error) => {
-						setBusy("");
-						setNotice({
-							kind: "error",
-							// 404 单独说清楚：宿主半侧只在 dsh 启动时加载，改完 lib/index.js 必须重启 dsh。
-							text: error.missing === true || /\b405\b/u.test(String(error.message))
-								? "宿主半侧还没挂上这条路由：插件 host 只在 dsh 启动时加载，改动 lib/index.js 后需要重启 dsh 才生效。"
-								: "启动失败：" + error.message,
-						});
-					});
-			}, [pollTasks, stopTaskPoll]);
-
-			// 刷新页面时若后台还在跑，把进度接回来。
-			useEffect(() => {
-				call("/tasks/status")
-					.then((status) => {
-						if (status && status.running) {
-							setTaskRun(status);
-							taskTimer.current = setTimeout(pollTasks, 2500);
-						}
-					})
-					.catch(() => {});
-				return stopTaskPoll;
-			}, [pollTasks, stopTaskPoll]);
-
-			const noticeColor = notice.kind === "error" ? TOKENS.danger : notice.kind === "ok" ? TOKENS.ok : TOKENS.muted;
-
-			// ---- 状态行 ----
-			const health = gateway.health || {};
-			const healthy = typeof health.healthy === "number" ? health.healthy : null;
-			const total = typeof health.total === "number" ? health.total : null;
-
-			// 汇总积分。不限量账号没有可加的数字，单独计数；总数归零但有不限量账号时
-			// 用强调色而不是危险色 —— 那是「没上限」不是「用光了」。
-			const creditsTotalTone = !creditsReady
-				? null
-				: (creditsData.unlimited > 0 && creditsData.total <= 0)
-					? TOKENS.accent
-					: creditsTone({ state: "ok", total: creditsData.total });
-			/**
-			 * 顶部状态行 —— 照参考图的「标签 + 大数字」排。
-			 *
-			 * 刻意**不放刷新按钮**：账号区标题栏的「刷新积分」是唯一刷新入口，
-			 * 顶部再放一个会让人以为要刷两处。模型数量同理 —— 下面「可用模型」区的
-			 * 标题里已经带着数量了，这里再报一遍是重复。
-			 *
-			 * 网关状态降成小圆点 + 短文字：它是背景信息，不该跟账号数抢视觉重量。
-			 * 但**不能省** —— 网关没起来时所有账号都不可用，那是第一诊断信息。
-			 */
-			const statusRow = h("div", { style: { display: "flex", alignItems: "center", gap: "14px", flexWrap: "wrap" } },
-				h("span", { style: { display: "inline-flex", alignItems: "center", gap: "6px", flexShrink: 0 } },
-					Dot({ color: gateway.running ? TOKENS.ok : TOKENS.danger, className: gateway.running ? undefined : "wb2ui-pulsedot" }),
-					h("span", { style: { fontSize: "12.5px", color: TOKENS.muted } }, gateway.running ? "网关运行中" : "网关未运行"),
-				),
-				Divider(),
-				h(Stat, { label: "账号数", value: String(accounts.length) }),
-				Divider(),
-				creditsReady
-					? h(Stat, { label: "总积分", value: formatCredits(creditsData.total), tone: creditsTotalTone })
-					: h(Stat, { label: "总积分", value: credits.phase === "loading" ? "读取中…" : "—" }),
-				// 两种「数字是 0」要分开说，它们的原因完全不同：
-				// 一个是没有账号（去添加），一个是账号在但都不可用（去查凭证/网关）。
-				accounts.length === 0
-					? h("span", { style: HINT }, "还没有账号，用下面的任一种方式添加")
-					: (healthy === 0 ? h("span", { style: Object.assign({}, HINT, { color: TOKENS.warn }) }, "网关可用账号数为 0 —— 凭证可能都过期了") : null),
-				// 有人在冷却时点一句。这是「余额明明有、请求却不是它跑」的唯一解释，
-				// 不说的话用户只能看着一堆正常数字猜。
-				pool !== null && pool.global.cooling > 0
-					? h("span", { style: Object.assign({}, HINT, { color: TOKENS.warn }) },
-						pool.global.cooling + " 个账号冷却中 —— 请求会自动走池里其他账号")
-					: null,
-			);
-
-			const headerNote = h("div", { style: HINT },
-				"这里管理 workbuddy2api 的账号凭证。凭证只写在本机 " + ((data && data.authDir) || "~/.dsh/wb2api/auths") + "，"
-				+ "浏览器永远拿不到 accessToken。网关由本插件托管，随 dsh 启停"
-				// 监听地址从顶部搬到这里：它只在排查连通性时才有用，不该占状态行的位置。
-				+ (gateway.baseURL ? "，监听 " + gateway.baseURL : "") + "。");
-
-			// ---- 未就绪提示 ----
-			if (state.phase === "error") {
-				return h("div", { style: WRAP },
-					Section({ title: "WorkBuddy 反代", children: h("div", { style: HINT }, "读取状态失败：" + state.error) }),
-				);
-			}
-			if (!data) {
-				return h("div", { style: WRAP }, Section({ title: "WorkBuddy 反代", children: h("div", { style: HINT }, "读取中…") }));
-			}
-
-			const binaryWarn = data.binary && !data.binary.exists
-				? h("div", { style: HINT }, "网关可执行文件还没就位（" + data.binary.path + "）。在 dsh 里执行 /wb2api-setup 会自动下载并校验。")
-				: null;
-			const configWarn = !data.configured
-				? h("div", { style: HINT }, "还没生成网关配置（~/.dsh/wb2api/config.json）。在 dsh 里执行 /wb2api-setup 完成初始化。")
-				: null;
-			const gatewayWarn = !gateway.running && data.configured && data.binary.exists
-				? h("div", { style: HINT }, "网关当前没在监听。dsh 启动时会自动拉起；也可以手动执行 /wb2api-start。")
-				: null;
-
-			// ---- 授权登录区 ----
-			const loginBody = login.phase === "waiting" || login.phase === "starting"
-				? h("div", { style: { display: "flex", flexDirection: "column", gap: "8px" } },
-					h("div", { style: ROW },
-						Dot({ color: TOKENS.warn, className: "wb2ui-pulsedot" }),
-						h("span", { style: { fontSize: "12.5px" } },
-							login.phase === "starting" ? "正在申请授权链接…" : "等待授权中… 第 " + login.attempt + "/" + POLL_MAX + " 次检查"),
-						h("button", { type: "button", className: "wb2ui-ghost", style: SMALL, onClick: cancelLogin }, "取消"),
-					),
-					login.authUrl
-						? h("div", null,
-							h("div", { style: HINT }, "窗口没弹出？手动打开这个链接完成授权："),
-							h("a", { href: login.authUrl, target: "_blank", rel: "noopener noreferrer", className: "wb2ui-link", style: { fontSize: "11.5px", color: TOKENS.accent, wordBreak: "break-all" } }, login.authUrl),
-						)
-						: null,
-					h("div", { style: HINT }, "授权完成后本页会自动确认（最多等 " + Math.round((POLL_INTERVAL_MS * POLL_MAX) / 1000) + " 秒）。"),
-				)
-				: h("div", { style: { display: "flex", flexDirection: "column", gap: "9px" } },
-					h("div", { style: { display: "flex", alignItems: "center", gap: "9px", flexWrap: "wrap" } },
-						// 标签用与账号卡 `Field` 同款的小字 —— 整个面板的「标签」是一种视觉语言，
-						// 这里换成徽章或加粗都会让人以为它是另一个东西。
-						h("span", { style: { fontSize: "12px", color: TOKENS.caption, flexShrink: 0 } }, "版本"),
-						h("select", {
-							style: Object.assign({}, SELECT, { minWidth: "210px" }),
-							value: realm, onChange: (e) => setRealm(e.target.value), disabled: busy === "login",
-						},
-							h("option", { value: "cn" }, "国内版 · codebuddy.cn"),
-							h("option", { value: "global" }, "国际版 · workbuddy.ai"),
-						),
-						// 按钮写**动作**（开始授权）、Tab 写**方式**（授权登录）。
-						// 两处都叫「授权登录」的话，人会分不清哪个是入口哪个是标签
-						// —— 测试里也真点错过。
-						h("button", { type: "button", className: "wb2ui-btn", style: BTN, onClick: beginLogin, disabled: busy === "login" },
-							busy === "login" ? "申请中…" : "开始授权"),
-					),
-					h("div", { style: HINT }, "国内外账号体系独立 —— 账号属于哪个版本就选哪一项，选错会拿到空账号信息。"),
-				);
-
-			// ---- 上传 JSON 区 ----
-			const uploadBody = h("div", { style: { display: "flex", flexDirection: "column", gap: "12px" } },
-				// 投放区做成三级层次：图标 → 主文案 → 操作入口。
-				// 之前是一整块居中的两行字，拖拽时除了边框变色没有任何反馈。
-				h("div", {
-					onDragOver: (e) => { e.preventDefault(); setDragging(true); },
-					onDragLeave: () => setDragging(false),
-					onDrop,
-					style: {
-						border: "1px dashed " + (dragging ? TOKENS.accent : TOKENS.border),
-						borderRadius: "12px", padding: "16px 14px",
-						background: dragging ? TOKENS.panel2 : "transparent",
-						display: "flex", flexDirection: "column", alignItems: "center", gap: "7px",
-						textAlign: "center",
-					},
-				},
-					h("span", { style: { display: "inline-flex", color: dragging ? TOKENS.accent : TOKENS.caption } }, ICON_UPLOAD),
-					h("div", { style: { fontSize: "12.5px", color: TOKENS.muted } }, "把凭证 / 账号导出 JSON 拖到这里"),
-					h("label", { className: "wb2ui-link", style: { cursor: "pointer", fontSize: "12px", fontWeight: 600, color: TOKENS.accent } },
-						"或点此选择文件",
-						h("input", { type: "file", accept: ".json,application/json", style: { display: "none" }, onChange: onPickFile }),
-					),
-				),
-				// 「或」分隔线：把两种入口的关系说清楚，而不是让它们各说各话。
-				h("div", { style: { display: "flex", alignItems: "center", gap: "10px" } },
-					h("span", { style: { flex: "1 1 auto", height: "1px", background: TOKENS.border } }),
-					h("span", { style: HINT }, "或直接粘贴"),
-					h("span", { style: { flex: "1 1 auto", height: "1px", background: TOKENS.border } }),
-				),
-				h("textarea", {
-					style: TEXTAREA,
-					value: pasted,
-					placeholder: '[\n {\n  "uid": "…", "nickname": "…",\n  "access_token": "…", "refresh_token": "…",\n  "expires_at": 1794480957832,   // 毫秒会自动换算成秒\n  "domain": "www.codebuddy.cn"   // 由此推断 cn / global\n }\n]',
-					onChange: (e) => setPasted(e.target.value),
-				}),
-				h("div", { style: { display: "flex", alignItems: "center", gap: "9px", flexWrap: "wrap" } },
-					h("button", { type: "button", className: "wb2ui-btn", style: BTN, onClick: () => importRaw(pasted), disabled: busy === "import" },
-						busy === "import" ? "导入中…" : "导入"),
-					h("button", { type: "button", className: "wb2ui-ghost", style: GHOST, onClick: () => setPasted("") }, "清空"),
-					h("span", { style: HINT }, "两种格式都收：account + auth 两段式，或扁平 snake_case / camelCase（时间戳毫秒秒都认）。"),
-				),
-			);
-
-			/**
-			 * 「添加账号」区 —— 两条路共用一块地方，Tab 切换。
-			 *
-			 * 登录进行中（waiting / starting）时**强制留在登录页**：轮询还在跑，
-			 * 切走会让用户以为授权被取消了，回来还得重新点。
-			 */
-			const loginBusy = login.phase === "waiting" || login.phase === "starting";
-			const activeAddTab = loginBusy ? "login" : addTab;
-			const addAccountBody = h("div", { style: { display: "flex", flexDirection: "column", gap: "12px" } },
-				// 下划线式 Tab：激活项用 2px 强调色底边，比描边盒子轻，hover 由 .wb2ui-tab 接管。
-				h("div", { style: { display: "flex", gap: "16px", borderBottom: "1px solid " + TOKENS.border } },
-					[["login", "授权登录"], ["import", "导入 JSON"]].map(([key, label]) => h("button", {
-						key,
-						type: "button",
-						className: "wb2ui-tab",
-						disabled: loginBusy && key !== "login",
-						onClick: () => setAddTab(key),
-						style: {
-							padding: "6px 2px 9px",
-							border: "none",
-							borderBottom: "2px solid " + (activeAddTab === key ? TOKENS.accent : "transparent"),
-							background: "transparent",
-							color: activeAddTab === key ? TOKENS.ink : TOKENS.caption,
-							fontSize: "12.5px", fontWeight: activeAddTab === key ? 600 : 500,
-							cursor: loginBusy && key !== "login" ? "not-allowed" : "pointer",
-							opacity: loginBusy && key !== "login" ? 0.45 : 1,
-							marginBottom: "-1px",
-						},
-					}, label)),
-				),
-				activeAddTab === "login" ? loginBody : uploadBody,
-			);
-
-			// ---- 积分：单账号徽章 + 包明细 ----
-
-			/**
-			 * 「剩余」后面接的那个值。
-			 *
-			 * 五种状态分开渲染，因为它们对用户意味着完全不同的事：
-			 * 「还没拉到」是等一下，「凭证读不了」是去修文件，「获取失败」是上游/网络，
-			 * 「后端未加载」是去重启 dsh。（禁用账号现在也查积分，不再有「已禁用」态。）
-			 * 统一显示成 0 会把前几种全伪装成最后一种。
-			 *
-			 * 好状态下返回的是**大号数字**（卡片上唯一的强调位），
-			 * 其余状态一律退回 12.5px 的说明文字 —— 尺寸本身就在告诉用户
-			 * 「这不是一个数字，是一条待处理的消息」。
-			 */
-			const creditValue = (row) => {
-				const note = (text, tone, title) => h("span",
-					Object.assign({ style: { fontSize: "12.5px", color: tone, lineHeight: 1.4 } }, title ? { title } : {}), text);
-				if (!row) {
-					if (credits.phase === "error") {
-						// 路由 404 与「上游挂了」是两回事：前者改代码不动 dsh 就能修，后者只能等。
-						return credits.missing
-							? note("面板后端未加载 · 需重启 dsh", TOKENS.danger, credits.error)
-							: note("获取失败", TOKENS.danger, credits.error);
-					}
-					// 读取中给**同尺寸**占位（17px 粗体）—— 用小字「读取中…」的话，
-					// 积分一到、占位换数字，这一行凭空长高一截，整张卡跟着跳。
-					if (credits.phase === "loading") {
-						return h("span", { style: { fontSize: "17px", fontWeight: 700, lineHeight: 1.2, color: TOKENS.caption, fontVariantNumeric: "tabular-nums" } }, "—");
-					}
-					return note("未知", TOKENS.caption);
+				const ratio = window.devicePixelRatio > 0 ? window.devicePixelRatio : 1;
+				const moduleSize = Math.max(1, Math.floor(modulePixels * ratio / code.size));
+				const side = moduleSize * code.size;
+				canvas.width = side;
+				canvas.height = side;
+				canvas.style.width = `${String(Math.round(side / ratio))}px`;
+				canvas.style.height = `${String(Math.round(side / ratio))}px`;
+				const context = canvas.getContext("2d");
+				if (context === null) return;
+				context.fillStyle = "#fff";
+				context.fillRect(0, 0, side, side);
+				context.fillStyle = "#000";
+				for (let y = 0; y < code.size; y += 1) for (let x = 0; x < code.size; x += 1) {
+					if (code.modules[y * code.size + x] !== true) continue;
+					context.fillRect(x * moduleSize, y * moduleSize, moduleSize, moduleSize);
 				}
-				if (row.state === "unreadable") return note("凭证读不了", TOKENS.danger);
-				if (row.state === "error") return note("获取失败", TOKENS.danger, row.error);
-				const tone = creditsTone(row);
-				if (row.unlimited) return h("span", { style: { fontSize: "16px", fontWeight: 700, color: TOKENS.accent, lineHeight: 1.2 } }, "不限量");
-				return h("span", { style: { display: "inline-flex", alignItems: "center", gap: "5px", color: tone } },
-					ICON_BOLT,
-					h("span", { style: { fontSize: "17px", fontWeight: 700, lineHeight: 1.2, fontVariantNumeric: "tabular-nums" } }, formatCredits(row.total)),
-				);
-			};
-
-			/** 到期描述 —— 分档照 WorkDaddy（分钟 / 小时 / 天）。 */
-			function expiryText(ms) {
-				if (!ms) return "有效期未知";
-				const diff = Number(ms) - Date.now();
-				if (diff <= 0) return "已过期";
-				const minute = 60000;
-				const hour = 60 * minute;
-				const day = 24 * hour;
-				if (diff < hour) return "剩余 " + Math.max(1, Math.ceil(diff / minute)) + " 分钟";
-				if (diff < day) return "剩余 " + Math.ceil(diff / hour) + " 小时";
-				return "剩余 " + Math.ceil(diff / day) + " 天";
-			}
-
-			/**
-			 * 一格的透明度 —— **越快到期的越淡**。
-			 *
-			 * 照 WorkDaddy 的 `creditOpacity`：剩余 >= 30 天算实心，1 天接近透明。
-			 * 好处是不用逐个悬停，扫一眼就能看出条上哪部分快失效了。
-			 * 到期时间未知的按实心（1）—— 它不会先没。
-			 */
-			function creditOpacity(days) {
-				if (days === null || days === undefined || !Number.isFinite(Number(days))) return 1;
-				return 0.05 + 0.95 * Math.max(0, Math.min(29, Number(days) - 1)) / 29;
-			}
-
-			/** 段剩余天数；未知返回 null。 */
-			const daysLeft = (segment) => (segment && segment.expiresAt
-				? (Number(segment.expiresAt) - Date.now()) / 86400000
-				: null);
-
-			/** 一格的悬停说明：来源 / 数量 / 到期。 */
-			function segmentTip(segment) {
-				return String(segment.source || "积分")
-					+ "\n" + formatCredits(segment.remaining) + " 积分"
-					+ "\n到期时间 " + (segment.expiresAt ? whenMs(segment.expiresAt) : "未知")
-					+ "（" + expiryText(segment.expiresAt) + "）";
-			}
-
-			/**
-			 * 占位积分条 —— 与真条同高。积分还在路上时先撑住版面，
-			 * 数据落地换真条的那一刻卡片高度不变（治「打开面板全卡集体长高」）。
-			 */
-			function creditBarSkeleton() {
-				return h("div", { style: { display: "flex", alignItems: "stretch", gap: "2px", width: "100%", height: "8px" } },
-					h("span", { className: "wb2ui-skel", style: { flex: "1 1 auto", borderRadius: "3px", background: TOKENS.bar } }));
-			}
-
-			/**
-			 * 积分条：**一格一个积分包**，宽度按各包占总额的比例分配。
-			 *
-			 * 两个细节照 WorkDaddy 学来，都是关键：
-			 *
-			 * 1. **按比例（flex 权重）而不是绝对值。** 绝对值会让 6 分的包在几百的
-			 *    总额里缩成一个点、看着像没画。权重保底 0.008，小额段也能留一条缝。
-			 * 2. **段间 2px 间隙 + 每段各自圆角**，一格一格看得出是独立的包，
-			 *    而不是一条连续的实心条。
-			 */
-			function creditBar(row) {
-				const segments = (row && Array.isArray(row.segments) ? row.segments : [])
-					.filter((segment) => segment && Number(segment.remaining) > 0);
-				if (segments.length === 0) return null;
-				const sum = segments.reduce((acc, segment) => acc + (Number(segment.remaining) || 0), 0) || 1;
-				return h("div", {
-					// 外层是淡色轨道：段间 2px 缝隙露出轨道色，一格一格更分明，两端由轨道统一收圆。
-					style: { display: "flex", alignItems: "stretch", gap: "2px", width: "100%", height: "8px", borderRadius: "4px", overflow: "hidden", background: "rgba(128,128,128,.14)" },
-				}, segments.map((segment, index) => {
-					const weight = Math.max(0.008, (Number(segment.remaining) || 0) / sum);
-					return h("span", {
-						key: index,
-						title: segmentTip(segment),
-						style: {
-							flex: weight.toFixed(4) + " 1 0",
-							minWidth: "3px",
-							background: TOKENS.bar,
-							opacity: creditOpacity(daysLeft(segment)).toFixed(3),
-						},
-					});
-				}));
-			}
-
-			/**
-			 * 展开后的分段明细 —— 与进度条**一一对应**（同一份 `segments`，同一顺序）。
-			 *
-			 * 左边那个小色块和条上的格子同透明度，用户能直接把"第几段"对回去。
-			 */
-			const segmentDetail = (row) => {
-				const segments = Array.isArray(row.segments) ? row.segments : [];
-				const gap = Number(row.sumCapacityRemain || 0) - (Number(row.total) || 0);
-				return h("div", {
-					className: "wb2ui-scroll",
-					style: {
-						border: "1px solid " + TOKENS.border, borderRadius: "9px", padding: "9px 11px",
-						background: TOKENS.panel2, maxHeight: "230px", overflowY: "auto",
-						display: "flex", flexDirection: "column", gap: "5px",
-					},
+			}, [text, modulePixels]);
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("canvas", {
+				ref,
+				role: "img",
+				"aria-label": "QR",
+				style: { display: "block" }
+			});
+		}
+		/**
+		* One pooled account, as one row inside its product's card.
+		*
+		* The row is deliberately flat: a status dot, the account's name, and ONE grey
+		* line of small text under it carrying the facts a reader checks at a glance —
+		* what is left, what this cycle consumed, what this plugin has sent through the
+		* account, and when the allowance returns. There is no disclosure: every figure
+		* used to sit behind a chevron, which turned a page about balances into a list
+		* of names with the balances hidden. Anything that is a DECISION (enable, test,
+		* rename, remove) lives in the ⋮ menu instead, so nothing in the row has to be
+		* expanded to be acted on.
+		*
+		* The meta line omits what is unknown rather than printing a zero: "the
+		* upstream did not report this" and "this is zero" are different answers, and
+		* the second one is the kind of wrong-but-plausible figure a reader acts on.
+		*/
+		function AccountRow$1({ account, busy, now, t, onAction }) {
+			const [menuOpen, setMenuOpen] = (0, react.useState)(false);
+			/** The inline editor this row has open, if any. */
+			const [mode, setMode] = (0, react.useState)(void 0);
+			const [label, setLabel] = (0, react.useState)("");
+			const copy = accountSummaryCopy(t);
+			const { tone, text: stateLabel } = accountSummaryState(account, now, copy);
+			const items = [
+				{
+					id: "toggle",
+					label: account.enabled === true ? t("accountDisable") : t("accountEnable"),
+					disabled: busy
 				},
-					h("div", { style: HINT }, "按到期时间排（先没的在前）· 共 " + segments.length + " 段，与上面的进度条一一对应"),
-					segments.map((segment, index) => h("div", {
-						key: index,
-						className: "wb2ui-segrow",
-						title: segmentTip(segment),
-						style: { display: "flex", alignItems: "center", gap: "8px", fontSize: "11.5px" },
-					},
-						h("span", {
-							style: {
-								width: "8px", height: "8px", flexShrink: 0, borderRadius: "2px",
-								background: TOKENS.bar, opacity: creditOpacity(daysLeft(segment)).toFixed(3),
-							},
-						}),
-						h("span", { style: { flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: TOKENS.muted } }, segment.source || "积分"),
-						h("span", { style: Object.assign({}, HINT, { flexShrink: 0 }) },
-							segment.expiresAt ? whenMs(segment.expiresAt).slice(0, 10) : "无到期"),
-						h("span", { style: { flexShrink: 0, fontWeight: 600, color: TOKENS.ink } }, formatCredits(segment.remaining)),
-						segment.total ? h("span", { style: { flexShrink: 0, color: TOKENS.caption } }, "/ " + formatCredits(segment.total)) : null,
-					)),
-					// 明细与主数字同口径（都是可用）。差额单独说一句，否则用户拿上游的
-					// 总量口径去核总数会对不上，反过来怀疑程序少加。
-					gap > 0
-						? h("div", { style: Object.assign({}, HINT, { borderTop: "1px solid " + TOKENS.border, paddingTop: "6px" }) },
-							"另有 " + formatCredits(gap) + " 本周期已用尽（上游总量口径会把它算进去，实际用不到，不计入上表）")
-						: null,
-				);
-			};
-
-			// ---- 账号列表 ----
-
-			/**
-			 * 任务浮层 —— 鼠标停在昵称上时显示。
-			 *
-			 * 三段按「看这个浮层的目的」排序：**可领 → 进行中 → 已完成**。
-			 * 反过来会让人先读一堆已经没有动作价值的条目，而真正想问的是
-			 * 「有没有白拿的」。
-			 *
-			 * 已完成那段也要给：用户问的就是「已经做完的任务」，只列没做完的
-			 * 等于没回答。
-			 */
-			const taskPanel = (row) => {
-				const box = {
-					position: "absolute", top: "calc(100% + 6px)", left: "14px", zIndex: 40,
-					width: "330px", maxHeight: "300px", overflowY: "auto",
-					border: "1px solid " + TOKENS.border, borderRadius: "10px",
-					background: TOKENS.panel, boxShadow: "0 10px 28px rgba(0,0,0,.32)",
-					padding: "10px 12px", display: "flex", flexDirection: "column", gap: "7px",
-					cursor: "default",
-				};
-				// 鼠标从昵称移进浮层时，两边各自延时隐藏 —— 否则浮层刚出现就没了。
-				const hoverProps = {
-					onMouseEnter: () => showTaskFor(row === null || row === undefined ? "" : row.uid),
-					onMouseLeave: hideTaskSoon,
-				};
-				if (row === undefined || row === null) {
-					return h("div", Object.assign({ style: box }, hoverProps), h("div", { style: HINT }, "任务信息读取中…"));
+				{
+					id: "test",
+					label: t("accountTest"),
+					disabled: busy
+				},
+				{
+					type: "separator",
+					id: "sep-edit"
+				},
+				{
+					id: "rename",
+					label: t("accountRename"),
+					disabled: busy
+				},
+				{
+					type: "separator",
+					id: "sep-danger"
+				},
+				{
+					id: "remove",
+					label: t("accountRemoveAction"),
+					disabled: busy,
+					danger: true
 				}
-				if (row.error !== undefined) {
-					return h("div", Object.assign({ style: box }, hoverProps),
-						h("div", { style: Object.assign({}, HINT, { color: TOKENS.danger }) }, "任务读取失败：" + row.error));
-				}
-
-				const tasks = Array.isArray(row.tasks) ? row.tasks : [];
-				const claimable = tasks.filter((item) => item.claimable);
-				const running = tasks.filter((item) => item.state === "in_progress" || item.state === "not_accepted");
-				const done = tasks.filter((item) => item.state === "claimed" || item.state === "completed");
-				const summary = row.summary || { completed: 0, total: tasks.length, pendingCredits: 0 };
-				const line = (item, tone, mark) => h("div", {
-					key: item.code + "|" + item.title,
-					style: { display: "flex", alignItems: "baseline", gap: "7px", fontSize: "11.5px", color: TOKENS.muted },
-				},
-					h("span", { style: { flexShrink: 0, width: "12px", color: tone } }, mark),
-					h("span", { style: { flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, item.title),
-					item.target > 1 ? h("span", { style: { flexShrink: 0, color: TOKENS.caption } }, item.current + "/" + item.target) : null,
-					item.credits > 0 ? h("span", { style: { flexShrink: 0, color: TOKENS.caption } }, "+" + item.credits) : null,
-					// 标出「完成方式可自动化」的任务（照 WorkDaddy 的白名单）。
-					// 是**标注**不是按钮：这些任务的完成要靠别的产品入口，插件够不着。
-					item.auto ? h("span", {
-						style: { flexShrink: 0, fontSize: "10.5px", color: TOKENS.bar },
-						title: "完成方式可自动化 —— 「保持活跃」发的云会话能推进 chat 类计数，其余要真实使用对应入口",
-					}, "可自动") : null,
-				);
-
-				return h("div", Object.assign({ style: box }, hoverProps),
-					h("div", { style: { display: "flex", alignItems: "baseline", gap: "9px", paddingBottom: "6px", borderBottom: "1px solid " + TOKENS.border } },
-						h("b", { style: { fontSize: "12.5px" } }, "任务 " + summary.completed + "/" + summary.total),
-						Number.isSafeInteger(row.streakDays) && row.streakDays >= 0
-							? h("span", { style: HINT }, "连续登录 " + row.streakDays + " 天")
-							: null,
-					),
-					claimable.length > 0
-						? h("div", { style: { display: "flex", flexDirection: "column", gap: "4px" } },
-							h("div", { style: Object.assign({}, HINT, { color: TOKENS.bar }) },
-								"可领 " + claimable.length + " 个（" + summary.pendingCredits + " 积分）· 点上方「领取任务积分」"),
-							claimable.slice(0, 8).map((item) => line(item, TOKENS.bar, "★")),
-						)
-						: null,
-					running.length > 0
-						? h("div", { style: { display: "flex", flexDirection: "column", gap: "4px" } },
-							h("div", { style: HINT }, "进行中 " + running.length + " 个"),
-							running.slice(0, 8).map((item) => line(item, TOKENS.caption, "○")),
-						)
-						: null,
-					done.length > 0
-						? h("div", { style: { display: "flex", flexDirection: "column", gap: "4px" } },
-							h("div", { style: HINT }, "已完成 " + done.length + " 个"),
-							done.slice(0, 12).map((item) => line(item, TOKENS.ok, "✓")),
-							done.length > 12 ? h("div", { style: HINT }, "……另有 " + (done.length - 12) + " 个已完成") : null,
-						)
-						: null,
-				);
+			];
+			const onMenuSelect = (id) => {
+				setMenuOpen(false);
+				if (id === "toggle") onAction({
+					action: "enable",
+					id: account.id,
+					enabled: account.enabled !== true
+				});
+				else if (id === "test") onAction({
+					action: "test",
+					id: account.id
+				});
+				else if (id === "rename") {
+					setLabel(account.name);
+					setMode("rename");
+				} else if (id === "remove") setMode("remove");
 			};
-
-			/** 两端对齐的一行「左边身份 …… 右边时效」，中间留白。挤在一起会变成一堵字墙。 */
-			const justified = (left, right) => h("div", {
-				style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", minWidth: 0 },
-			}, left, right);
-
-			/**
-			 * 一张账号卡。
-			 *
-			 * 五行的信息层级（从上到下扫一眼就能读完）：
-			 * ① 谁 —— 昵称 + 属性徽章 + 操作
-			 * ② 什么身份 / 什么时候过期
-			 * ③ 还剩多少
-			 * ④ 条状占比
-			 * ⑤ 包明细（要展开才出）
-			 *
-			 * 之前是一行「昵称 + 一串 run-on 文本 + 右侧三个文字按钮」，
-			 * 昵称一长就把操作挤到换行，uid / 到期时间 / 文件名糊在同一行里分不出层级。
-			 */
-			const accountCard = (account) => {
-				const credit = creditByFile[account.file];
-				const expanded = expandedFile === account.file;
-				const canExpand = Boolean(credit && credit.state === "ok" && (credit.segments || []).length > 0);
-				const deleting = confirmFile === account.file;
-				// 禁用账号**也显示积分行** —— 卡片塌掉（只剩第一行）比多一行数字糟得多，
-				// 而「切换账号」的副作用正好是把其余账号全禁用：一点切换，几张卡同时塌，
-				// 看起来像坏了。是不是参与轮换由顶部徽章表达，不靠抽掉内容。
-				// 今日已使用：上游只给逐笔流水，host 侧按当天汇总好再下发。
-				const todayUsed = credit && credit.todayUsage ? Number(credit.todayUsage.used) || 0 : 0;
-				const live = poolByUid[account.uid];
-				const expiry = expiryState(account.expiresAt);
-				const working = Boolean(live && Number(live.inFlight) > 0);
-				// （原来还有个 isActive，现在并进 isCurrent 了 —— 多账号时就是它。）
-				/**
-				 * 「当前使用中」= 池里只剩它一个启用 —— 网关没有别的可换，那才是
-				 * 名副其实的"当前在用"。多个启用时是加权轮换，没有单一当前，
-				 * **就不该瞎指一个**（猜错比不说更糟）。
-				 *
-				 * 它只在用户主动切换后出现，不会随后台请求自己变 —— 界面不该自己动。
-				 */
-				const soloCurrent = !account.disabled && enabledAccountCount === 1;
-				/**
-				 * 高亮的那个账号。**始终有一个** —— 不然"当前在用的是哪个"这个问题
-				 * 就没答案了（用户要的就是这个）。两档依据：
-				 *
-				 * 1. 池里只剩一个启用 → 它就是（网关没别的可换，最硬的依据）；
-				 * 2. 否则退到「最近使用」那个（`last_success` 最新 / 有请求在飞）。
-				 *
-				 * 都不满足（网关刚起来、一次请求还没发过）就谁都不高亮 —— 那种情况下
-				 * 猜一个比不指更糟。
-				 */
-				const isCurrent = !account.disabled && (soloCurrent || account.uid === activeUid);
-
-				/**
-				 * WorkDaddy 卡片排版：
-				 * - **无边框扁平卡** —— 深色面板里靠底色和留白分区，不画框线；
-				 * - 行序：昵称+徽章行 → 「uid ｜ 有效期至」 → 「可用 ｜ 今日已使用」 → 通栏积分条贴底；
-				 * - 当前使用的账号只做**背景提亮**，不动边框。
-				 */
-				return h("div", {
-					key: account.file,
-					className: "wb2ui-account",
-					style: {
-						borderRadius: "12px",
-						padding: "14px 16px 12px",
-						background: deleting
-							? "linear-gradient(" + "color-mix(in srgb, " + TOKENS.danger + " 10%, transparent)" + ", " + "color-mix(in srgb, " + TOKENS.danger + " 10%, transparent)" + "), " + TOKENS.panel
-							: (isCurrent ? "linear-gradient(" + TOKENS.overlay + ", " + TOKENS.overlay + "), " : "") + TOKENS.panel,
-						// 任务浮层是这张卡的绝对定位子元素。
-						position: "relative",
-						display: "flex", flexDirection: "column", gap: "8px",
-						// **不灰化**未参与轮换的卡片 —— 内容该完整，状态由徽章说。
-					},
-				},
-					// ① 昵称 + 徽章 | 操作
-					h("div", { style: { display: "flex", alignItems: "center", gap: "10px", minWidth: 0 } },
-						h("span", {
-							// 头像点：按 uid 稳定取色，一眼把卡片和账号对上，也让操作按钮的右侧有视觉锚。
-							style: {
-								width: "30px", height: "30px", flexShrink: 0, borderRadius: "50%",
-								display: "inline-flex", alignItems: "center", justifyContent: "center",
-								fontSize: "13px", fontWeight: 700, color: "#fff",
-								background: avatarColor(account.uid),
-							},
-						}, (account.nickname || account.uid || "?").trim().slice(0, 1).toUpperCase() || "?"),
-						h("span", {
-							style: {
-								fontSize: "16px", fontWeight: 700, letterSpacing: ".1px",
-								// 独占剩余宽度、完整显示：超长自动折行（不断字），不再 ellipsis 截断。
-								lineHeight: 1.3, flex: "1 1 auto", minWidth: 0,
-								wordBreak: "break-word", overflowWrap: "anywhere",
-								cursor: "help",
-							},
-							// 光标是 help、并且直说「悬停」—— 不然没人会去试那个交互。
-							title: "悬停查看任务进度",
-							onMouseEnter: () => showTaskFor(account.uid),
-							onMouseLeave: hideTaskSoon,
-						}, account.nickname || account.uid || "(无昵称)"),
-						deleting
-							? h("div", { style: { display: "flex", gap: "6px", marginLeft: "auto", flexShrink: 0 } },
-								h("button", {
-									type: "button",
-									className: "wb2ui-ghost", style: Object.assign({}, SMALL, { borderColor: TOKENS.danger, color: TOKENS.danger }),
-									disabled: busy === "delete:" + account.file,
-									onClick: () => deleteAccount(account.file),
-								}, busy === "delete:" + account.file ? "删除中…" : "确认删除"),
-								h("button", { type: "button", className: "wb2ui-ghost", style: SMALL, onClick: () => setConfirmFile("") }, "取消"),
-							)
-							: h("div", { style: { display: "flex", gap: "7px", marginLeft: "auto", flexShrink: 0 } },
-								h(IconButton, {
-									title: isCurrent ? "恢复全部账号参与加权轮换" : "切换为只用这个账号（其余暂停参与，凭证不删）",
-									disabled: busy === "switch:" + account.file,
-									onClick: () => switchToAccount(account.file, isCurrent),
-								}, ICON_SWAP),
-								h(IconButton, {
-									title: "删除该账号的凭证文件",
-									danger: true,
-									onClick: () => setConfirmFile(account.file),
-							}, ICON_TRASH),
-						),
-					),
-					// ①b 徽章行 —— 独立成行：不跟昵称抢宽度，怎么换行都不影响昵称与操作按钮。
-					h("div", { style: { display: "flex", alignItems: "center", gap: "5px", flexWrap: "wrap" } },
-						h(Chip, null, account.enterpriseId ? "企业版" : "个人版"),
-						account.realm === "global" ? h(Chip, { tone: TOKENS.accent, toneInk: TOKENS.accent }, "国际版") : null,
-						account.unreadable
-							? h(Chip, { tone: TOKENS.danger, toneInk: TOKENS.danger }, "文件损坏")
-							: h(Chip, {
-								tone: account.disabled ? TOKENS.warn : TOKENS.ok,
-								toneInk: account.disabled ? TOKENS.warn : TOKENS.ok,
-								title: account.disabled ? "点一下让它重新参与轮换" : "点一下暂停它参与轮换（凭证不会被删）",
-								onClick: () => toggleAccount(account.file, account.disabled),
-							}, account.disabled ? "未参与轮换" : "已启用"),
-						account.expired ? h(Chip, { tone: TOKENS.warn, toneInk: TOKENS.warn }, "凭证过期") : null,
-						// 网关的实时判定（冷却 / 熔断）—— 最动态的信息放徽章行末尾。
-						poolBadge(poolByUid[account.uid]),
-						checkinBadge(activity["checkin:" + account.uid]),
-						streakLabel(growthByUid[account.uid]),
-						taskBadge(growthByUid[account.uid]),
-					),
-					// ② 「当前调用」徽章 + uid ｜ 有效期至 —— WorkDaddy 的「手机 ｜ 有效期至」行。
-					justified(
-						h("span", { style: { display: "inline-flex", alignItems: "center", gap: "8px", minWidth: 0 } },
-							isCurrent
-								? h(Chip, { tone: TOKENS.bar, toneInk: TOKENS.bar },
-									working ? "正在处理" : (soloCurrent ? "当前使用中" : "最近使用"))
-								: null,
-							h(Field, {
-								label: account.enterpriseId ? "企业" : "uid",
-								value: account.enterpriseId || account.uid || "—",
-								style: { fontFamily: "ui-monospace, 'Cascadia Mono', Consolas, monospace", fontSize: "11.5px", color: TOKENS.caption },
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: cx("wbp-accountRow", account.enabled === true && tone === "ok" && "wbp-accountRowActive"),
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: "wbp-accountHead",
+						children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)(StatusDot, {
+								tone,
+								title: stateLabel
 							}),
-						),
-						h(Field, { label: "有效期至", value: expiry.text, style: { color: expiry.tone } }),
-					),
-					// ③ 可用 ⚡x ｜ 今日已使用 ⚡x —— WorkDaddy 的「剩余 ｜ 今日已使用」行。
-					h("div", { style: { display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: "12px", minWidth: 0 } },
-						h("span", { style: { display: "inline-flex", alignItems: "center", gap: "7px", minWidth: 0 } },
-							h("span", { style: { fontSize: "12.5px", color: TOKENS.caption, flexShrink: 0 } }, "可用"),
-							creditValue(credit),
-						),
-						todayUsed > 0
-							? h("span", {
-								style: { display: "inline-flex", alignItems: "center", gap: "4px", fontSize: "12.5px", color: TOKENS.caption, flexShrink: 0 },
-								title: (credit.todayUsage && credit.todayUsage.count ? credit.todayUsage.count + " 笔请求" : "")
-									+ (credit.todayUsage && credit.todayUsage.date ? " · " + credit.todayUsage.date : ""),
-							},
-								"今日已使用",
-								ICON_BOLT,
-								h("b", { style: { color: TOKENS.ink, fontWeight: 600, fontVariantNumeric: "tabular-nums" } }, formatCredits(todayUsed)),
-							)
-							: null,
-					),
-					// ④ 积分条：贴底通栏（WorkDaddy 的条是全卡宽），一格一个包，越快到期的越淡。
-					// 积分还在加载时画同高占位条 —— 否则每张卡都在积分落地那一刻集体长高。
-					credit && credit.state === "ok" && !credit.unlimited ? creditBar(credit)
-						: (credit === undefined && credits.phase === "loading" ? creditBarSkeleton() : null),
-					// ⑤ 分段明细开合。加载中放一个 visibility:hidden 的同款按钮占位，行高不跳。
-					canExpand
-						? h("button", {
-							type: "button",
-							style: {
-								alignSelf: "flex-start", padding: "3px 10px", borderRadius: "999px",
-								border: "1px solid " + TOKENS.border, background: "transparent",
-								color: TOKENS.muted, fontSize: "11.5px", cursor: "pointer",
-							},
-							onClick: () => setExpandedFile(expanded ? "" : account.file),
-						}, credit.packageCount + " 段 " + (expanded ? "▴" : "▾"))
-						: (credit === undefined && credits.phase === "loading"
-							? h("button", {
-								type: "button",
-								style: {
-									visibility: "hidden", alignSelf: "flex-start", padding: "3px 10px", borderRadius: "999px",
-									border: "1px solid transparent", background: "transparent",
-									fontSize: "11.5px", cursor: "default",
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "wbp-accountName",
+								title: account.name,
+								children: account.name
+							}),
+							tone === "ok" ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "wbp-usagePlanStatus",
+								children: stateLabel
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { className: "wbp-spacer" }),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Menu, {
+								open: menuOpen,
+								onClose: () => {
+									setMenuOpen(false);
 								},
-							}, "占位")
-							: null),
-					expanded && canExpand ? segmentDetail(credit) : null,
-					// 鼠标停在昵称上时弹出。挂在卡片末尾 = 盖在后续内容之上（z-index 40）。
-					taskUid === account.uid ? taskPanel(growthByUid[account.uid]) : null,
-				);
-			};
-
-			const accountRows = accounts.length === 0
-				? h("div", { style: { display: "flex", flexDirection: "column", alignItems: "center", gap: "8px", padding: "24px 0 12px" } },
-					h("span", { style: { display: "inline-flex", color: TOKENS.muted } }, ICON_UPLOAD),
-					h("div", { style: { fontSize: "12.5px", color: TOKENS.secondary } }, "还没有任何账号"),
-					h("div", { style: HINT }, "用上面的「授权登录」或「导入 JSON」添加 —— 网关对 auths/ 每 5 秒轮询，加完自动生效，不用重启。"))
-				: h("div", { style: { display: "flex", flexDirection: "column", gap: "10px" } }, accounts.map(accountCard));
-
-			// ---- 模型目录 ----
-			const modelBody = models === null
-				? h("div", { style: HINT }, gateway.running ? "模型目录读取失败（网关刚起来时可能还没就绪，刷新一下）。" : "网关未运行，读不到模型目录。")
-				: models.length === 0
-					? h("div", { style: HINT }, "网关没返回任何模型 —— 通常意味着还没有可用账号。")
-					: h("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(230px, 1fr))", gap: "7px" } },
-						models.map((model) => h("div", {
-							key: model.id,
-							className: "wb2ui-model",
-							style: { border: "1px solid " + TOKENS.border, borderRadius: "9px", padding: "8px 10px", display: "flex", flexDirection: "column", gap: "3px" },
-						},
-							// 网关的模型 id 带区域前缀（`cn:auto` / `global:gpt-5`）。区域信息在
-							// 网关配置里已经定了，账号卡上也标了，这里再重复一遍只会把真正
-							// 要看的模型名挤窄。完整 id 留在 title 里，悬停能看到、也能抄。
-							h("span", { style: { fontSize: "12px", fontWeight: 600, wordBreak: "break-all", fontFamily: "ui-monospace, 'Cascadia Mono', Consolas, monospace" }, title: model.id }, shortModelId(model.id)),
-							h("span", { style: HINT },
-								compact(model.contextLength) + " 上下文"
-								+ (model.maxOutputTokens ? " · 输出 " + compact(model.maxOutputTokens) : "")
-								+ (model.supportsImages ? " · 支持图片" : ""),
-							),
-						)),
-					);
-
-			return h("div", { style: WRAP },
-				h("div", { style: { display: "flex", flexDirection: "column", gap: "14px" } },
-					h("div", { style: CARD }, statusRow, headerNote, configWarn, binaryWarn, gatewayWarn),
-					notice.kind !== "idle"
-						? h("div", {
-							// 横幅化：左侧 3px 强调边 + 同色淡底，成功/失败一眼分清，不再是一行裸文字。
-							style: {
-								fontSize: "12.5px", color: noticeColor, lineHeight: 1.6,
-								padding: "9px 12px", borderRadius: "10px",
-								borderLeft: "3px solid " + noticeColor,
-								background: "color-mix(in srgb, " + noticeColor + " 9%, transparent)",
-							},
-						}, notice.text)
-						: null,
-					// 任务轮次状态：待办确认 / 执行进度 / 领奖汇总 / 日志尾巴。
-					// 只在有内容时出现 —— 平时它不该占版面。
-					(taskRun.running || taskRun.summary || taskRun.error || taskRun.pending || taskRun.missing)
-						? h("div", {
-							style: {
-								border: "1px solid " + TOKENS.border, borderRadius: "10px", padding: "10px 12px",
-								display: "flex", flexDirection: "column", gap: "6px", background: TOKENS.panel2,
-							},
-						},
-							h("div", { style: { fontSize: "12.5px", fontWeight: 600, color: TOKENS.ink } },
-								taskRun.running
-									? "任务执行中…（确认待办 → 执行动作 → 自动领奖）"
-									: (taskRun.summary
-										? "任务执行完成：领奖 " + taskRun.summary.totals.claimItems + " 项，+" + taskRun.summary.totals.credit + " 分 +"
-											+ taskRun.summary.totals.energy + " 能"
-											+ (taskRun.summary.totals.errors > 0 ? "，" + taskRun.summary.totals.errors + " 项出错" : "")
-										: (taskRun.error ? "任务执行失败" : "任务状态"))),
-							taskRun.pending
-								? h("div", { style: HINT },
-									"确认待办：" + taskRun.pending.total + " 项"
-									+ (taskRun.pending.accounts || [])
-										.filter((a) => (a.pending || []).length > 0)
-										.map((a) => " · " + (a.nickname || String(a.uid).slice(0, 8)) + " " + a.pending.length + " 项")
-										.join(""))
-								: null,
-							taskRun.error
-								? h("div", { style: Object.assign({}, HINT, { color: TOKENS.danger }) }, taskRun.error)
-								: null,
-							taskRun.summary
-								? h("div", { style: HINT },
-									taskRun.summary.accounts
-										.filter((a) => a.credit > 0 || a.errors.length > 0)
-										.map((a) => (a.nickname || String(a.uid).slice(0, 8)) + " +" + a.credit + "分"
-											+ (a.errors.length > 0 ? "（" + a.errors.length + " 错）" : ""))
-										.join(" · ") || "没有新增奖励（待办都已完成或未达标）")
-								: null,
-							(taskRun.logs && taskRun.logs.length > 0)
-								? h("div", {
-									style: {
-										maxHeight: "132px", overflowY: "auto", fontFamily: "ui-monospace, Consolas, monospace",
-										fontSize: "11px", lineHeight: 1.5, color: TOKENS.caption, whiteSpace: "pre-wrap",
+								onSelect: onMenuSelect,
+								items,
+								align: "end",
+								portal: true,
+								anchor: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									className: "wbp-iconButton",
+									"aria-label": `${account.name} — ${t("accountActions")}`,
+									title: t("accountActions"),
+									"aria-haspopup": "menu",
+									"aria-expanded": menuOpen,
+									onClick: () => {
+										setMenuOpen((value) => !value);
 									},
-								}, taskRun.logs.slice(-8).join("\n"))
-								: null,
-						)
-						: null,
-					Section({ title: "添加账号", children: addAccountBody }),
-					Section({
-						title: "账号（" + accounts.length + "）",
-						extra: h("div", { style: Object.assign({}, ROW, { marginLeft: "auto" }) },
-							h("span", {
-								// 「积分更新于 N 秒前」宽度随时间变，会把右边三个按钮推来推去
-								// —— 占住固定宽度，按钮就不再左右横跳。
-								style: Object.assign({}, HINT, credits.missing ? { color: TOKENS.warn } : null, {
-									display: "inline-block", minWidth: "9.5em", fontVariantNumeric: "tabular-nums",
-								}),
-							},
-								credits.phase === "error"
-									? (credits.missing
-										? "面板后端未加载：插件 host 半侧只在 dsh 启动时加载，改动后需重启 dsh 生效"
-										: "积分读取失败：" + credits.error)
-									: (creditsData && creditsData.oldestFetch ? "积分更新于 " + timeAgo(creditsData.oldestFetch) : ""),
-							),
-							// 「一键做任务」放最前：它是这一区唯一「帮我把便宜占回来」的动作，
-							// 另三个是查看/收尾类。主按钮色只给它一个，避免一排放三个蓝底。
-							h("button", {
-								type: "button",
-								style: Object.assign({}, SMALL, {
-									background: TOKENS.fill, color: TOKENS.onFill,
-									borderColor: "transparent", fontWeight: 600,
-								}),
-								disabled: busy === "tasks" || taskRun.running || accounts.length === 0,
-								onClick: runTasks,
-								title: "先确认每个账号有无待办任务，再逐个执行（对话 / 桌面事件链 / 专家链），达标自动领奖。一轮可能几分钟。",
-							}, taskRun.running ? "任务执行中…" : "一键做任务"),
-							h("button", {
-								type: "button", className: "wb2ui-ghost", style: SMALL,
-								disabled: credits.phase === "loading",
-								onClick: () => loadCredits(true),
-							}, credits.phase === "loading" ? "读取中…" : "刷新积分"),
-							// 签到**不放手动的** —— 每天首次打开面板自动跑，够用了。
-							// 留个按钮只会让人以为必须点它一下。
-							// 下面的「领取任务积分」要留：任务完成是随机发生的，
-							// 没有固定时机可挂。
-							h("button", {
-								type: "button", className: "wb2ui-ghost", style: SMALL,
-								disabled: busy === "growth" || accounts.length === 0,
-								onClick: () => runActivity("growth"),
-								// 只领「已完成但还没领」的 —— 没做完的任务发过去会被上游拒。
-								title: "领取已完成的成长任务奖励。可领数量见各账号卡上的紫色徽章。",
-							}, busy === "growth" ? "领取中…" : "领取任务积分"),
-							h("button", {
-								type: "button", className: "wb2ui-ghost", style: SMALL,
-								disabled: busy === "keepalive" || accounts.length === 0,
-								onClick: () => runActivity("keepalive"),
-								title: "用每个账号发起一次云端会话，保持账号活跃度。",
-							}, busy === "keepalive" ? "保活中…" : "保持活跃"),
-						),
-						children: accountRows,
+									children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										className: "wbp-kebab",
+										"aria-hidden": "true"
+									})
+								})
+							})
+						]
 					}),
-					Section({ title: "可用模型" + (models ? "（" + models.length + "）" : ""), children: modelBody }),
-				),
-			);
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: "wbp-accountMeta",
+						children: accountSummaryMeta(account, now, copy)
+					}),
+					mode !== "rename" ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: "wbp-inlineForm",
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+							className: "wbp-fieldHead",
+							children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "wbp-label",
+								children: t("accountRename")
+							})
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: "wbp-inlineActions",
+							children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+									className: "wbp-input",
+									value: label,
+									placeholder: t("accountRenamePlaceholder"),
+									"aria-label": t("accountRename"),
+									disabled: busy,
+									autoFocus: true,
+									onChange: (event) => {
+										setLabel(event.target.value);
+									}
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { className: "wbp-spacer" }),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)(ActionButton, {
+									label: t("cancel"),
+									onClick: () => {
+										setMode(void 0);
+									}
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)(ActionButton, {
+									label: t("accountApply"),
+									tone: "primary",
+									disabled: busy || label.trim() === "",
+									onClick: () => {
+										onAction({
+											action: "label",
+											id: account.id,
+											label: label.trim()
+										});
+										setMode(void 0);
+									}
+								})
+							]
+						})]
+					}),
+					mode !== "remove" ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: "wbp-confirmBar",
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+							className: "wbp-confirmText",
+							children: t("accountRemoveConfirm", { name: account.name })
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: "wbp-dialogActions",
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(ActionButton, {
+								label: t("cancel"),
+								onClick: () => {
+									setMode(void 0);
+								}
+							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ActionButton, {
+								label: t("accountRemove"),
+								tone: "danger",
+								disabled: busy,
+								onClick: () => {
+									onAction({
+										action: "remove",
+										id: account.id
+									});
+									setMode(void 0);
+								}
+							})]
+						})]
+					})
+				]
+			});
 		}
+		/**
+		* The promotional chips one model row shows, without saying "free" twice.
+		*
+		* The upstream's own badge text is shown verbatim rather than translated — it is
+		* the product's own wording for its own promotion ("Free now", "限时免费"), and
+		* restating it in this plugin's language would be inventing copy for a claim the
+		* upstream made.
+		*
+		* The deduplication exists because a free model can arrive with *both* facts: a
+		* badge naming the promotion, and the `free` flag the rate was derived from. The
+		* international catalog does exactly that, which rendered "Free now" and "Free"
+		* side by side. When a badge already says the model is free, the derived chip is
+		* dropped — the badge is the specific claim, and this one is only the summary.
+		*/
+		function promotionChips(model, freeLabel) {
+			const badges = model.badges ?? [];
+			const alreadySaysFree = badges.some((badge) => /free/i.test(badge) || badge.includes("免费"));
+			return [...badges, ...model.free === true && !alreadySaysFree ? [freeLabel] : []];
+		}
+		/**
+		* The model list for one product: a context-length switch where the upstream
+		* declares a choice, and a reasoning-level detection button where the model has
+		* levels worth discovering.
+		*
+		* Both controls are writes and share the key-bearing route the account actions
+		* use. Detection sits here rather than only in the composer because it is a
+		* property of the model you are looking at — reading down the list with the
+		* models in front of you is the moment you notice one has no levels declared,
+		* and having to go and pick that model first to fix it was the roundabout part.
+		*/
+		function ModelsBlock({ variant, status, probe, busy, t, staged, context, onContext, onRefresh, onDetect, onClearProbe, onStage }) {
+			const signedIn = status !== void 0 && status.status === "signed-in" ? status : void 0;
+			const models = signedIn?.models ?? [];
+			const catalog = signedIn?.catalog;
+			/**
+			* The account bucket the model filter belongs to; undefined renders no
+			* filter row at all.
+			*
+			* Absent for an account with no stable user id: the preference is keyed by
+			* `uid:enterpriseId`, so there is no bucket to store it in, and a control
+			* that cannot be saved is worse than one that is not offered.
+			*/
+			const visibility = signedIn?.visibility;
+			/**
+			* The selection in force for this product: the staged draft when one exists,
+			* else what the host reports.
+			*
+			* The draft is absolute rather than a patch — `allowlist.length === 0` IS the
+			* "no filter" state — so there is exactly one source of truth per render and
+			* no precedence puzzle between two lists that could disagree.
+			*/
+			const filterOn = staged !== void 0 ? staged.filterOn : visibility?.allowlist !== void 0;
+			/**
+			* The selection the picker reads and writes.
+			*
+			* With the filter ON it is the staged draft or the host's list. With it OFF
+			* the host keeps no list — "off" and "everything visible" are the same state —
+			* so the menu edits a calendar of the whole catalog, and the first untick
+			* there turns the filter on (see the picker's commit below). That is what
+			* keeps the menu usable without flipping the switch first, and what stops an
+			* untick from hiding the entire catalog through a list that only ever named
+			* the one model.
+			*
+			* The CALENDAR is read-only for the trigger's label ({@link displayed}): while
+			* the filter is off nothing is filtered, and a label counting the whole
+			* catalog would read as a filter that is on.
+			*/
+			const pickerSelection = staged !== void 0 ? staged.allowlist : visibility?.allowlist ?? (filterOn ? [] : models.map((model) => model.id));
+			/**
+			* What the FILTER is currently about, which is what the row's label states.
+			*
+			* Off is "everything", so the label says nothing about models rather than
+			* counting them; on names the count the filter is actually applying.
+			*/
+			const displayed = filterOn ? pickerSelection : visibility?.allowlist ?? [];
+			const format = new Intl.DateTimeFormat(void 0, {
+				dateStyle: "short",
+				timeStyle: "short"
+			});
+			/**
+			* Which model is waiting for the user to agree to a detection.
+			*
+			* Detection sends real requests against the user's own quota, so it asks
+			* first — inline, in the row the button belongs to, rather than in a modal:
+			* the question is one line about the model beside it, and a dialog for that is
+			* heavier than the action it guards.
+			*/
+			const [pending, setPending] = (0, react.useState)();
+			(0, react.useEffect)(() => {
+				if (pending !== void 0 && !(probe?.candidates ?? []).includes(pending)) setPending(void 0);
+			}, [pending, probe?.candidates]);
+			const catalogNote = catalog === void 0 ? void 0 : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+				className: "wbp-hint",
+				children: catalog.source === "live" && catalog.fetchedAt !== void 0 ? t("modelsSourceLive", { time: format.format(new Date(catalog.fetchedAt)) }) : catalog.source === "saved" && catalog.fetchedAt !== void 0 ? t("modelsSourceSaved", { time: format.format(new Date(catalog.fetchedAt)) }) : t("modelsSourceFallback")
+			});
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+				catalogNote === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+					className: "wbp-row wbp-rowFlush",
+					children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: "wbp-rowText",
+						children: catalogNote
+					})
+				}),
+				models.length === 0 || visibility === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(FilterRow, {
+					id: `wbp-filter-${variant.id}`,
+					enabled: filterOn,
+					disabled: busy,
+					label: t("filterModelsLabel"),
+					description: filterOn ? t("filterModelsHint") : t("filterModelsIdle"),
+					summary: t("filterModelsCount", {
+						ticked: displayed.length,
+						total: models.length
+					}),
+					clearLabel: t("filterModelsClear"),
+					onToggle: (next) => {
+						onStage({
+							filterOn: next,
+							allowlist: pickerSelection.length > 0 ? pickerSelection : models.map((model) => model.id)
+						});
+					},
+					onClear: () => {
+						onStage({
+							filterOn: false,
+							allowlist: displayed
+						});
+					},
+					control: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ModelPicker, {
+						id: `wbp-filter-models-${variant.id}`,
+						selected: pickerSelection,
+						labelled: displayed,
+						catalog: selectableModels(models),
+						disabled: busy,
+						label: t("filterModelsLabel"),
+						t,
+						onPick: (ids) => {
+							onStage({
+								filterOn: true,
+								allowlist: ids
+							});
+						}
+					})
+				}),
+				signedIn === void 0 && status?.status === "error" ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+					className: "wbp-rowError",
+					role: "status",
+					children: status.message
+				}) : null,
+				models.length === 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(SettingRow, {
+					title: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						className: "wbp-hint",
+						children: t("modelsEmpty")
+					}),
+					className: "wbp-rowFlush"
+				}) : models.map((model) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					className: "wbp-modelRow",
+					children: [
+						/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+							className: "wbp-modelMain",
+							children: [
+								!filterOn || models.length === 0 || pickerSelection.includes(model.id) ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: "wbp-modelFiltered",
+									title: t("filterModelsExcludedHint"),
+									"aria-label": t("filterModelsExcludedHint")
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: "wbp-modelName",
+									title: model.name,
+									children: model.name
+								}),
+								promotionChips(model, t("freeModel")).map((chip) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)(Badge, {
+									tone: "ok",
+									children: chip
+								}, chip)),
+								model.credits === void 0 ? model.rateUnknown === true ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: "wbp-hint",
+									children: t("rateUnknown")
+								}) : null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: "wbp-hint",
+									children: t("rate", { rate: model.credits })
+								})
+							]
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+							className: "wbp-modelControl",
+							children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: "wbp-modelProbeResult",
+									children: probe === void 0 || !probe.candidates.includes(model.id) ? null : (() => {
+										const result = probe.results.find((entry) => entry.id === model.id);
+										if (result === void 0) return null;
+										return /* @__PURE__ */ (0, react_jsx_runtime.jsx)(Badge, {
+											tone: "ok",
+											title: t("probeTooltipVerified", { levels: (result.efforts ?? []).join(" / ") }),
+											children: result.validation === "validating" && (result.efforts?.length ?? 0) > 0 ? result.efforts.join(" / ") : t(result.validation === "non-validating" ? "probeResultNotValidating" : "probeResultUnknown")
+										});
+									})()
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: "wbp-modelProbeAction",
+									children: probe === void 0 || !probe.candidates.includes(model.id) ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ActionButton, {
+										label: t((() => {
+											return probe.results.find((entry) => entry.id === model.id) === void 0 ? "probeStart" : "probeRedetect";
+										})()),
+										title: t("probeTooltipIdle", { model: model.name }),
+										disabled: busy || probe.running === true,
+										onClick: () => {
+											setPending(model.id);
+										}
+									})
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: "wbp-modelContext",
+									children: model.contextChoices === void 0 || model.contextChoices.length < 2 ? model.contextWindow === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+										className: "wbp-hint",
+										children: [
+											t("contextHeading"),
+											" ",
+											shortTokens(model.contextWindow)
+										]
+									}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(SegmentedField, {
+										label: `${t("contextLabel")}: ${model.name}`,
+										disabled: busy,
+										value: String(model.contextChoice ?? model.contextChoices[0] ?? 0),
+										options: model.contextChoices.map((length) => ({
+											value: String(length),
+											label: shortTokens(length),
+											title: t("contextSwitchTitle", { size: shortTokens(length) })
+										})),
+										onChange: (next) => {
+											onContext(model.id, Number(next));
+										}
+									})
+								})
+							]
+						}),
+						pending !== model.id ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: "wbp-confirmBar",
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+								className: "wbp-confirmText",
+								children: t("probeConfirmBody", { model: model.name })
+							}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+								className: "wbp-dialogActions",
+								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(ActionButton, {
+									label: t("cancel"),
+									onClick: () => {
+										setPending(void 0);
+									}
+								}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ActionButton, {
+									label: t("probeConfirmAction"),
+									tone: "primary",
+									disabled: busy || probe?.running === true,
+									onClick: () => {
+										setPending(void 0);
+										onDetect(model.id);
+									}
+								})]
+							})]
+						})
+					]
+				}, model.id))
+			] });
+		}
+		/**
+		* The model lists, one product at a time.
+		*
+		* Why one list instead of two stacked ones: the two rosters are long (twenty
+		* rows each) and share most of their model ids, so showing both doubled the page
+		* height for information a reader consults one product at a time. The switch
+		* sits where a reader already looks for the list's controls — left of Refresh,
+		* on the heading line — and slides, so flipping between the products reads as
+		* changing which list is shown rather than as reloading the page.
+		*
+		* A segmented control rather than tabs: the two products are the same kind of
+		* thing seen alternately, not two destinations. It is the platform's own
+		* segmented shape (a raised pill sliding under the selected segment), which is
+		* what every other two-way choice in this plugin already uses.
+		*/
+		function ModelsSection({ variants, statuses, probeFor, busy, t, context, stagedModels, onContext, onRefresh, onDetect, onClearProbe, onStage }) {
+			/**
+			* Which list is on screen.
+			*
+			* Seeded with the first product and then left alone: the page keeps the
+			* choice for its lifetime, because a reader flipping to the other product is
+			* doing a comparison, and a re-render that snapped back would undo it.
+			*/
+			const [shown, setShown] = (0, react.useState)(variants[0]?.id ?? "");
+			const active = variants.find((variant) => variant.id === shown) ?? variants[0];
+			const count = (variant) => {
+				const status = statuses[variant.id];
+				return status !== void 0 && status.status === "signed-in" ? status.models?.length ?? 0 : 0;
+			};
+			if (active === void 0) return null;
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)(SettingsGroup, {
+				title: t("modelsHeading"),
+				action: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [variants.length < 2 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(SegmentedField, {
+					label: t("modelsSwitchLabel"),
+					value: active.id,
+					disabled: busy,
+					options: variants.map((variant) => ({
+						value: variant.id,
+						label: variant.appName,
+						title: t("modelsSwitchTitle", {
+							product: variant.appName,
+							count: count(variant)
+						})
+					})),
+					onChange: setShown
+				}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ActionButton, {
+					label: t("modelsRefresh"),
+					disabled: busy,
+					onClick: () => {
+						onRefresh(active);
+					}
+				})] }),
+				children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ModelsBlock, {
+					variant: active,
+					status: statuses[active.id],
+					probe: probeFor(active),
+					busy,
+					t,
+					context,
+					staged: stagedModels[active.id],
+					onContext: (model, length) => {
+						onContext(active, model, length);
+					},
+					onRefresh: () => {
+						onRefresh(active);
+					},
+					onDetect: (model) => {
+						onDetect(active, model);
+					},
+					onClearProbe: () => {
+						onClearProbe(active);
+					},
+					onStage: (next) => {
+						onStage(active, next);
+					}
+				}, active.id)
+			});
+		}
+		/**
+		* The account area: one card per product, every account of that product inside
+		* the same card.
+		*
+		* Why one card per product rather than one card per account: an account is a row
+		* of the POOL, not a surface of its own. A card per account made a two-account
+		* pool look like two features, each with its own border, padding and header, and
+		* the figures a reader compares sat in separate frames. One card states the
+		* product once, its pool total once, and lists its accounts as rows — the shape
+		* every account list in this UI already uses.
+		*
+		* The products stay apart because their credits are not convertible: a shared
+		* total would be a number that describes nothing, and the two pools are never
+		* interchangeable.
+		*/
+		function AccountsSection({ entries, statuses, busy, now, t, onAdd, onAction, onRefreshAll }) {
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(SettingsGroup, {
+				title: t("accountHeading"),
+				action: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [entries.length === 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ActionButton, {
+					label: t("accountRefreshAll"),
+					disabled: busy,
+					title: t("accountRefreshAllHint"),
+					onClick: onRefreshAll
+				}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ActionButton, {
+					label: t("accountAdd"),
+					disabled: busy,
+					onClick: onAdd
+				})] }),
+				description: entries.length > 1 ? t("accountRotateHint") : t("accountEmptyHint"),
+				children: [
+					CARD_VARIANTS.map((variant) => {
+						const status = statuses[variant.id];
+						if (status === void 0 || status.status !== "error") return null;
+						return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("p", {
+							className: "wbp-rowError",
+							role: "status",
+							children: [
+								variant.appName,
+								": ",
+								status.message
+							]
+						}, variant.id);
+					}),
+					CARD_VARIANTS.map((variant) => {
+						const status = statuses[variant.id];
+						if (status === void 0 || status.status !== "signed-in" || status.desktopError === void 0) return null;
+						return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("p", {
+							className: "wbp-notice",
+							role: "status",
+							children: [
+								variant.appName,
+								": ",
+								status.desktopError
+							]
+						}, variant.id);
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: "wbp-productCards",
+						children: CARD_VARIANTS.map((variant) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ProductAccountsCard, {
+							variant,
+							accounts: entries.filter((entry) => entry.variant.id === variant.id).map((entry) => entry.account),
+							status: statuses[variant.id],
+							busy,
+							now,
+							t,
+							onAction: (action) => {
+								onAction(variant, action);
+							}
+						}, variant.id))
+					})
+				]
+			});
+		}
+		/**
+		* One product's pooled accounts, in one card.
+		*
+		* What the card states, and in which order:
+		*
+		*   [product name]                       [remaining / capacity]
+		*   [status dot] [account name]  [state]              ⋮
+		*                [grey line: 剩余 / 已用 / 请求 / token / 恢复]
+		*   …
+		*
+		* The head total is the POOL's, summed over the accounts whose balance was
+		* actually read — an account whose lookup failed contributes nothing rather
+		* than a zero, because a zero would silently shrink a figure the reader is
+		* using to decide whether they need to add another account.
+		*
+		* A product with no accounts and nothing wrong to report renders nothing: a
+		* permanent "no accounts" card for a product the user does not use turns a
+		* status list into a reminder.
+		*/
+		function ProductAccountsCard({ variant, accounts, status, busy, now, t, onAction }) {
+			const detail = status === void 0 ? void 0 : status.status === "error" ? status.message : status.status === "signed-out" ? status.reason : void 0;
+			if (accounts.length === 0 && detail === void 0) return null;
+			const known = accounts.map((account) => account.credits).filter((value) => typeof value === "number");
+			const total = known.length === 0 ? void 0 : known.reduce((sum, value) => sum + value, 0);
+			const capacity = accounts.length > 0 && accounts.every((account) => account.credits === void 0 || account.creditsTotal !== void 0) ? accounts.reduce((sum, account) => sum + (account.creditsTotal ?? 0), 0) : 0;
+			const ready = accounts.filter((account) => account.available).length;
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("section", {
+				className: "wbp-productCard",
+				"aria-label": variant.appName,
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: "wbp-productHead",
+						children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "wbp-productName",
+								children: variant.appName
+							}),
+							accounts.length === 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "wbp-productCount",
+								children: t("cardReady", {
+									ready,
+									total: accounts.length
+								})
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { className: "wbp-spacer" }),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "wbp-productTotal",
+								children: total === void 0 ? accounts.length === 0 ? "" : "—" : capacity > 0 ? t("accountMetaRemainingOf", {
+									remaining: formatCredit$1(total),
+									total: formatCredit$1(capacity)
+								}) : t("accountMetaRemaining", { remaining: formatCredit$1(total) })
+							})
+						]
+					}),
+					detail === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: "wbp-productDetail",
+						children: detail
+					}),
+					accounts.length === 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: "wbp-accountList",
+						children: accounts.map((account) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)(AccountRow$1, {
+							account,
+							busy,
+							now,
+							t,
+							onAction
+						}, account.id))
+					})
+				]
+			});
+		}
+		/**
+		* One account's check-in state, in one sentence.
+		*
+		* The record and the run answer different questions, so the line states the
+		* record first (when this account last claimed a day) and appends the most
+		* recent outcome only when it disagrees — a successful run repeats what the
+		* record already says, and saying it twice reads as two separate events.
+		*/
+		function checkinLine(row, t) {
+			const parts = [];
+			if (row.day !== void 0) parts.push(t("checkinRowDay", { day: row.day }));
+			else parts.push(t("checkinRowNever"));
+			if (row.state === "failed") parts.push(t("checkinRowFailed", { reason: row.reason ?? "" }));
+			else if (row.state === "skipped") parts.push(t("checkinRowSkipped", { reason: row.reason ?? "" }));
+			return parts.join(" · ");
+		}
+		/** The list a user picks a product from before the login dialog opens. */
+		function ProductPicker({ t, onPick, onCancel }) {
+			return (0, react_dom.createPortal)(/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+				className: "wbp-overlay",
+				role: "presentation",
+				onClick: (event) => {
+					if (event.target === event.currentTarget) onCancel();
+				},
+				children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					className: "wbp-dialog",
+					role: "dialog",
+					"aria-modal": "true",
+					"aria-label": t("accountAddTitle"),
+					children: [
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h3", {
+							className: "wbp-dialogTitle",
+							children: t("accountAddTitle")
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+							className: "wbp-dialogBody",
+							children: t("accountAddPickHint")
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)(ActionButton, {
+							label: t("accountAddCn"),
+							onClick: () => {
+								onPick(CARD_VARIANTS[0]);
+							}
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)(ActionButton, {
+							label: t("accountAddAi"),
+							onClick: () => {
+								onPick(CARD_VARIANTS[1]);
+							}
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+							className: "wbp-dialogActions",
+							children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ActionButton, {
+								label: t("cancel"),
+								onClick: onCancel
+							})
+						})
+					]
+				})
+			}), document.body);
+		}
+		/**
+		* The save bar's leading mark once there is an outcome: a circled tick or a
+		* circled bang, ported from the reference implementation's `SaveBarIcon` (same
+		* 16px viewBox, same 1.6 stroke). Drawn rather than a glyph character so it
+		* inherits the bar's tone colour and never picks up a font's own metrics.
+		*/
+		function SaveBarGlyph({ tone }) {
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("svg", {
+				viewBox: "0 0 16 16",
+				width: "16",
+				height: "16",
+				fill: "none",
+				stroke: "currentColor",
+				strokeWidth: "1.6",
+				strokeLinecap: "round",
+				strokeLinejoin: "round",
+				"aria-hidden": "true",
+				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("circle", {
+					cx: "8",
+					cy: "8",
+					r: "6.5"
+				}), tone === "success" ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("path", { d: "M5.2 8.2l1.9 1.9 3.7-3.9" }) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("path", { d: "M8 4.8v3.6M8 11.1v.1" })]
+			});
+		}
+		/**
+		* The sign-in dialog for one product.
+		*
+		* Both products offer a browser sign-in and a pasted token. Only the CN product
+		* offers the scannable code: the international QR endpoint answers, but there is
+		* no app on a phone that completes it, so showing a code would be offering a
+		* path that cannot be walked. The international product's browser route is
+		* therefore a plain link to its console rather than a QR.
+		*
+		* The browser route only *starts* a sign-in — it is the console, and the plugin
+		* cannot observe what happens there. So the token half is not a fallback for it
+		* but its other half: the user signs in on the web, copies the token, and pastes
+		* it. The copy says so rather than leaving the two tabs unexplained.
+		*/
+		function AddAccountDialog({ variant, t, busy, error, onCancel, onSubmitQr, onPollQr, onSubmitToken, onSubmitDesktop, onOpenLink }) {
+			const qrSupported = variant.id === "workbuddy";
+			const [mode, setMode] = (0, react.useState)(qrSupported ? "qr" : "web");
+			const [challenge, setChallenge] = (0, react.useState)();
+			/**
+			* Whether the last hand-off failed.
+			*
+			* A hand-off can only fail in one place (the browser route, where the dialog
+			* itself asks for the page), and when it does the address has to reach the
+			* user: every strategy in the chain is silent by design, so without this the
+			* dialog would keep a button that appears to work and does not.
+			*/
+			const [linkFailed, setLinkFailed] = (0, react.useState)(false);
+			const [token, setToken] = (0, react.useState)("");
+			const [remaining, setRemaining] = (0, react.useState)(0);
+			const stopped = (0, react.useRef)(false);
+			/**
+			* Whether this dialog has already asked for a challenge.
+			*
+			* A ref, not the `challenge` state: a failed `add` answers with no challenge
+			* at all, so keying the effect on the state alone would re-run it on every
+			* render the failure caused, firing `add` in a loop. The dialog asks once per
+			* opening and offers the explicit actions below after that.
+			*/
+			const asked = (0, react.useRef)(false);
+			/**
+			* Whether this dialog has already tried the desktop option.
+			*
+			* Same one-shot rule as `asked`: reading the app's file is a real action (it
+			* clears any earlier removal), so it happens once per opening and the error
+			* below is how a failure is reported.
+			*/
+			const askedDesktop = (0, react.useRef)(false);
+			/**
+			* Mint a challenge as soon as a route that needs one is shown.
+			*
+			* Both routes do: the code route renders the URL as a QR, and the browser
+			* route opens it. That is what makes the browser route a real sign-in rather
+			* than a link to a marketing page — the `authUrl` the host mints *is* the
+			* product's login page, carrying the state the host is already polling.
+			*/
+			(0, react.useEffect)(() => {
+				if (mode !== "qr" && mode !== "web" || asked.current) return;
+				asked.current = true;
+				stopped.current = false;
+				onSubmitQr().then((next) => {
+					if (stopped.current || next === void 0) return;
+					setChallenge(next);
+				});
+			}, [mode, onSubmitQr]);
+			/**
+			* Try the desktop option as soon as it is chosen.
+			*
+			* Reading the app's own file is fast and local, so a button would only repeat
+			* the choice the segment already made; a failure surfaces through `error`
+			* below and the user can pick another route.
+			*/
+			(0, react.useEffect)(() => {
+				if (mode !== "desktop" || askedDesktop.current) return;
+				askedDesktop.current = true;
+				onSubmitDesktop();
+			}, [mode, onSubmitDesktop]);
+			/**
+			* Open the minted login page in the system browser, once.
+			*
+			* Automatic rather than behind a button: the user already chose "sign in on
+			* the web", so making them click again to reach the page that choice names
+			* would be asking the same question twice. A ref keeps a re-render from
+			* opening a second tab.
+			*/
+			const opened = (0, react.useRef)(false);
+			(0, react.useEffect)(() => {
+				if (mode !== "web" || challenge === void 0 || opened.current) return;
+				opened.current = true;
+				onOpenLink(challenge.authUrl).then((opened) => {
+					if (!opened) setLinkFailed(true);
+				});
+			}, [
+				mode,
+				challenge,
+				onOpenLink
+			]);
+			(0, react.useEffect)(() => {
+				if (challenge === void 0) return;
+				setLinkFailed(false);
+				setRemaining(Math.max(0, challenge.expiresAtMs - Date.now()));
+				const tick = window.setInterval(() => {
+					setRemaining(Math.max(0, challenge.expiresAtMs - Date.now()));
+				}, 1e3);
+				return () => {
+					window.clearInterval(tick);
+				};
+			}, [challenge]);
+			(0, react.useEffect)(() => {
+				if (challenge === void 0 || stopped.current) return;
+				const poll = window.setInterval(() => {
+					onPollQr(challenge.state).then((keep) => {
+						if (!keep) stopped.current = true;
+					});
+				}, POLL_INTERVAL_MS);
+				return () => {
+					window.clearInterval(poll);
+				};
+			}, [challenge, onPollQr]);
+			(0, react.useEffect)(() => {
+				const onKey = (event) => {
+					if (event.key === "Escape") onCancel();
+				};
+				window.addEventListener("keydown", onKey);
+				return () => {
+					window.removeEventListener("keydown", onKey);
+				};
+			}, [onCancel]);
+			(0, react.useEffect)(() => () => {
+				stopped.current = true;
+			}, []);
+			return (0, react_dom.createPortal)(/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+				className: "wbp-overlay",
+				role: "presentation",
+				onClick: (event) => {
+					if (event.target === event.currentTarget) onCancel();
+				},
+				children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					className: "wbp-dialog",
+					role: "dialog",
+					"aria-modal": "true",
+					"aria-label": variant.appName,
+					children: [
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h3", {
+							className: "wbp-dialogTitle",
+							children: t("accountAddTitle")
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+							className: "wbp-dialogActions",
+							style: { justifyContent: "center" },
+							children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(SegmentedField, {
+								label: t("accountActionLogin"),
+								value: mode,
+								options: qrSupported ? [
+									{
+										value: "qr",
+										label: t("accountLoginQr")
+									},
+									{
+										value: "desktop",
+										label: t("accountLoginDesktop")
+									},
+									{
+										value: "token",
+										label: t("accountLoginToken")
+									}
+								] : [
+									{
+										value: "web",
+										label: t("accountLoginWeb")
+									},
+									{
+										value: "desktop",
+										label: t("accountLoginDesktop")
+									},
+									{
+										value: "token",
+										label: t("accountLoginToken")
+									}
+								],
+								onChange: (next) => {
+									setMode(next);
+								}
+							})
+						}),
+						!linkFailed || challenge === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: "wbp-linkFallback",
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+								className: "wbp-dialogBody",
+								children: t("accountOpenLinkFailed")
+							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+								className: "wbp-input",
+								readOnly: true,
+								value: challenge.authUrl,
+								"aria-label": t("accountOpenLink"),
+								onFocus: (event) => {
+									event.currentTarget.select();
+								}
+							})]
+						}),
+						mode === "desktop" ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+							className: "wbp-dialogBody",
+							children: t("accountDesktopBody")
+						}), busy ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: "wbp-hint",
+							children: t("loading")
+						}) : null] }) : mode === "qr" ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+								className: "wbp-dialogBody",
+								children: t("accountAddBody")
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+								className: "wbp-qrFrame",
+								children: challenge === void 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: "wbp-hint",
+									children: t("loading")
+								}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(QrCanvas, {
+									text: challenge.authUrl,
+									modulePixels: 232
+								})
+							}),
+							challenge === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+								className: "wbp-dialogBody",
+								children: t("accountAddWaiting", { seconds: Math.ceil(remaining / 1e3) })
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+								className: "wbp-dialogActions",
+								children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ActionButton, {
+									label: t("accountOpenLink"),
+									disabled: challenge === void 0,
+									onClick: () => {
+										if (challenge === void 0) return;
+										onOpenLink(challenge.authUrl).then((opened) => {
+											setLinkFailed(!opened);
+										});
+									}
+								})
+							})
+						] }) : mode === "web" ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+								className: "wbp-dialogBody",
+								children: t("accountWebBody")
+							}),
+							challenge === void 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "wbp-hint",
+								children: t("loading")
+							}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+								className: "wbp-dialogBody",
+								children: t("accountWebWaiting", { seconds: Math.ceil(remaining / 1e3) })
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+								className: "wbp-dialogActions",
+								children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ActionButton, {
+									label: t("accountOpenLink"),
+									disabled: challenge === void 0,
+									onClick: () => {
+										if (challenge === void 0) return;
+										onOpenLink(challenge.authUrl).then((opened) => {
+											setLinkFailed(!opened);
+										});
+									}
+								})
+							})
+						] }) : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+								className: "wbp-dialogBody",
+								children: t("accountTokenBody")
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("textarea", {
+								className: "wbp-tokenArea",
+								value: token,
+								placeholder: t("accountTokenPlaceholder"),
+								spellCheck: false,
+								onChange: (event) => {
+									setToken(event.target.value);
+								}
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+								className: "wbp-dialogActions",
+								children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ActionButton, {
+									label: busy ? t("accountChecking") : t("accountSubmit"),
+									tone: "primary",
+									disabled: busy || token.trim() === "",
+									onClick: () => {
+										onSubmitToken(token);
+									}
+								})
+							})
+						] }),
+						error === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+							className: "wbp-rowError",
+							children: error
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+							className: "wbp-dialogActions",
+							children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ActionButton, {
+								label: t("cancel"),
+								onClick: onCancel
+							})
+						})
+					]
+				})
+			}), document.body);
+		}
+		/**
+		* The page itself: one card, two product blocks.
+		*
+		* Each product is driven by its own status document, so a failure or a slow
+		* answer on one never blocks or blanks the other.
+		*/
+		function WorkBuddySettingsPage({ t, context, refreshPanel }) {
+			const [statuses, setStatuses] = (0, react.useState)(() => {
+				const cached = {};
+				for (const variant of CARD_VARIANTS) {
+					const document = readCachedStatus(variant.id);
+					if (document !== void 0) cached[variant.id] = document;
+				}
+				return cached;
+			});
+			const [busy, setBusy] = (0, react.useState)(false);
+			const [error, setError] = (0, react.useState)();
+			const [picking, setPicking] = (0, react.useState)(false);
+			const [adding, setAdding] = (0, react.useState)();
+			const [now, setNow] = (0, react.useState)(() => Date.now());
+			/**
+			* Uncommitted model filters, one per product.
+			*
+			* The settings page collects model edits and writes them on Save, matching the
+			* reference implementation's staged form: assembling "only these models" is a
+			* multi-step decision (open the picker, search, tick, close), and a page that
+			* wrote on every close would put three intermediate filters into the host's
+			* store on the way to the one the user meant. A per-product map rather than a
+			* single draft because the two products' filters are independent rows on one
+			* page, and staging one must not discard the other.
+			*
+			* Each entry is ABSOLUTE, not a patch: `allowlist.length === 0` is the "no
+			* filter" state, so there is no precedence puzzle between the draft and the
+			* document.
+			*/
+			const [stagedModels, setStagedModels] = (0, react.useState)({});
+			/** True while the staged edits are being written; the bar says so. */
+			const [saving, setSaving] = (0, react.useState)(false);
+			/**
+			* An informational line about what a save actually did.
+			*
+			* Not `error`: the old-host path is a downgrade, not a failure — the filter is
+			* in force, it is just stored as a hide list. Rendering it as an error would
+			* turn the save bar red and (worse) hide the "Saved" acknowledgement that says
+			* the write landed.
+			*/
+			const [notice, setNotice] = (0, react.useState)();
+			/** True for the moment after a save landed, which is all the bar needs to say. */
+			const [justSaved, setJustSaved] = (0, react.useState)(false);
+			const mounted = (0, react.useRef)(true);
+			/**
+			* The latest documents, readable from a callback that must not re-create
+			* itself: `readAll` is a dependency of the polling effect, so rebuilding it on
+			* every document would restart the interval on every sweep.
+			*/
+			const statusesRef = (0, react.useRef)(statuses);
+			statusesRef.current = statuses;
+			(0, react.useEffect)(() => {
+				mounted.current = true;
+				return () => {
+					mounted.current = false;
+				};
+			}, []);
+			(0, react.useEffect)(() => {
+				const tick = window.setInterval(() => {
+					setNow(Date.now());
+				}, 3e4);
+				return () => {
+					window.clearInterval(tick);
+				};
+			}, []);
+			/**
+			* Let the "Saved" state retire on its own.
+			*
+			* The bar exists to be noticed and then to get out of the way: a save that
+			* landed has nothing left to act on, and a bar that stayed until the next
+			* click would sit over the page's last rows for as long as the reader is
+			* reading. A timer rather than a dismiss button for the same reason —
+			* confirming a confirmation is one interaction too many.
+			*/
+			(0, react.useEffect)(() => {
+				if (!justSaved) return;
+				const timer = window.setTimeout(() => {
+					setJustSaved(false);
+				}, 3e3);
+				return () => {
+					window.clearTimeout(timer);
+				};
+			}, [justSaved]);
+			const readAll = (0, react.useCallback)(async (signal) => {
+				const answers = await Promise.all(CARD_VARIANTS.map(async (variant) => {
+					const result = await readWorkBuddyStatus(variant, signal);
+					if (result.state === "unreadable") return void 0;
+					if (result.state === "refused") return [variant.id, {
+						status: "error",
+						message: result.message
+					}];
+					return [variant.id, result.status];
+				}));
+				if (!mounted.current || signal?.aborted === true) return;
+				const next = { ...statusesRef.current };
+				for (const answer of answers) {
+					if (answer === void 0) continue;
+					next[answer[0]] = answer[1];
+					writeCachedStatus(answer[0], answer[1]);
+				}
+				statusesRef.current = next;
+				setStatuses(next);
+			}, []);
+			(0, react.useEffect)(() => {
+				const controller = new AbortController();
+				readAll(controller.signal);
+				const tick = window.setInterval(() => {
+					readAll(controller.signal);
+				}, REFRESH_INTERVAL_MS$1);
+				return () => {
+					window.clearInterval(tick);
+					controller.abort();
+				};
+			}, [readAll]);
+			/** The control key, which the status documents hand out in both sign-in states. */
+			const keyFor = (0, react.useCallback)((variant) => {
+				const status = statuses[variant.id];
+				return status !== void 0 && "probeKey" in status ? status.probeKey : void 0;
+			}, [statuses]);
+			/**
+			* Why this product cannot be written to right now, in the host's own words.
+			*
+			* The control key arrives with the status document, so a read that failed (or a
+			* signed-out host) leaves the page unable to POST anything. That used to be
+			* reported as a bare "request failed" — the reported symptom when adding the
+			* international product — even though the host had said exactly what was wrong
+			* and the sentence was sitting in the response body.
+			*/
+			const blockedReason = (0, react.useCallback)((variant) => {
+				const status = statuses[variant.id];
+				if (status === void 0) return void 0;
+				if (status.status === "error") return status.message;
+				if (status.status === "signed-out") return status.reason;
+			}, [statuses]);
+			const run = (0, react.useCallback)(async (variant, action) => {
+				const key = keyFor(variant);
+				if (key === void 0) {
+					setError(blockedReason(variant) ?? t("requestFailed"));
+					return;
+				}
+				const response = await fetch(variant.accountPath, {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						"X-WorkBuddy-Probe-Key": key
+					},
+					credentials: "same-origin",
+					body: JSON.stringify(action)
+				});
+				const value = await response.json().catch(() => void 0);
+				if (!response.ok) {
+					const message = typeof value === "object" && value !== null && "error" in value ? String(value["error"]) : `HTTP ${String(response.status)}`;
+					setError(message);
+					return;
+				}
+				return value;
+			}, [keyFor, t]);
+			const submitQr = (0, react.useCallback)(async (variant) => {
+				setError(void 0);
+				setBusy(true);
+				try {
+					const result = await run(variant, { action: "add" });
+					if (result?.challenge === void 0) {
+						setError(result?.reason ?? t("requestFailed"));
+						return;
+					}
+					return result.challenge;
+				} finally {
+					if (mounted.current) setBusy(false);
+				}
+			}, [run, t]);
+			/**
+			* Hand one sign-in page to the user's own browser.
+			*
+			* The chain lives in `open-external`; what this adds is the two facts only
+			* the page has — which route serves the product the dialog is open for, and
+			* the control key that proves this page was the one the host talked to. A
+			* signed-out host hands out no key, so the host strategy is simply skipped and
+			* the chain falls through to the browser's own APIs.
+			*
+			* Returns whether the link was handed off at all, so the dialog can name the
+			* address instead of leaving the user with a button that did nothing.
+			*/
+			const openSignInPage = (0, react.useCallback)(async (variant, url) => {
+				const key = keyFor(variant);
+				const options = { probePath: variant.probePath };
+				if (key !== void 0) options.key = key;
+				if (context !== void 0) options.context = context;
+				return openExternalLink(url, options);
+			}, [context, keyFor]);
+			const pollQr = (0, react.useCallback)(async (variant, state) => {
+				const result = await run(variant, {
+					action: "poll",
+					state
+				});
+				if (result === void 0) return false;
+				if (result.state === "waiting") return true;
+				if (result.state === "added") {
+					setAdding(void 0);
+					setError(void 0);
+					await readAll();
+					return false;
+				}
+				setError(result.reason ?? t(result.state === "expired" ? "accountQrExpired" : "accountQrInvalid"));
+				return false;
+			}, [
+				readAll,
+				run,
+				t
+			]);
+			const submitToken = (0, react.useCallback)(async (variant, token) => {
+				setError(void 0);
+				setBusy(true);
+				try {
+					const result = await run(variant, {
+						action: "add-cookie",
+						token
+					});
+					if (result === void 0) return false;
+					if (result.state !== "added") {
+						setError(result.reason ?? t("requestFailed"));
+						return false;
+					}
+					setAdding(void 0);
+					await readAll();
+					return true;
+				} finally {
+					if (mounted.current) setBusy(false);
+				}
+			}, [
+				readAll,
+				run,
+				t
+			]);
+			const submitDesktop = (0, react.useCallback)(async (variant) => {
+				setError(void 0);
+				setBusy(true);
+				try {
+					const result = await run(variant, { action: "adopt-desktop" });
+					if (result === void 0) return false;
+					if (result.state !== "added") {
+						setError(result.reason ?? t("requestFailed"));
+						return false;
+					}
+					setAdding(void 0);
+					await readAll();
+					return true;
+				} finally {
+					if (mounted.current) setBusy(false);
+				}
+			}, [
+				readAll,
+				run,
+				t
+			]);
+			/**
+			* Ask the host to re-fetch this product's model list.
+			*
+			* Shares the probe route's `refresh` action rather than the account route:
+			* the work is a catalog fetch, and that is what the probe route already does.
+			*/
+			const refreshModels = (0, react.useCallback)((variant) => {
+				const key = keyFor(variant);
+				if (key === void 0) return;
+				setBusy(true);
+				setError(void 0);
+				fetch(variant.probePath, {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						"X-WorkBuddy-Probe-Key": key
+					},
+					credentials: "same-origin",
+					body: JSON.stringify({ action: "refresh" })
+				}).then(async (response) => {
+					const value = await response.json().catch(() => void 0);
+					if (!response.ok) setError(`HTTP ${String(response.status)}`);
+					else if (typeof value === "object" && value !== null && "state" in value && value.state === "failed") setError(String(value["reason"] ?? t("requestFailed")));
+					await readAll();
+				}).catch((cause) => {
+					setError(cause instanceof Error ? cause.message : t("requestFailed"));
+				}).finally(() => {
+					if (mounted.current) setBusy(false);
+				});
+			}, [
+				keyFor,
+				readAll,
+				t
+			]);
+			/**
+			* Detect one model's reasoning levels.
+			*
+			* A write on the probe route, beside its `refresh`: the probe endpoint owns
+			* detection, and the account route owns the pool. Returns nothing — the
+			* re-read afterwards is what updates the row.
+			*/
+			const probeAction = (0, react.useCallback)((variant, body) => {
+				const key = keyFor(variant);
+				if (key === void 0) return;
+				setBusy(true);
+				setError(void 0);
+				fetch(variant.probePath, {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						"X-WorkBuddy-Probe-Key": key
+					},
+					credentials: "same-origin",
+					body: JSON.stringify(body)
+				}).then(async (response) => {
+					const value = await response.json().catch(() => void 0);
+					if (!response.ok) setError(`HTTP ${String(response.status)}`);
+					else if (typeof value === "object" && value !== null && "state" in value && value.state === "unavailable") setError(String(value["reason"] ?? t("requestFailed")));
+					await readAll();
+				}).catch((cause) => {
+					setError(cause instanceof Error ? cause.message : t("requestFailed"));
+				}).finally(() => {
+					if (mounted.current) setBusy(false);
+				});
+			}, [
+				keyFor,
+				readAll,
+				t
+			]);
+			/**
+			* Stage one product's model filter, or discard with `undefined`.
+			*
+			* Staging is pure local state: nothing here talks to the host, which is the
+			* point of the save bar. A discard drops this product's entry and leaves the
+			* other product's alone.
+			*/
+			const stageModels = (0, react.useCallback)((variant, next) => {
+				setJustSaved(false);
+				setError(void 0);
+				setNotice(void 0);
+				setStagedModels((current) => {
+					if (next === void 0) {
+						if (!(variant.id in current)) return current;
+						const { [variant.id]: _dropped, ...rest } = current;
+						return rest;
+					}
+					return {
+						...current,
+						[variant.id]: next
+					};
+				});
+			}, []);
+			/** Discard every staged model edit, for the bar's Discard. */
+			const discardStaged = (0, react.useCallback)(() => {
+				setStagedModels({});
+				setError(void 0);
+				setJustSaved(false);
+			}, []);
+			/**
+			* Re-read every account's balance and state, for every product that has one.
+			*
+			* One write per variant rather than per account: the host's `refresh-credits`
+			* drops that variant's whole cached credit map, so the next status read spends
+			* one billing request per account — which is exactly what the user asked for
+			* by pressing this, and what the ordinary minute-long sweep deliberately does
+			* not do.
+			*
+			* Only the account section is refreshed. The model catalogs have their own
+			* per-product Refresh buttons beside their headings, and folding them in here
+			* would make one button answer two different questions (and spend an upstream
+			* catalog request nobody asked for).
+			*
+			* A variant with no key (no document answered, or an older host withholding
+			* the control key) is skipped rather than reported as a failure: the page is
+			* already saying that product cannot be read, and this button is not the place
+			* for a second copy of that sentence.
+			*/
+			const refreshAllAccounts = (0, react.useCallback)(() => {
+				const targets = CARD_VARIANTS.map((variant) => ({
+					variant,
+					key: keyFor(variant)
+				})).filter((target) => target.key !== void 0);
+				if (targets.length === 0) {
+					setError(t("requestFailed"));
+					return;
+				}
+				setBusy(true);
+				setError(void 0);
+				setNotice(void 0);
+				Promise.all(targets.map(async ({ variant, key }) => {
+					try {
+						const response = await fetch(variant.accountPath, {
+							method: "POST",
+							headers: {
+								"Content-Type": "application/json",
+								"X-WorkBuddy-Probe-Key": key
+							},
+							credentials: "same-origin",
+							body: JSON.stringify({ action: "refresh-credits" })
+						});
+						const value = await response.json().catch(() => void 0);
+						if (!response.ok) return "HTTP " + String(response.status);
+						if (typeof value === "object" && value !== null && "state" in value && value.state === "failed") return String(value["reason"] ?? t("requestFailed"));
+						return;
+					} catch (cause) {
+						return cause instanceof Error ? cause.message : t("requestFailed");
+					}
+				})).then(async (failures) => {
+					const first = failures.find((failure) => failure !== void 0);
+					if (first !== void 0) setError(first);
+					await readAll();
+					refreshPanel?.();
+				}).catch((cause) => {
+					setError(cause instanceof Error ? cause.message : t("requestFailed"));
+				}).finally(() => {
+					if (mounted.current) setBusy(false);
+				});
+			}, [
+				keyFor,
+				readAll,
+				refreshPanel,
+				t
+			]);
+			const accountAction = (0, react.useCallback)((variant, action) => {
+				setError(void 0);
+				setBusy(true);
+				run(variant, action).then(async (result) => {
+					if (result === void 0) return;
+					if (result.state === "failed") setError(result.reason ?? t("requestFailed"));
+					else if (action.action === "test" && result.test !== void 0) setError(result.test.ok ? void 0 : `${t("accountTestFailed")}: ${result.test.message}`);
+					await readAll();
+					refreshPanel?.();
+				}).finally(() => {
+					if (mounted.current) setBusy(false);
+				});
+			}, [
+				readAll,
+				refreshPanel,
+				run,
+				t
+			]);
+			/**
+			* The preference values this page has just written, before the re-read lands.
+			*
+			* A write is a round trip plus a full re-read of both products' status routes,
+			* and the re-read is the slow half: each route re-reads its pool, and on a
+			* cold credit cache that is a billing request per account (measured here at
+			* 0.35s for the CN route and 1.3s for the international one). Staging the
+			* control's own value locally makes the switch move in the same click, and the
+			* document replaces it when it arrives — the same "paint first, confirm after"
+			* shape the status cache uses.
+			*
+			* Only the fields this page OWNS are staged; anything the host computes stays
+			* whatever the document says.
+			*/
+			/**
+			* Which product's model list the page shows.
+			*
+			* The two rosters are long (twenty rows each) and share most of their ids, so
+			* stacking them doubled the page for no gain: a reader works on ONE product's
+			* list at a time. A switch instead of tabs because the two are the same kind of
+			* thing seen alternately, not two destinations.
+			*
+			* Default follows the pool: the first product that actually has a model list.
+			* A product with no models shows its empty state rather than a blank panel.
+			*/
+			const [modelsShown, setModelsShown] = (0, react.useState)(CARD_VARIANTS[0]?.id ?? "");
+			const [writtenPreferences, setWrittenPreferences] = (0, react.useState)({});
+			/** The bucket this product's preferences are keyed by, when the document has one. */
+			const visibilityAccount = (0, react.useCallback)((variant) => {
+				const status = statuses[variant.id];
+				return status === void 0 || !("visibility" in status) ? void 0 : status.visibility?.account;
+			}, [statuses]);
+			/** The catalog rows the document currently publishes for one product. */
+			const catalogIds = (0, react.useCallback)((variant) => {
+				const status = statuses[variant.id];
+				return status === void 0 || !("models" in status) ? [] : (status.models ?? []).map((model) => model.id);
+			}, [statuses]);
+			/**
+			* Replace one product's model filter.
+			*
+			* A write on the probe route, beside the per-model visibility toggle: the two
+			* edit different lists on the host (the hide-list and the allowlist), so one
+			* cannot be expressed as the other. The account the document was rendered from
+			* travels with the request — the host refuses a write aimed at a different
+			* account than the one signed in, which is what keeps a stale page from
+			* landing A's filter in B's bucket.
+			*
+			* Reports WHICH failure it was, because the caller answers them differently: an
+			* unrecognized action is a host old enough to predate the feature, and that has
+			* a working alternative (the per-model hide list — see {@link applyFilterByHiding});
+			* anything else is an error the user has to read.
+			*/
+			const allowlistAction = (0, react.useCallback)((variant, ids) => {
+				const key = keyFor(variant);
+				const account = visibilityAccount(variant);
+				if (key === void 0 || account === void 0) return Promise.resolve("failed");
+				setBusy(true);
+				setError(void 0);
+				return fetch(variant.probePath, {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						"X-WorkBuddy-Probe-Key": key
+					},
+					credentials: "same-origin",
+					body: JSON.stringify({
+						action: "set-model-allowlist",
+						allowlist: ids,
+						account
+					})
+				}).then(async (response) => {
+					const value = await response.json().catch(() => void 0);
+					if (!response.ok) {
+						setError(response.status === 400 || response.status === 404 ? t("filterModelsUnsupported") : `HTTP ${String(response.status)}`);
+						await readAll();
+						return response.status === 400 || response.status === 404 ? "unsupported" : "failed";
+					}
+					if (typeof value === "object" && value !== null && "state" in value && value.state !== "updated") {
+						setError(String(value["reason"] ?? t("requestFailed")));
+						await readAll();
+						return "failed";
+					}
+					await readAll();
+					return "updated";
+				}).catch((cause) => {
+					setError(cause instanceof Error ? cause.message : t("requestFailed"));
+					return "failed";
+				}).finally(() => {
+					if (mounted.current) setBusy(false);
+				});
+			}, [
+				keyFor,
+				readAll,
+				t,
+				visibilityAccount
+			]);
+			/**
+			* Enforce a filter through the per-model hide list, for a host that does not
+			* know the allowlist action.
+			*
+			* The hide list is the plugin's oldest visibility write and every host build
+			* has it, so this is the one way to make the switch work TODAY rather than
+			* after a DSH restart. It is a translation, not the same write: `disabled`
+			* names what to hide rather than what to keep, so the unticked models are
+			* hidden and every ticked one is shown again. Applying the filter twice must
+			* be idempotent (it is the same two sets), and the tick list itself is not
+			* stored — this host has nowhere to put it — so the selection is derived from
+			* the hide list on the next read.
+			*
+			* Unfiltering (the switch going off) shows every model the catalog names,
+			* which is what "show everything" means here.
+			*/
+			const applyFilterByHiding = (0, react.useCallback)(async (variant, ids) => {
+				const key = keyFor(variant);
+				const account = visibilityAccount(variant);
+				const catalog = catalogIds(variant);
+				if (key === void 0 || account === void 0 || catalog.length === 0) return false;
+				const keep = new Set(ids);
+				const writes = catalog.map((model) => ({
+					model,
+					visible: keep.has(model)
+				}));
+				const results = await Promise.all(writes.map(async (write) => {
+					try {
+						return (await fetch(variant.probePath, {
+							method: "POST",
+							headers: {
+								"Content-Type": "application/json",
+								"X-WorkBuddy-Probe-Key": key
+							},
+							credentials: "same-origin",
+							body: JSON.stringify({
+								action: "set-model-visibility",
+								model: write.model,
+								visible: write.visible,
+								account
+							})
+						})).ok;
+					} catch {
+						return false;
+					}
+				}));
+				await readAll();
+				return results.every(Boolean);
+			}, [
+				catalogIds,
+				keyFor,
+				readAll,
+				visibilityAccount
+			]);
+			/**
+			* Write one plugin-wide sidebar preference.
+			*
+			* An IMMEDIATE write, unlike the model filter beside it: both of these change
+			* how an always-visible surface is drawn, and staging them would leave the
+			* sidebar keeping a card (or stating the credit one way) while the control
+			* claims the other. The value comes back on the next status read, which is
+			* what redraws the card.
+			*
+			* One helper for all three preferences because they are one wire shape — an
+			* action plus its value — and because the failure handling is the part that
+			* must not drift between them: a 400/404 means this host does not know the
+			* action, and that is the same story whichever control asked.
+			*/
+			const writeSidebarPreference = (0, react.useCallback)((body, staged) => {
+				const variant = CARD_VARIANTS[0];
+				const key = variant === void 0 ? void 0 : keyFor(variant);
+				if (variant === void 0 || key === void 0) {
+					setError(blockedReason(variant ?? CARD_VARIANTS[1]) ?? t("requestFailed"));
+					return;
+				}
+				setWrittenPreferences((current) => ({
+					...current,
+					...staged
+				}));
+				setError(void 0);
+				setNotice(void 0);
+				fetch(variant.probePath, {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						"X-WorkBuddy-Probe-Key": key
+					},
+					credentials: "same-origin",
+					body: JSON.stringify(body)
+				}).then(async (response) => {
+					const value = await response.json().catch(() => void 0);
+					if (!response.ok) {
+						setError(response.status === 400 || response.status === 404 ? t("sidebarSettingUnsupported") : "HTTP " + String(response.status));
+						setWrittenPreferences({});
+					} else if (typeof value === "object" && value !== null && "state" in value && value.state !== "updated") {
+						setError(String(value["reason"] ?? t("requestFailed")));
+						setWrittenPreferences({});
+					}
+					refreshPanel?.();
+				}).catch((cause) => {
+					setError(cause instanceof Error ? cause.message : t("requestFailed"));
+					setWrittenPreferences({});
+				});
+			}, [
+				blockedReason,
+				keyFor,
+				readAll,
+				refreshPanel,
+				t
+			]);
+			/**
+			* Claim one account's daily check-in now.
+			*
+			* A write that spends a round trip rather than credit, so it needs the same
+			* in-process key as the other actions but no confirmation step: the upstream
+			* is idempotent, and re-asking after "already" costs nothing.
+			*/
+			const checkInAccount = (0, react.useCallback)((variant, accountId) => {
+				const key = keyFor(variant);
+				if (key === void 0) return;
+				setBusy(true);
+				setError(void 0);
+				fetch(variant.probePath, {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						"X-WorkBuddy-Probe-Key": key
+					},
+					credentials: "same-origin",
+					body: JSON.stringify({
+						action: "check-in",
+						account: accountId
+					})
+				}).then(async (response) => {
+					const value = await response.json().catch(() => void 0);
+					if (!response.ok) setError("HTTP " + String(response.status));
+					else if (typeof value === "object" && value !== null && "state" in value && value.state === "failed") setError(String(value["reason"] ?? t("requestFailed")));
+					await readAll();
+				}).catch((cause) => {
+					setError(cause instanceof Error ? cause.message : t("requestFailed"));
+				}).finally(() => {
+					if (mounted.current) setBusy(false);
+				});
+			}, [
+				keyFor,
+				readAll,
+				t
+			]);
+			/** Toggle the daily check-in preference. */
+			const setCheckinAuto = (0, react.useCallback)((enabled) => {
+				writeSidebarPreference({
+					action: "set-checkin-auto",
+					enabled
+				}, { checkinAuto: enabled });
+			}, [writeSidebarPreference]);
+			/** Store the sidebar's credit-line style. */
+			const setCreditStyle = (0, react.useCallback)((style) => {
+				writeSidebarPreference({
+					action: "set-sidebar-credit-style",
+					creditStyle: style
+				}, { creditStyle: style });
+			}, [writeSidebarPreference]);
+			/**
+			* Show or hide the sidebar's credit card.
+			*
+			* The one preference on this page that removes a surface rather than
+			* reshaping it, which is why the group grows a way into the dashboard while it
+			* is off: the card is the plugin's only other route there.
+			*/
+			const setCreditVisible = (0, react.useCallback)((visible) => {
+				writeSidebarPreference({
+					action: "set-sidebar-credit-visible",
+					enabled: visible
+				}, { creditVisible: visible });
+			}, [writeSidebarPreference]);
+			/**
+			* Show or hide the composer dock's credit badge.
+			*
+			* A separate switch from the sidebar card above because it removes a different
+			* surface in a different place: the two are independent by design, and neither
+			* implies the other.
+			*/
+			const setComposerCreditVisible = (0, react.useCallback)((visible) => {
+				writeSidebarPreference({
+					action: "set-composer-credit-visible",
+					enabled: visible
+				}, { composerVisible: visible });
+			}, [writeSidebarPreference]);
+			/**
+			* Show or hide the composer's reasoning-detection control.
+			*
+			* The third composer switch: the badge reports a balance, this control offers
+			* to spend credit detecting a model, and the two are separate surfaces a user
+			* may want independently.
+			*/
+			const setProbeControlVisible = (0, react.useCallback)((visible) => {
+				writeSidebarPreference({
+					action: "set-probe-control-visible",
+					enabled: visible
+				}, { probeControlVisible: visible });
+			}, [writeSidebarPreference]);
+			/**
+			* Write every staged model filter.
+			*
+			* All-or-nothing in what it REPORTS rather than in what it sends: each
+			* product's write goes out on its own (they are independent rows, and one
+			* failing must not silently drop the other), and the bar clears only when
+			* every write landed — a half-applied save stays visible as unsaved work
+			* instead of leaving the page claiming a state the host does not have.
+			*
+			* `allowlistAction` already surfaces the refusal (HTTP status, host reason,
+			* or the "this host does not know the action" copy for a 400/404), which is
+			* what the page's error line renders.
+			*/
+			const saveStaged = (0, react.useCallback)(() => {
+				const entries = CARD_VARIANTS.flatMap((variant) => {
+					const staged = stagedModels[variant.id];
+					return staged === void 0 ? [] : [{
+						variant,
+						staged
+					}];
+				});
+				if (entries.length === 0) return;
+				setSaving(true);
+				setError(void 0);
+				setNotice(void 0);
+				setJustSaved(false);
+				Promise.all(entries.map(async (entry) => {
+					const ids = entry.staged.filterOn ? entry.staged.allowlist : [];
+					const result = await allowlistAction(entry.variant, ids);
+					if (result !== "unsupported") return result === "updated";
+					const applied = await applyFilterByHiding(entry.variant, ids);
+					if (applied) {
+						setError(void 0);
+						setNotice(t("filterModelsFallback"));
+					}
+					return applied;
+				})).then((results) => {
+					if (!mounted.current) return;
+					if (results.every(Boolean)) {
+						setStagedModels({});
+						setJustSaved(true);
+					}
+				}).catch((cause) => {
+					setError(cause instanceof Error ? cause.message : t("requestFailed"));
+				}).finally(() => {
+					if (mounted.current) setSaving(false);
+				});
+			}, [
+				allowlistAction,
+				applyFilterByHiding,
+				stagedModels,
+				t
+			]);
+			/**
+			* This product's detection state, when the document carries one.
+			*
+			* Read off the document rather than narrowed through `status`, for the same
+			* reason the account section is: `probe` is optional, and a narrowed union
+			* loses it.
+			*/
+			const probeFor = (0, react.useCallback)((variant) => {
+				const status = statuses[variant.id];
+				return status === void 0 || !("probe" in status) ? void 0 : status.probe;
+			}, [statuses]);
+			/**
+			* Every product's accounts in one list, each tagged with its product.
+			*
+			* Tagged rather than looked up later: a row's controls must post to the route
+			* of the pool the account actually lives in, and the only thing that decides
+			* that is which status document it came from.
+			*/
+			const taggedAccounts = CARD_VARIANTS.flatMap((variant) => {
+				const status = statuses[variant.id];
+				if (status === void 0 || !("accounts" in status)) return [];
+				return (status.accounts?.accounts ?? []).map((account) => ({
+					account,
+					variant
+				}));
+			});
+			/**
+			* The check-in section, read from whichever document carries one.
+			*
+			* Both variants answer with their own section, so the page merges them: the
+			* preference is plugin-wide (one clock, one switch) while the rows are per
+			* pool — a CN account's claim must never stand in for an international one's.
+			*/
+			const checkinSections = CARD_VARIANTS.flatMap((variant) => {
+				const status = statuses[variant.id];
+				const section = status === void 0 || !("checkin" in status) ? void 0 : status.checkin;
+				return section === void 0 ? [] : [{
+					variant,
+					section
+				}];
+			});
+			/** The plugin-wide switch, when any document states it. */
+			const currentCheckinAuto = writtenPreferences.checkinAuto ?? statedPreference(statuses, (status) => status.checkinAuto);
+			/** Whether anything is waiting to be written; the bar's whole condition. */
+			const hasStaged = Object.keys(stagedModels).length > 0;
+			/**
+			* The sidebar style the host reports, when it reports one.
+			*
+			* Read from whichever document carries it (both variants are told the same
+			* value — it is one setting, not a per-product one). Absent on a host that
+			* cannot persist the preference, and the row is then not rendered at all: a
+			* control that cannot be saved is worse than no control.
+			*/
+			const currentCreditStyle = writtenPreferences.creditStyle ?? statedPreference(statuses, (status) => status.sidebarCreditStyle);
+			/**
+			* Whether the host says the sidebar keeps its card, when it says anything.
+			*
+			* `undefined` — not `true` — when no document carries the field: that is an
+			* older host which cannot persist the preference, and the switch is then not
+			* rendered at all, exactly like the style row beside it. Once the field IS
+			* there, an absent value can no longer stand in for "on": the stored value is
+			* what the sidebar draws from, and a page that second-guessed it would lie
+			* about the state it is editing.
+			*/
+			const currentCreditVisible = writtenPreferences.creditVisible ?? statedPreference(statuses, (status) => status.sidebarCreditVisible);
+			/**
+			* Whether the host says the composer keeps its badge, when it says anything.
+			*
+			* Same `undefined`-means-older-host reading as the sidebar switch beside it,
+			* and the same reason: a control that cannot be saved is worse than no control.
+			*/
+			const currentComposerCreditVisible = writtenPreferences.composerVisible ?? statedPreference(statuses, (status) => status.composerCreditVisible);
+			/** Whether the host says the composer keeps its detection control. */
+			const currentProbeControlVisible = writtenPreferences.probeControlVisible ?? statedPreference(statuses, (status) => status.probeControlVisible);
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("section", {
+				className: "wbp-section",
+				"aria-label": t("accountHeading"),
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(AccountsSection, {
+						entries: taggedAccounts,
+						statuses,
+						busy,
+						now,
+						t,
+						onAdd: () => {
+							setError(void 0);
+							setPicking(true);
+						},
+						onAction: accountAction,
+						onRefreshAll: refreshAllAccounts
+					}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ModelsSection, {
+						variants: CARD_VARIANTS,
+						statuses,
+						probeFor,
+						busy,
+						t,
+						context,
+						stagedModels,
+						onContext: (variant, model, length) => {
+							accountAction(variant, {
+								action: "context",
+								model,
+								length
+							});
+						},
+						onRefresh: (variant) => {
+							refreshModels(variant);
+						},
+						onDetect: (variant, model) => {
+							probeAction(variant, {
+								action: "probe",
+								model
+							});
+						},
+						onClearProbe: (variant) => {
+							probeAction(variant, { action: "clear" });
+						},
+						onStage: (variant, next) => {
+							stageModels(variant, next);
+						}
+					})] }),
+					error === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: "wbp-rowError",
+						children: error
+					}),
+					notice === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: "wbp-notice",
+						role: "status",
+						children: notice
+					}),
+					currentCheckinAuto === void 0 && checkinSections.length === 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(SettingsGroup, {
+						title: t("checkinHeading"),
+						description: t("checkinHint"),
+						children: [currentCheckinAuto === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(SettingRow, {
+							title: t("checkinAutoLabel"),
+							titleFor: "wbp-checkin-auto",
+							description: t("checkinAutoHint"),
+							control: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ToggleField, {
+								id: "wbp-checkin-auto",
+								label: t("checkinAutoLabel"),
+								checked: currentCheckinAuto,
+								disabled: busy,
+								onChange: setCheckinAuto
+							})
+						}), checkinSections.flatMap(({ variant, section }) => section.rows.map((row) => {
+							const account = taggedAccounts.find((entry) => entry.variant.id === variant.id && entry.account.id === row.accountId)?.account;
+							return /* @__PURE__ */ (0, react_jsx_runtime.jsx)(SettingRow, {
+								title: account?.name ?? row.accountId,
+								description: checkinLine(row, t),
+								control: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ActionButton, {
+									label: t("checkinRunNow"),
+									disabled: busy,
+									onClick: () => {
+										checkInAccount(variant, row.accountId);
+									}
+								})
+							}, `${variant.id}:${row.accountId}`);
+						}))]
+					}),
+					currentCreditVisible === void 0 && currentCreditStyle === void 0 && currentComposerCreditVisible === void 0 && currentProbeControlVisible === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(SettingsGroup, {
+						title: t("sidebarStyleHeading"),
+						children: [
+							currentCreditVisible === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(SettingRow, {
+								title: t("sidebarVisibleLabel"),
+								titleFor: "wbp-sidebar-visible",
+								description: t("sidebarVisibleHint"),
+								control: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ToggleField, {
+									id: "wbp-sidebar-visible",
+									label: t("sidebarVisibleLabel"),
+									checked: currentCreditVisible,
+									disabled: busy,
+									onChange: setCreditVisible
+								})
+							}),
+							currentCreditStyle === void 0 || currentCreditVisible === false ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(SettingRow, {
+								title: t("sidebarStyleLabel"),
+								description: t("sidebarStyleHint"),
+								control: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(SegmentedField, {
+									label: t("sidebarStyleLabel"),
+									disabled: busy,
+									value: currentCreditStyle,
+									options: [{
+										value: "remaining",
+										label: t("sidebarStyleRemaining")
+									}, {
+										value: "usage",
+										label: t("sidebarStyleUsage")
+									}],
+									onChange: (next) => {
+										const style = isWorkBuddySidebarCreditStyle(next) ? next : void 0;
+										if (style !== void 0 && style !== currentCreditStyle) setCreditStyle(style);
+									}
+								})
+							}),
+							currentComposerCreditVisible === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(SettingRow, {
+								title: t("composerVisibleLabel"),
+								titleFor: "wbp-composer-visible",
+								description: t("composerVisibleHint"),
+								control: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ToggleField, {
+									id: "wbp-composer-visible",
+									label: t("composerVisibleLabel"),
+									checked: currentComposerCreditVisible,
+									disabled: busy,
+									onChange: setComposerCreditVisible
+								})
+							}),
+							currentProbeControlVisible === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(SettingRow, {
+								title: t("probeControlVisibleLabel"),
+								titleFor: "wbp-probe-control-visible",
+								description: t("probeControlVisibleHint"),
+								control: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ToggleField, {
+									id: "wbp-probe-control-visible",
+									label: t("probeControlVisibleLabel"),
+									checked: currentProbeControlVisible,
+									disabled: busy,
+									onChange: setProbeControlVisible
+								})
+							})
+						]
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: "wbp-saveBarDock",
+						children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: cx("wbp-saveBar", error !== void 0 ? "wbp-saveBarError" : justSaved && !hasStaged ? "wbp-saveBarSuccess" : void 0, hasStaged || justSaved || error !== void 0 ? "wbp-saveBarShown" : void 0),
+							role: "region",
+							"aria-label": t("saveBarSave"),
+							"aria-hidden": !(hasStaged || justSaved || error !== void 0),
+							children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: "wbp-saveBarIcon",
+									"aria-hidden": "true",
+									children: !hasStaged && error === void 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(SaveBarGlyph, { tone: "success" }) : error !== void 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(SaveBarGlyph, { tone: "error" }) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { className: "wbp-saveBarPulse" })
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+									className: "wbp-saveBarText",
+									role: "status",
+									"aria-live": "polite",
+									children: error !== void 0 ? error : hasStaged ? t("saveBarUnsaved") : justSaved ? t("saveBarSaved") : ""
+								}),
+								hasStaged ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									className: "wbp-saveBarActions",
+									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+										type: "button",
+										className: "wbp-saveBarButton wbp-saveBarGhost",
+										disabled: saving,
+										onClick: () => {
+											discardStaged();
+										},
+										children: t("saveBarDiscard")
+									}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+										type: "button",
+										className: "wbp-saveBarButton wbp-saveBarPrimary",
+										disabled: saving,
+										onClick: () => {
+											saveStaged();
+										},
+										children: t(saving ? "saveBarSaving" : "saveBarSave")
+									})]
+								}) : null
+							]
+						})
+					}),
+					picking ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ProductPicker, {
+						t,
+						onPick: (picked) => {
+							setPicking(false);
+							setAdding(picked);
+						},
+						onCancel: () => {
+							setPicking(false);
+						}
+					}) : null,
+					adding === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(AddAccountDialog, {
+						variant: adding,
+						t,
+						busy,
+						...error === void 0 ? {} : { error },
+						onCancel: () => {
+							setAdding(void 0);
+							setError(void 0);
+						},
+						onSubmitQr: () => submitQr(adding),
+						onPollQr: (state) => pollQr(adding, state),
+						onSubmitToken: (token) => submitToken(adding, token),
+						onSubmitDesktop: () => submitDesktop(adding),
+						onOpenLink: (url) => openSignInPage(adding, url)
+					})
+				]
+			});
+		}
+		//#endregion
+		//#region src/client/WorkBuddyProbeControl.tsx
+		/**
+		* Per-model reasoning-effort entry beside the Composer's model selector.
+		*
+		* Interaction follows the Fast Mode control `dsh-codex-connect` ships in this
+		* same seat, which is the established shape for composer chrome here:
+		*
+		* - a **static inline label** next to the icon names the feature ("Reasoning
+		*   levels"), set smaller and dimmer than the surrounding chrome so it reads as
+		*   an annotation on the icon. It never carries state: the verified levels
+		*   already appear in the model dropdown (the adapter exposes them as
+		*   selectable efforts), so repeating them here would duplicate the real answer
+		*   and make the label's width jump as results change.
+		* - a **hover/focus tooltip** carries the state and the click's purpose, the way
+		*   Fast Mode's tooltip explains its current speed.
+		* - the **confirmation** is a small bubble anchored to the control, not a
+		*   `window.confirm`. Probing spends real credit, so a confirmation stays — but
+		*   it belongs next to the thing it acts on, sized to one line plus two small
+		*   buttons.
+		*
+		* @module dsh-workbuddy-connect/client/probe-control
+		*/
+		/**
+		* The card (and therefore the routes) a selected provider belongs to.
+		*
+		* The control serves both WorkBuddy providers from one seat, so the provider id
+		* is what selects the status and probe endpoints. Returning `undefined` for any
+		* other provider is what keeps the icon off every non-WorkBuddy model.
+		*/
+		function cardVariantFor(provider) {
+			return CARD_VARIANTS.find((card) => card.id === provider);
+		}
+		/** How often the control re-checks state when the window regains focus. */
+		const RECONCILE_MS = 6e4;
+		const wrapperStyle = {
+			display: "inline-flex",
+			position: "relative",
+			alignItems: "center",
+			transform: "translateY(2px)",
+			marginRight: -8
+		};
+		const buttonStyle = {
+			display: "inline-flex",
+			alignItems: "center",
+			justifyContent: "center",
+			gap: 2,
+			height: 30,
+			padding: "0 6px",
+			border: 0,
+			borderRadius: 8,
+			background: "transparent",
+			color: "var(--dsw-alias-label-secondary)",
+			font: "inherit",
+			whiteSpace: "nowrap",
+			cursor: "pointer"
+		};
+		/**
+		* The inline label. Smaller and dimmer than the surrounding chrome on purpose:
+		* it names the feature, so it should read as an annotation attached to the icon
+		* rather than compete with the adjacent model selector.
+		*/
+		const labelStyle = {
+			fontSize: 11,
+			lineHeight: "16px",
+			color: "var(--dsw-alias-label-tertiary)"
+		};
+		/** Tooltip bubble: the Fast Mode shape (nowrap, one line, above the control). */
+		const tooltipStyle = {
+			position: "absolute",
+			left: "50%",
+			bottom: "calc(100% + 8px)",
+			zIndex: 1e3,
+			transform: "translateX(-50%)",
+			padding: "4px 8px",
+			borderRadius: 6,
+			background: "var(--dsw-specific-tip, #1f2329)",
+			boxShadow: "var(--dsw-shadow-lv2)",
+			color: "var(--dsw-alias-label-primary, #fff)",
+			fontSize: 12,
+			lineHeight: "18px",
+			whiteSpace: "nowrap",
+			pointerEvents: "none"
+		};
+		/** Confirmation bubble: same anchor, but interactive and allowed to wrap. */
+		const confirmStyle = {
+			position: "absolute",
+			right: 0,
+			bottom: "calc(100% + 8px)",
+			zIndex: 1001,
+			display: "flex",
+			flexDirection: "column",
+			gap: 8,
+			width: 260,
+			padding: "10px 12px",
+			border: "1px solid var(--dsw-alias-border-l2)",
+			borderRadius: 8,
+			background: "var(--dsw-alias-bg-layer-1, #fff)",
+			boxShadow: "var(--dsw-shadow-lv2)",
+			color: "var(--dsw-alias-label-primary)",
+			fontSize: 12,
+			lineHeight: "18px"
+		};
+		const confirmRowStyle = {
+			display: "flex",
+			justifyContent: "flex-end",
+			gap: 8
+		};
+		const confirmButtonStyle = {
+			padding: "3px 10px",
+			border: "1px solid var(--dsw-alias-border-l2)",
+			borderRadius: 6,
+			background: "transparent",
+			color: "inherit",
+			font: "inherit",
+			fontSize: 12,
+			cursor: "pointer"
+		};
+		/**
+		* Primary action inside the confirmation bubble.
+		*
+		* The fill and its text colour must come as a pair: `brand-primary` resolves to
+		* a light accent in this theme, so hardcoding `color: #fff` on top of it renders
+		* white-on-white. `button-primary-fill` + `label-primary-foreground` is the
+		* theme's own pair for exactly this, and is what `dsh-codex-connect` uses for
+		* the same job.
+		*/
+		const primaryButtonStyle = {
+			...confirmButtonStyle,
+			border: "1px solid var(--dsw-alias-button-primary-fill)",
+			background: "var(--dsw-alias-button-primary-fill)",
+			color: "var(--dsw-alias-label-primary-foreground)"
+		};
+		/**
+		* Result note: a single line + a dismiss button, anchored to the control's
+		* right side. Smaller than the confirmation bubble because it carries an
+		* *outcome*, not a *decision* — the work is done, the user only has to read
+		* and dismiss.
+		*/
+		const noteStyle = {
+			position: "absolute",
+			right: 0,
+			bottom: "calc(100% + 8px)",
+			zIndex: 1001,
+			display: "flex",
+			alignItems: "center",
+			gap: 12,
+			padding: "6px 10px",
+			border: "1px solid var(--dsw-alias-border-l2)",
+			borderRadius: 8,
+			background: "var(--dsw-alias-bg-layer-1)",
+			boxShadow: "var(--dsw-shadow-lv2)",
+			color: "var(--dsw-alias-label-primary)",
+			fontSize: 12,
+			lineHeight: "18px",
+			whiteSpace: "nowrap"
+		};
+		/**
+		* The note's dismiss action. Outlined rather than bare text: inside an already
+		* bordered bubble, an unbordered word does not read as something you can click.
+		* Matches the outlined pill convention the plugin's other secondary actions use.
+		*/
+		const noteDismissStyle = {
+			padding: "2px 8px",
+			border: "1px solid var(--dsw-alias-border-l2)",
+			borderRadius: 6,
+			background: "transparent",
+			color: "var(--dsw-alias-label-secondary)",
+			font: "inherit",
+			fontSize: 12,
+			lineHeight: "18px",
+			cursor: "pointer"
+		};
+		/**
+		* The feature's static inline label. Deliberately not a state readout — see the
+		* module comment.
+		*/
+		function useLabel(t) {
+			return t("probeLabel");
+		}
+		/** Pick the model's recorded observation out of the probe section. */
+		function resultFor(status, model) {
+			if (status.status !== "signed-in") return void 0;
+			return status.probe?.results.find((result) => result.id === model);
+		}
+		/**
+		* The one-line tooltip: current state first, then what a click does — the same
+		* two-part shape Fast Mode uses.
+		*
+		* A recorded result outranks a remembered failure. `failed` only means "the last
+		* run from this control did not complete"; the host can record a result for the
+		* same model at any time (a detection started from the settings card, another
+		* conversation, or a finished sweep), and the levels the user paid for are the
+		* more useful answer than the stale failure. Failure copy is what remains when
+		* there is no result to report.
+		*/
+		function tooltipText(t, model, state) {
+			if (state.busy) return t("probeRunning", { model });
+			const result = state.result;
+			if (result !== void 0) {
+				if (result.validation === "validating" && (result.efforts?.length ?? 0) > 0) return t("probeTooltipVerified", { levels: result.efforts.join(" / ") });
+				if (result.validation === "non-validating") return t("probeTooltipNotValidating");
+				return t("probeTooltipRetry");
+			}
+			if (state.failed) return t("probeTooltipRetry");
+			return t("probeTooltipIdle", { model });
+		}
+		/** Model-independent shell: resolves the selection, then delegates per model. */
+		function WorkBuddyProbeControl({ directory, t }) {
+			const subscribe = (0, react.useCallback)((listener) => directory.subscribe(listener), [directory]);
+			const snapshot = (0, react.useCallback)(() => directory.getSnapshot(), [directory]);
+			const selection = (0, react.useSyncExternalStore)(subscribe, snapshot, snapshot).current;
+			const card = selection == null ? void 0 : cardVariantFor(selection.provider);
+			const key = card === void 0 || selection == null ? void 0 : `${card.id}:${selection.model}`;
+			return card === void 0 || selection == null || key === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ModelProbe, {
+				model: selection.model,
+				card,
+				label: useLabel(t),
+				t
+			}, key);
+		}
+		function ModelProbe({ model, card, label, t }) {
+			const [status, setStatus] = (0, react.useState)();
+			const [busy, setBusy] = (0, react.useState)(false);
+			const [confirming, setConfirming] = (0, react.useState)(false);
+			const [tooltipVisible, setTooltipVisible] = (0, react.useState)(false);
+			const [failed, setFailed] = (0, react.useState)(false);
+			const [note, setNote] = (0, react.useState)();
+			const inFlight = (0, react.useRef)(false);
+			const mounted = (0, react.useRef)(false);
+			const readSeq = (0, react.useRef)(0);
+			const tooltipId = (0, react.useId)();
+			const refresh = (0, react.useCallback)(async (signal) => {
+				const seq = ++readSeq.current;
+				const response = await fetch(card.statusPath, {
+					credentials: "same-origin",
+					headers: { accept: "application/json" },
+					...signal === void 0 ? {} : { signal }
+				});
+				if (!response.ok) throw new Error(`HTTP ${response.status}`);
+				const value = await response.json().catch(() => void 0);
+				if (!isWorkBuddyWebStatus(value)) throw new Error(t("statusResponseInvalid"));
+				if (mounted.current && !signal?.aborted && seq === readSeq.current) setStatus(value);
+			}, [card.statusPath, t]);
+			(0, react.useEffect)(() => {
+				mounted.current = true;
+				const controller = new AbortController();
+				const load = () => {
+					refresh(controller.signal).catch(() => {});
+				};
+				load();
+				const timer = window.setInterval(load, RECONCILE_MS);
+				window.addEventListener("focus", load);
+				return () => {
+					mounted.current = false;
+					controller.abort();
+					window.clearInterval(timer);
+					window.removeEventListener("focus", load);
+				};
+			}, [refresh]);
+			const probe = status?.status === "signed-in" ? status.probe : void 0;
+			const key = status?.status === "signed-in" ? status.probeKey : void 0;
+			const result = status === void 0 ? void 0 : resultFor(status, model);
+			const hasResult = probe?.candidates.includes(model) === true || result !== void 0;
+			const wanted = status === void 0 || !("probeControlVisible" in status) ? true : status.probeControlVisible !== false;
+			const visible = hasResult && wanted;
+			(0, react.useEffect)(() => {
+				if (result !== void 0) setFailed(false);
+			}, [result]);
+			(0, react.useEffect)(() => {
+				setConfirming(false);
+				setNote(void 0);
+			}, [model]);
+			const detect = async () => {
+				if (key === void 0 || inFlight.current || probe?.running === true) return;
+				inFlight.current = true;
+				setNote(void 0);
+				setConfirming(false);
+				setBusy(true);
+				setFailed(false);
+				try {
+					const response = await fetch(card.probePath, {
+						method: "POST",
+						credentials: "same-origin",
+						headers: {
+							"Content-Type": "application/json",
+							"X-WorkBuddy-Probe-Key": key
+						},
+						body: JSON.stringify({
+							action: "probe",
+							model
+						})
+					});
+					const body = await response.json();
+					if (!response.ok || body.state !== "ok" || body.validation !== "validating" && body.validation !== "non-validating" || !Array.isArray(body.efforts) || !body.efforts.every((effort) => typeof effort === "string")) throw new Error("probe failed");
+					if (mounted.current) {
+						const completed = {
+							id: model,
+							name: model,
+							validation: body.validation,
+							efforts: body.efforts,
+							probedAt: Date.now()
+						};
+						setNote(completed);
+					}
+					refresh().catch(() => {});
+				} catch {
+					if (mounted.current) setFailed(true);
+				} finally {
+					inFlight.current = false;
+					if (mounted.current) setBusy(false);
+				}
+			};
+			if (!visible) return null;
+			const text = tooltipText(t, model, {
+				busy,
+				result,
+				failed
+			});
+			const disabled = busy || probe?.running === true || key === void 0;
+			const showTooltip = tooltipVisible && !confirming && note === void 0;
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+				style: wrapperStyle,
+				onMouseEnter: () => {
+					setTooltipVisible(true);
+				},
+				onMouseLeave: () => {
+					setTooltipVisible(false);
+				},
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+						type: "button",
+						"aria-label": text,
+						"aria-describedby": showTooltip ? tooltipId : void 0,
+						"aria-busy": busy,
+						"aria-expanded": confirming,
+						disabled,
+						onClick: () => {
+							setConfirming(true);
+						},
+						onFocus: () => {
+							setTooltipVisible(true);
+						},
+						onBlur: () => {
+							setTooltipVisible(false);
+						},
+						style: {
+							...buttonStyle,
+							opacity: disabled && !confirming ? .6 : 1,
+							cursor: disabled ? "default" : "pointer"
+						},
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("svg", {
+							width: "16",
+							height: "16",
+							viewBox: "0 0 24 24",
+							fill: "none",
+							stroke: "currentColor",
+							strokeWidth: "1.6",
+							"aria-hidden": "true",
+							focusable: "false",
+							children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("circle", {
+									cx: "12",
+									cy: "12",
+									r: "9"
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("circle", {
+									cx: "12",
+									cy: "12",
+									r: "4"
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("path", { d: "M12 12 20 4" }),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("circle", {
+									cx: "12",
+									cy: "12",
+									r: "1"
+								})
+							]
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							style: labelStyle,
+							children: label
+						})]
+					}),
+					showTooltip && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						id: tooltipId,
+						role: "tooltip",
+						style: tooltipStyle,
+						children: text
+					}),
+					confirming && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+						style: confirmStyle,
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("probeBubbleBody") }), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+							style: confirmRowStyle,
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								style: confirmButtonStyle,
+								onClick: () => {
+									setConfirming(false);
+								},
+								children: t("cancel")
+							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								style: primaryButtonStyle,
+								onClick: () => {
+									detect();
+								},
+								children: t("probeConfirmAction")
+							})]
+						})]
+					}),
+					note === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+						role: "status",
+						"aria-live": "polite",
+						style: noteStyle,
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: noteText(t, note) }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+							type: "button",
+							style: noteDismissStyle,
+							onClick: () => {
+								setNote(void 0);
+							},
+							children: t("probeNoteDismiss")
+						})]
+					})
+				]
+			});
+		}
+		/** Compose the one-line outcome string the note bubble shows. */
+		function noteText(t, result) {
+			if (result.validation === "validating" && (result.efforts?.length ?? 0) > 0) return t("probeNoteVerified", { levels: result.efforts.join(" / ") });
+			if (result.validation === "non-validating") return t("probeNoteNotValidating");
+			return t("probeNoteUnknown");
+		}
+		//#endregion
+		//#region src/client/panel.ts
+		/** Thousands-separated integer, using the reader's own grouping. */
+		function formatCount(value) {
+			return new Intl.NumberFormat(void 0, { maximumFractionDigits: 0 }).format(value);
+		}
+		/**
+		* Total remaining credit for one product's pool, or undefined when no account
+		* reported a balance.
+		*
+		* Deliberately a SUM over accounts that answered, not over the pool: a pool
+		* where one account's lookup failed would otherwise show a figure that silently
+		* treats the missing account as zero. Products are never summed together — the
+		* two subscriptions' credits are not convertible — which is why this is
+		* per-product and there is no grand total anywhere in the view.
+		*/
+		function creditTotal(accounts) {
+			const known = accounts.filter((account) => account.credits !== void 0);
+			if (known.length === 0) return void 0;
+			return known.reduce((sum, account) => sum + (account.credits ?? 0), 0);
+		}
+		/**
+		* The pool's stated capacity, summed the same way as {@link creditTotal}.
+		*
+		* undefined unless EVERY account that reported a balance also reported a cap:
+		* a partial sum would understate the pool's size while looking like a complete
+		* figure, and the used amount derived from it would be wrong in the direction
+		* nobody checks (used = total - remaining would come out too large).
+		*/
+		function creditCapacity(accounts) {
+			const known = accounts.filter((account) => account.credits !== void 0);
+			if (known.length === 0) return void 0;
+			if (known.some((account) => account.creditsTotal === void 0)) return void 0;
+			const capacities = known.map((account) => account.creditsTotal ?? 0);
+			if (capacities.every((capacity) => capacity <= 0)) return void 0;
+			return capacities.reduce((sum, capacity) => sum + capacity, 0);
+		}
+		/** Whether an account is benched right now. */
+		function isBenched(account, now) {
+			return account.cooldown !== void 0 && account.cooldown.untilMs > now;
+		}
+		/**
+		* The single key naming a product's sign-in state.
+		*
+		* The pool is the authority — "signed in" means *the pool has an account*, not
+		* that the desktop app is signed in — so the state is read from the account
+		* section the host sends in both states, never inferred from a missing one.
+		*/
+		function productState(status) {
+			if (status === void 0) return "unknown";
+			if (status.status === "error") return "error";
+			return status.status === "signed-in" ? "signed-in" : "signed-out";
+		}
+		/** Accounts the document carries, whichever sign-in state it is in. */
+		function accountsOf(status) {
+			if (status === void 0 || status.status === "error") return [];
+			return status.accounts?.accounts ?? [];
+		}
+		/**
+		* The one-line explanation a product shows under its name, when it has one.
+		*
+		* Precedence is deliberate: a host failure outranks a sign-in reason (it means
+		* the plugin could not answer at all), and a sign-in reason outranks the
+		* generic signed-out hint (it names the file to fix).
+		*/
+		function detailOf(status) {
+			if (status === void 0) return void 0;
+			if (status.status === "error") return status.message;
+			return status.status === "signed-out" ? status.reason : void 0;
+		}
+		/** One product's block, from its own status document. */
+		function productView(variant, status, now) {
+			const accounts = accountsOf(status);
+			const benched = accounts.filter((account) => isBenched(account, now)).length;
+			const total = creditTotal(accounts);
+			const models = status !== void 0 && status.status === "signed-in" ? status.models ?? [] : [];
+			const catalogSource = status !== void 0 && status.status === "signed-in" ? status.catalog?.source ?? "none" : "none";
+			const stats = [
+				{
+					label: "accountCount",
+					value: formatCount(accounts.length)
+				},
+				{
+					label: "creditTotal",
+					value: total === void 0 ? "" : formatCount(total),
+					...total === void 0 ? { pending: "creditPending" } : {}
+				},
+				{
+					label: "modelCount",
+					value: formatCount(models.length)
+				}
+			];
+			const capacity = creditCapacity(accounts);
+			return {
+				id: variant.id,
+				name: variant.appName,
+				state: productState(status),
+				...detailOf(status) === void 0 ? {} : { detail: detailOf(status) },
+				stats,
+				benched,
+				catalogSource,
+				accounts,
+				...total === void 0 ? {} : { creditsRemaining: total },
+				...capacity === void 0 ? {} : { creditsCapacity: capacity }
+			};
+		}
+		/**
+		* Project one snapshot into the panel's view.
+		*
+		* `available` is a fact about the HOST, not about sign-in: with no route
+		* answering, the dashboard says so once instead of rendering two products that
+		* look signed out for reasons the plugin cannot see.
+		*/
+		function buildPanelView(options) {
+			const { snapshot } = options;
+			const now = options.now ?? Date.now();
+			const products = CARD_VARIANTS.map((variant) => productView(variant, snapshot.statuses[variant.id], now));
+			const accountCount = products.reduce((sum, product) => sum + countOf(product, "accountCount"), 0);
+			const modelCount = products.reduce((sum, product) => sum + countOf(product, "modelCount"), 0);
+			const benchedCount = products.reduce((sum, product) => sum + product.benched, 0);
+			return {
+				products,
+				footProducts: products.filter((product) => product.state === "signed-in" || countOf(product, "accountCount") > 0),
+				loading: snapshot.loading && snapshot.fetchedAt === 0,
+				available: snapshot.fetchedAt > 0,
+				accountCount,
+				benchedCount,
+				modelCount,
+				footTitle: footTitle(products),
+				creditStyle: creditStyleOf(snapshot),
+				creditVisible: creditVisibleOf(snapshot),
+				composerCreditVisible: composerCreditVisibleOf(snapshot),
+				preferencesSettled: snapshot.fetchedAt > 0
+			};
+		}
+		/**
+		* The card's display preference, as the host stated it.
+		*
+		* Read from whichever document carries it (both variants are told the same
+		* value — it is one plugin-wide setting, not a per-product one), and any
+		* document that cannot state it — an older host, or a read that failed — leaves
+		* the default shape in place rather than blanking the card.
+		*/
+		function creditStyleOf(snapshot) {
+			return statedPreference(snapshot.statuses, (status) => status.sidebarCreditStyle) ?? "remaining";
+		}
+		/**
+		* Whether the sidebar keeps its card, as the host stated it.
+		*
+		* The same shape as {@link creditStyleOf} — one plugin-wide answer read from
+		* whichever document carries it — with one deliberate difference: a document
+		* that does NOT state it means "present", not "hidden". An older host, a read
+		* that failed, or a profile with no settings service must all leave the card
+		* exactly where it was; only an explicit `false` takes it away.
+		*/
+		function creditVisibleOf(snapshot) {
+			return statedPreference(snapshot.statuses, (status) => status.sidebarCreditVisible) ?? true;
+		}
+		/**
+		* Whether the composer keeps its credit badge, as the host stated it.
+		*
+		* Same shape and same "absent means present" default as {@link creditVisibleOf},
+		* which is what lets both switches be read by one rule instead of two.
+		*/
+		function composerCreditVisibleOf(snapshot) {
+			return statedPreference(snapshot.statuses, (status) => status.composerCreditVisible) ?? true;
+		}
+		/** Read one numeric stat back out of a product block. */
+		function countOf(product, label) {
+			const stat = product.stats.find((candidate) => candidate.label === label);
+			if (stat === void 0 || stat.value === "") return 0;
+			return Number(stat.value.replace(/\D/gu, "")) || 0;
+		}
+		/**
+		* The footer card's tooltip: the product count plus each product's own state,
+		* so the card's accessible name carries the same facts its visible rows do.
+		*/
+		function footTitle(products) {
+			return products.map((product) => product.state === "signed-in" ? product.name + ": " + String(countOf(product, "accountCount")) + "/" + String(countOf(product, "modelCount")) : product.name + ": " + product.state).join(" · ");
+		}
+		//#endregion
+		//#region src/client/credit-badge.tsx
+		/**
+		* The composer's credit badge — "WorkBuddy: 5,266" at the right of the composer
+		* dock — and the per-account breakdown it opens.
+		*
+		* Why this seat: the composer dock is the row DSH already fills with what the
+		* turn cost (the context meter, tokens, cache-hit rate, speed). A credit figure
+		* answers the next question — "and how much of my quota is left" — so it belongs
+		* in that row, and it is registered LAST in it, which puts it to the right of the
+		* context readout instead of among the harness's own figures.
+		*
+		* Why the click expands: the badge states one pool's total, but an account is
+		* what a user acts on. Expanding in place answers "which account, and how much is
+		* left on it" without a trip to the settings page.
+		*
+		* The panel is deliberately a copy of the harness's OWN context popover
+		* (ui-conversation's `ContextMeter`) rather than a shape of this plugin's
+		* invention, because the two sit in the same row and are opened the same way:
+		* the same placement and dismissal primitives (`useAnchoredPosition` above the
+		* trigger, `useDismissOnOutsidePointer`, Escape), the same menu material and
+		* elevation tokens, the same `min(264px, …)` width, the same header/rows
+		* geometry, and the same portal into `document.body` — portalled because the
+		* composer's own overflow would otherwise crop an anchored panel at the tool
+		* row's edge. A user who has opened the context readout has already seen this
+		* panel, so it must not read as a second, slightly different one.
+		*
+		* Why it is conditional on the model: the figure describes the quota behind the
+		* model about to answer. Showing it while another provider is selected would
+		* attach a WorkBuddy number to a session that cannot spend it.
+		*
+		* Three seats are read, and all are checked before anything is rendered:
+		*
+		* 1. **the session's current model** — through the same `ModelDirectory` store
+		*    the reasoning-probe control uses, read with `useSyncExternalStore` so a
+		*    model switch re-renders this badge;
+		* 2. **the credit itself** — from the panel store both the sidebar card and the
+		*    dashboard already poll, so the three surfaces can never disagree about what
+		*    is left;
+		* 3. **whether the badge is wanted at all** — the plugin-wide preference carried
+		*    on the same status documents, read through the panel projection so the
+		*    switch and the sidebar card's switch answer a missing field identically.
+		*
+		* A host that supplies none of them (an older client, or a profile without the
+		* composer dock) renders nothing: this is an annotation, never a requirement.
+		*
+		* @module dsh-workbuddy-connect/client/credit-badge
+		*/
+		/** One credit figure, grouped the way every other surface in this plugin groups it. */
+		function formatCredit(value) {
+			return new Intl.NumberFormat(void 0, { maximumFractionDigits: 1 }).format(value);
+		}
+		/**
+		* One account's line inside the panel.
+		*
+		* An account that reported no balance says so rather than showing a zero: "not
+		* read yet" and "this account is empty" are different facts, and only the second
+		* is worth acting on.
+		*/
+		function AccountRow({ account, t }) {
+			const name = account.label ?? account.nickname ?? account.name;
+			const figure = account.credits === void 0 ? t("accountCreditsPending") : account.creditsTotal === void 0 ? t("accountCreditsOnly", { remaining: formatCredit(account.credits) }) : t("accountCreditsRow", {
+				remaining: formatCredit(account.credits),
+				total: formatCredit(account.creditsTotal)
+			});
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: "wbp-badgeRow",
+				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("dt", {
+					title: name,
+					children: name
+				}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("dd", { children: figure })]
+			});
+		}
+		/**
+		* One product's block: its heading, the pool's fill, and one row per account.
+		*
+		* A product with no accounts renders nothing at all rather than an empty
+		* heading: the panel is a statement about the pools the user actually has, and a
+		* product nobody signed into has no figures to state. (The sidebar card's own
+		* rule, applied here for the same reason.)
+		*
+		* The bar is drawn only when the pool's capacity can be stated COMPLETELY — the
+		* same rule the sidebar card follows, so a fill never implies a total that
+		* silently ignores an account whose cap went unreported.
+		*/
+		function ProductBlock({ product, t }) {
+			if (product.accounts.length === 0) return null;
+			const remaining = product.creditsRemaining;
+			const capacity = product.creditsCapacity;
+			const ratio = remaining === void 0 || capacity === void 0 || capacity <= 0 ? void 0 : Math.min(1, Math.max(0, remaining / capacity));
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("section", {
+				className: "wbp-badgeGroup",
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: "wbp-badgeGroupHead",
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: "wbp-badgeGroupName",
+							children: product.name
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: "wbp-badgeGroupTotal",
+							children: remaining === void 0 ? t("creditPending") : formatCredit(remaining)
+						})]
+					}),
+					ratio === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: "wbp-badgeBar",
+						children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: "wbp-badgeBarFill",
+							style: { width: `${String(ratio * 100)}%` }
+						})
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("dl", {
+						className: "wbp-badgeRows",
+						children: product.accounts.map((account) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)(AccountRow, {
+							account,
+							t
+						}, account.id))
+					})
+				]
+			});
+		}
+		/**
+		* The badge and its panel.
+		*
+		* Both stores are read through `useSyncExternalStore` with the same
+		* subscribe/snapshot pair the probe control uses, so a model switch and a landed
+		* sweep each update the figure in place.
+		*/
+		function WorkBuddyCreditBadge({ directory, panel, t }) {
+			const subscribeDirectory = (0, react.useCallback)((listener) => directory.subscribe(listener), [directory]);
+			const readDirectory = (0, react.useCallback)(() => directory.getSnapshot(), [directory]);
+			const selection = (0, react.useSyncExternalStore)(subscribeDirectory, readDirectory, readDirectory).current;
+			const subscribePanel = (0, react.useCallback)((listener) => panel.subscribe(listener), [panel]);
+			const readPanel = (0, react.useCallback)(() => panel.getSnapshot(), [panel]);
+			const snapshot = (0, react.useSyncExternalStore)(subscribePanel, readPanel, readPanel);
+			const [open, setOpen] = (0, react.useState)(false);
+			const rootRef = (0, react.useRef)(null);
+			const panelRef = (0, react.useRef)(null);
+			const view = buildPanelView({ snapshot });
+			const card = selection == null ? void 0 : cardVariantFor(selection.provider);
+			const product = card === void 0 ? void 0 : view.products.find((candidate) => candidate.id === card.id);
+			const remaining = product?.creditsRemaining;
+			const available = card !== void 0 && product !== void 0 && product.state === "signed-in" && remaining !== void 0;
+			const position = (0, _deepseek_ai_dsh_client_ui_primitives.useAnchoredPosition)({
+				open: open && available,
+				anchorRef: rootRef,
+				panelRef,
+				side: "top",
+				gap: 8,
+				margin: 12
+			});
+			(0, _deepseek_ai_dsh_client_ui_primitives.useDismissOnOutsidePointer)(rootRef, open && available, setOpen, panelRef);
+			(0, react.useEffect)(() => {
+				if (!available && open) setOpen(false);
+			}, [available, open]);
+			(0, react.useEffect)(() => {
+				if (!open || !available || typeof document === "undefined") return;
+				const onKeyDown = (event) => {
+					if (event.key === "Escape") setOpen(false);
+				};
+				document.addEventListener("keydown", onKeyDown);
+				return () => {
+					document.removeEventListener("keydown", onKeyDown);
+				};
+			}, [available, open]);
+			if (!view.preferencesSettled) return null;
+			if (!view.composerCreditVisible) return null;
+			if (!available) return null;
+			const label = t("creditBadgeLabel", {
+				product: card.appName,
+				remaining: formatCredit(remaining)
+			});
+			const panelBody = /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+				className: "wbp-badgePanel",
+				ref: panelRef,
+				style: position ?? {
+					visibility: "hidden",
+					left: 0,
+					top: 0
+				},
+				role: "dialog",
+				"aria-label": t("creditBadgePanelTitle"),
+				children: view.products.map((candidate) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ProductBlock, {
+					product: candidate,
+					t
+				}, candidate.id))
+			});
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+				className: "wbp-creditBadgeRoot",
+				ref: rootRef,
+				"data-workbuddy-credit-badge": "",
+				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Tooltip, {
+					label,
+					side: "top",
+					delayMs: 200,
+					disabled: open,
+					children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+						type: "button",
+						className: "wbp-creditBadge",
+						"aria-label": label,
+						"aria-haspopup": "dialog",
+						"aria-expanded": open,
+						onClick: () => {
+							setOpen((current) => !current);
+						},
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: "wbp-creditBadgeName",
+							children: card.appName
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: "wbp-creditBadgeValue",
+							children: formatCredit(remaining)
+						})]
+					})
+				}), open ? typeof document === "undefined" ? panelBody : (0, react_dom.createPortal)(panelBody, document.body) : null]
+			});
+		}
+		//#endregion
+		//#region src/client/panel-copy.ts
+		/**
+		* Copy for the WorkBuddy dashboard: the sidebar footer card and the centre
+		* column panel.
+		*
+		* Its own namespace (panel.workbuddy), separate from the settings page's
+		* settings.workbuddy, because the panel is not part of the settings page —
+		* but it follows the SAME active language: both slots declare this namespace
+		* at registration, which is what binds their t seat, and a language switch
+		* mints a fresh t that re-renders the surfaces (see panel-view.tsx).
+		*
+		* @module dsh-workbuddy-connect/client/panel-copy
+		*/
+		/** Locale namespace the panel's surfaces register under. */
+		const PANEL_LOCALE_NS = "panel.workbuddy.functy";
+		/** English dictionary; the key domain for both surfaces. */
+		const PANEL_COPY_EN = {
+			/** Panel title and the sidebar card's own label. */
+			nav: "WorkBuddy",
+			/** Heading over the per-product account totals. */
+			accounts: "Accounts",
+			/** Heading over the per-product model figures. */
+			models: "Models",
+			/** Heading listing the per-product sign-in states. */
+			signIn: "Sign-in",
+			/** The dashboard's refresh action. */
+			refresh: "Refresh",
+			/** The dashboard's way back to the Conversation. */
+			close: "Close",
+			/** Shown while a read is in flight and nothing has arrived yet. */
+			loading: "Reading the WorkBuddy pools…",
+			/** Shown when nothing has ever been read (no host route answered). */
+			unavailable: "The host did not report its pools. Update the plugin, or restart DSH.",
+			/**
+			* The per-product tile captions, read BESIDE their figures: the tile draws the
+			* caption as its small label and the count as its large value.
+			*
+			* Captions, never placeholders — a value like `'{count}'` here is drawn
+			* literally, because nothing fills it: the tile translates the label with no
+			* parameters, so only a real caption can render.
+			*/
+			accountCount: "Accounts",
+			/** One product's total remaining credit. */
+			creditTotal: "Credit",
+			/** A product whose accounts report no balance yet. */
+			creditPending: "—",
+			/** Models currently served, per product. */
+			modelCount: "Models",
+			/** Where the served model list came from: a live upstream fetch. */
+			sourceLive: "Live",
+			/** Where the served model list came from: this account's last saved fetch. */
+			sourceSaved: "Saved",
+			/** Where the served model list came from: the roster compiled into the plugin. */
+			sourceFallback: "Built-in",
+			/** The product's pool has an account and can serve requests. */
+			signedIn: "Signed in",
+			/** No account: the product can serve nothing. */
+			signedOut: "Not signed in",
+			/** The pool has accounts but none may be used right now. */
+			allUnavailable: "All accounts are set aside",
+			/** The host reported a failure for this product. */
+			failure: "Read failed",
+			/** A limit leaves N accounts benched until their stated reset. */
+			benched: "{count} set aside",
+			/** The card's spend line, laid out as "used / total" like the reference card. */
+			creditUsed: "{used} / {total}",
+			/** Shown instead when the pool's capacity cannot be stated: the balance alone. */
+			creditRemaining: "{remaining} left",
+			/**
+			* The sidebar card's one line per product: the label names the figure, so the
+			* number needs no column header beside it.
+			*/
+			creditRemainingLabel: "{product} remaining",
+			/**
+			* The composer badge's text and accessible name: the product, then the balance
+			* — "WorkBuddy: 5,266". The colon is the whole label, so the figure never
+			* needs a heading above it.
+			*/
+			creditBadgeLabel: "{product}: {remaining}",
+			/**
+			* The expanded badge panel's heading and accessible name.
+			*
+			* A title rather than a bare list because the panel states two pools: without
+			* it the rows would read as one account list whose figures do not add up.
+			*/
+			creditBadgePanelTitle: "Credit by account",
+			/** One account's balance, when a cap is known: "5,266 / 10,000 left". */
+			accountCreditsRow: "{remaining} / {total} left",
+			/** One account's balance, when no cap was stated: "5,266 left". */
+			accountCreditsOnly: "{remaining} left",
+			/** One account whose balance has not been read (yet, or at all). */
+			accountCreditsPending: "Not read yet",
+			/** The footer card's accessible name and tooltip. */
+			footerLabel: "WorkBuddy — open the dashboard",
+			/** The rail icon's accessible name. */
+			railLabel: "WorkBuddy dashboard"
+		};
+		/** Chinese dictionary; every key above, in the same order. */
+		const PANEL_COPY_ZH = {
+			nav: "WorkBuddy",
+			accounts: "账号",
+			models: "模型",
+			signIn: "登录状态",
+			refresh: "刷新",
+			close: "关闭",
+			loading: "正在读取 WorkBuddy 账号池…",
+			unavailable: "宿主未返回账号池。请更新插件或重启 DSH。",
+			accountCount: "账号",
+			creditTotal: "积分",
+			creditPending: "—",
+			modelCount: "模型",
+			sourceLive: "实时",
+			sourceSaved: "已保存",
+			sourceFallback: "内置",
+			signedIn: "已登录",
+			signedOut: "未登录",
+			allUnavailable: "全部账号被搁置",
+			failure: "读取失败",
+			benched: "{count} 个搁置中",
+			creditUsed: "{used} / {total}",
+			creditRemaining: "剩余 {remaining}",
+			/** 侧边栏每行一条：标签自己说明这个数字是什么。 */
+			creditRemainingLabel: "{product} 剩余额度",
+			/** 聊天框那枚徽标的文字与无障碍名：产品名 + 余额。 */
+			creditBadgeLabel: "{product}: {remaining}",
+			creditBadgePanelTitle: "各账号额度",
+			accountCreditsRow: "剩余 {remaining} / {total}",
+			accountCreditsOnly: "剩余 {remaining}",
+			accountCreditsPending: "尚未读取",
+			footerLabel: "WorkBuddy —— 打开仪表盘",
+			railLabel: "WorkBuddy 仪表盘"
+		};
+		/** Fill {name} placeholders from a parameter record. */
+		function interpolate(template, params) {
+			return template.replace(/\{(\w+)\}/gu, (match, name) => name in params ? String(params[name]) : match);
+		}
+		/** English fallback used when a registration carries no locale seat. */
+		const panelTextEN = (key, params = {}) => interpolate(PANEL_COPY_EN[key], params);
+		/**
+		* A translator that prefers the harness's active language and falls back to
+		* English per key, so a dictionary missing one string (an older bundle, a
+		* partially translated locale) still renders a readable panel.
+		*/
+		function panelTranslator(t) {
+			if (t === void 0) return panelTextEN;
+			return (key, params = {}) => {
+				const translated = t(key, params);
+				return translated === key ? interpolate(PANEL_COPY_EN[key], params) : translated;
+			};
+		}
+		//#endregion
+		//#region src/client/panel-hooks.ts
+		/**
+		* React binding for the shared panel store: the `useSyncExternalStore` seat
+		* both panel surfaces read through, plus the two effects that keep the poll
+		* alive for exactly as long as a surface is mounted.
+		*
+		* Kept apart from `panel-view.tsx` so the components stay render-only and the
+		* subscription logic has one home.
+		*
+		* @module dsh-workbuddy-connect/client/panel-hooks
+		*/
+		/**
+		* Run `start` once for the mount, disposing on unmount.
+		*
+		* The panel's poll is started by the sidebar card (always mounted) rather than
+		* by the dashboard, and `start()` is idempotent per store — so opening the
+		* dashboard does not start a second timer, and closing it does not stop the
+		* card's.
+		*/
+		function useEffectOnce(start) {
+			(0, react.useEffect)(() => start(), [start]);
+		}
+		//#endregion
+		//#region src/client/panel-view.tsx
+		/**
+		* The panel's view. `useWorkBuddyPanel` subscribes to the shared store, so a
+		* completed sweep re-renders BOTH surfaces from the same snapshot — the footer
+		* card's totals and the dashboard can never disagree about what was read.
+		*/
+		function usePanelView(props) {
+			return buildPanelView({ snapshot: props.useWorkBuddyPanel((state) => state) });
+		}
+		/** Resolve the translator once per render from the injected locale seat. */
+		function translatorOf(props) {
+			return panelTranslator(props.t);
+		}
+		/** The tag tone a product's sign-in state earns. */
+		function stateTone(product) {
+			if (product.state === "signed-in") return "success";
+			if (product.state === "error") return "danger";
+			if (product.state === "signed-out") return "warning";
+			return "neutral";
+		}
+		/** One product's state as words. */
+		function stateText(product, t) {
+			if (product.state === "signed-in") return t("signedIn");
+			if (product.state === "signed-out") return t("signedOut");
+			if (product.state === "error") return t("failure");
+			return t("loading");
+		}
+		/**
+		* One product on the dashboard: its identity, its state, and its figures.
+		*
+		* Built from the same row pieces the settings page uses, so the two surfaces are
+		* visibly the same product's UI. The block is a `<section>` of rows rather than
+		* a card because the reference layout has no card surfaces at all.
+		*/
+		function ProductCard({ product, t }) {
+			const tone = stateTone(product);
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("section", {
+				className: "wbp-card",
+				"aria-label": product.name,
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: "wbp-cardHead",
+						children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "wbp-avatar",
+								"aria-hidden": "true",
+								children: product.name.slice(0, 1).toUpperCase()
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "wbp-cardIdentity",
+								children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: "wbp-cardTitle",
+									children: product.name
+								})
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { className: "wbp-spacer" }),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)(Badge, {
+								tone: tone === "success" ? "plain" : tone === "danger" ? "error" : tone === "warning" ? "warn" : "muted",
+								children: stateText(product, t)
+							}),
+							product.benched > 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(Badge, {
+								tone: "warn",
+								children: t("benched", { count: product.benched })
+							}) : null,
+							product.catalogSource === "none" ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(Badge, {
+								tone: "muted",
+								children: t(product.catalogSource === "live" ? "sourceLive" : product.catalogSource === "saved" ? "sourceSaved" : "sourceFallback")
+							})
+						]
+					}),
+					product.detail === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: "wbp-noticeHint",
+						children: product.detail
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: "wbp-tiles",
+						children: product.stats.map((stat) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)(StatTile, {
+							label: t(stat.label),
+							value: stat.value === "" ? stat.pending === void 0 ? "" : t(stat.pending) : stat.value
+						}, stat.label))
+					})
+				]
+			});
+		}
+		/**
+		* The centre-column dashboard, registered into the layout's keyed `main` slot
+		* under `workbuddy-panel`. Selecting that key is what the footer card's
+		* `open()` does, so the two registrations are one navigation entry.
+		*
+		* The panel covers the Conversation while it is open, which is why it carries
+		* its own way back (`close`): without one the footer card could only re-select
+		* a panel the user is already looking at.
+		*/
+		function WorkBuddyPanel(props) {
+			const view = usePanelView(props);
+			const t = translatorOf(props);
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+				className: "wbp-main",
+				children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					className: "wbp-mainInner",
+					children: [
+						/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("header", {
+							className: "wbp-header",
+							children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)(Ring, {
+									percent: ringPercent(view),
+									warn: view.benchedCount > 0,
+									size: 20
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+									className: "wbp-headerText",
+									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h2", {
+										className: "wbp-titleLg",
+										children: t("nav")
+									}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+										className: "wbp-subtitle",
+										children: view.available ? t("footerLabel") : t("unavailable")
+									})]
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { className: "wbp-spacer" }),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)(ActionButton, {
+									label: t("refresh"),
+									onClick: () => {
+										props.refresh();
+									}
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)(ActionButton, {
+									label: t("close"),
+									onClick: () => {
+										props.close();
+									}
+								})
+							]
+						}),
+						!view.available && !view.loading ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: "wbp-notice wbp-noticeError",
+							role: "status",
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+								className: "wbp-noticeTitle",
+								children: t("failure")
+							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+								className: "wbp-noticeHint",
+								children: t("unavailable")
+							})]
+						}) : null,
+						view.loading ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+							className: "wbp-hint",
+							children: t("loading")
+						}) : null,
+						view.available ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: "wbp-tiles",
+							children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)(StatTile, {
+									label: t("accounts"),
+									value: String(view.accountCount)
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)(StatTile, {
+									label: t("models"),
+									value: String(view.modelCount)
+								}),
+								view.benchedCount === 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(StatTile, {
+									label: t("benched", { count: view.benchedCount }),
+									value: String(view.benchedCount)
+								})
+							]
+						}) : null,
+						view.products.map((product) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ProductCard, {
+							product,
+							t
+						}, product.id))
+					]
+				})
+			});
+		}
+		/**
+		* The header ring's sweep: how much of what the pools hold is servable now.
+		*
+		* A ring rather than a number because the header has no room for a sentence, and
+		* "everything is fine" is the state a glance should confirm. With nothing read
+		* yet the ring is empty rather than full, so "nothing known" does not look like
+		* "all healthy".
+		*/
+		function ringPercent(view) {
+			if (view.accountCount === 0) return 0;
+			return (view.accountCount - view.benchedCount) / view.accountCount * 100;
+		}
+		/**
+		* The sidebar footer card, registered into `sidebar.footer.action` — the list
+		* the shell renders in the sidebar's foot area directly ABOVE the Settings
+		* seat, so the card reads as a bottom-pinned sibling of Settings rather than a
+		* global panel icon at the top of the column.
+		*
+		* The shell wraps nothing here, so this component owns the surface: the button,
+		* its chrome and its accessible name. In the expanded column it draws the title
+		* row and one line per product (accounts, total credit, models) — the two
+		* products are never merged into one figure, because their credits are not
+		* convertible. In the 56px rail it collapses to a 36px icon button, matching the
+		* shell's own rail geometry. `wide` arrives from the shell as an owner prop.
+		*
+		* The poll starts here rather than in the panel: the card is always mounted, so
+		* the dashboard opens with data already in hand.
+		*
+		* The one thing that can take this card away is the user's own switch
+		* ({@link PanelView.creditVisible}). The component still MOUNTS when that is
+		* off — it renders `null` and keeps the shared poll alive with it. That matters:
+		* the poll's home is this entry, and a component that unmounted would leave the
+		* dashboard and the composer badge reading a snapshot nothing refreshes.
+		*/
+		function WorkBuddyFooterEntry(props) {
+			const view = usePanelView(props);
+			const t = translatorOf(props);
+			const startAutoRefresh = props.startAutoRefresh;
+			const refresh = props.refresh;
+			useEffectOnce(startAutoRefresh);
+			if (!view.preferencesSettled) return null;
+			if (!view.creditVisible) return null;
+			const label = view.footTitle === "" ? t("footerLabel") : view.footTitle;
+			if (!props.wide) return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+				type: "button",
+				className: "wbp-railButton",
+				"aria-label": t("railLabel"),
+				title: label,
+				onClick: () => {
+					props.open();
+				},
+				children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(Ring, {
+					percent: ringPercent(view),
+					warn: view.benchedCount > 0,
+					size: 18
+				})
+			});
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+				type: "button",
+				className: "wbp-foot",
+				"aria-label": label,
+				title: label,
+				onClick: () => {
+					props.open();
+				},
+				onDoubleClick: () => {
+					refresh();
+				},
+				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+					className: "wbp-footTop",
+					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						className: "wbp-footName",
+						children: t("nav")
+					}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { className: "wbp-spacer" })]
+				}), view.footProducts.map((product) => {
+					const remaining = product.creditsRemaining;
+					const capacity = product.creditsCapacity;
+					const format = (value) => new Intl.NumberFormat(void 0, { maximumFractionDigits: 1 }).format(value);
+					const used = capacity === void 0 || remaining === void 0 ? void 0 : Math.max(0, capacity - remaining);
+					const percent = capacity === void 0 || capacity <= 0 || used === void 0 ? 0 : Math.min(100, used / capacity * 100);
+					const usageStyle = view.creditStyle === "usage";
+					return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+						className: cx("wbp-footRow", usageStyle && "wbp-footRowUsage"),
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+							className: "wbp-footHead",
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "wbp-footLabel",
+								children: usageStyle ? product.name : t("creditRemainingLabel", { product: product.name })
+							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "wbp-footAmount",
+								children: product.state !== "signed-in" ? stateText(product, t) : usageStyle ? used === void 0 || capacity === void 0 ? remaining === void 0 ? t("creditPending") : t("creditRemaining", { remaining: format(remaining) }) : t("creditUsed", {
+									used: format(used),
+									total: format(capacity)
+								}) : remaining === void 0 ? t("creditPending") : format(remaining)
+							})]
+						}), !usageStyle || product.state !== "signed-in" || capacity === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: "wbp-footBar",
+							role: "progressbar",
+							"aria-label": product.name,
+							"aria-valuemin": 0,
+							"aria-valuemax": 100,
+							"aria-valuenow": Math.round(percent),
+							children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "wbp-footFill",
+								style: { width: `${String(percent)}%` }
+							})
+						})]
+					}, product.id);
+				})]
+			});
+		}
+		//#endregion
+		//#region src/client/provider-card.tsx
+		/**
+		* The WorkBuddy card inside the harness Models settings page (browser half).
+		*
+		* Rendered through the `settings.models.provider-card` keyed slot, registered
+		* under `entryKey = settingsNs` — the key the Models page dispatches for every
+		* row of an adapter family. That row exists because the host half now
+		* contributes a `registerConfigurableProviders` directory entry for the
+		* variant; without it there would be no row and therefore nowhere for this card
+		* to render (see `src/index.ts`).
+		*
+		* The Models page keeps its own editor, which for this namespace has no fields
+		* to offer. This card is the real surface beside it: the pool's state, the
+		* accounts and their balances, and the way through to the accounts page. It
+		* deliberately does NOT duplicate the whole page — a row in a provider list is
+		* a summary, and the full management surface is one click away.
+		*
+		* Styles ride the settings page's stylesheet (`wbp-` classes), injected once by
+		* the client entry, so the card and the page it summarizes cannot drift apart
+		* visually.
+		*
+		* @module dsh-workbuddy-connect/client/provider-card
+		*/
+		/** How often the card re-reads its product while it is on screen. */
+		const REFRESH_INTERVAL_MS = 3e4;
+		/**
+		* Bind this card's dictionary to the shared account-summary words.
+		*
+		* The provider card states the same facts as the accounts page, so it reuses
+		* the same projection; only the wording comes from this namespace.
+		*/
+		function summaryCopy(t) {
+			return {
+				disabled: t("accountStateDisabled"),
+				sessionDead: t("accountStateSessionDead"),
+				exhausted: t("accountStateExhausted"),
+				limited: t("accountStateLimited"),
+				expired: t("accountExpired"),
+				creditsFailed: t("accountCreditsFailed"),
+				creditsPending: t("accountCreditsPending"),
+				remainingOf: ({ remaining, total }) => t("accountMetaRemainingOf", {
+					remaining,
+					total
+				}),
+				remaining: ({ remaining }) => t("accountMetaRemaining", { remaining }),
+				used: ({ used }) => t("accountMetaUsed", { used }),
+				requests: ({ count }) => t("accountMetaRequests", { count }),
+				inputTokens: ({ value }) => t("accountMetaInputTokens", { value }),
+				outputTokens: ({ value }) => t("accountMetaOutputTokens", { value }),
+				cache: ({ percent }) => t("accountMetaCache", { percent }),
+				resets: ({ when }) => t("accountMetaResets", { when }),
+				tokenExpires: ({ when }) => t("accountMetaTokenExpires", { when }),
+				wait: ({ value, unit }) => t(unit === "hour" ? "waitHours" : "waitMinutes", { value })
+			};
+		}
+		/**
+		* Which variant this occurrence belongs to.
+		*
+		* The slot hands the card its directory row, so the provider id is the one
+		* reliable answer; without a row (an older host that dispatches the slot with
+		* no owner props) the card degrades to the first variant rather than refusing
+		* to render.
+		*/
+		function variantFor(owner) {
+			const id = owner?.provider?.provider;
+			return CARD_VARIANTS.find((variant) => variant.id === id) ?? CARD_VARIANTS[0];
+		}
+		/**
+		* The card body. Reads its own product's status document, which is the same
+		* route the accounts page and the dashboard read — one source, so the three
+		* surfaces cannot disagree about a balance.
+		*/
+		function WorkBuddyProviderCard(props) {
+			const variant = variantFor(props);
+			const { t } = props;
+			const [status, setStatus] = (0, react.useState)();
+			const [failed, setFailed] = (0, react.useState)(false);
+			const [reading, setReading] = (0, react.useState)(false);
+			const mounted = (0, react.useRef)(true);
+			(0, react.useEffect)(() => {
+				mounted.current = true;
+				return () => {
+					mounted.current = false;
+				};
+			}, []);
+			const read = (0, react.useCallback)(async (signal) => {
+				if (signal === void 0) setReading(true);
+				try {
+					const result = await readWorkBuddyStatus(variant, signal);
+					if (!mounted.current || signal?.aborted === true) return;
+					if (result.state !== "read") {
+						setFailed(true);
+						return;
+					}
+					setStatus(result.status);
+					setFailed(false);
+				} finally {
+					if (signal === void 0 && mounted.current) setReading(false);
+				}
+			}, [variant.statusPath]);
+			(0, react.useEffect)(() => {
+				const controller = new AbortController();
+				read(controller.signal);
+				const tick = window.setInterval(() => {
+					read(controller.signal);
+				}, REFRESH_INTERVAL_MS);
+				return () => {
+					window.clearInterval(tick);
+					controller.abort();
+				};
+			}, [read]);
+			const accounts = status !== void 0 && "accounts" in status ? status.accounts?.accounts ?? [] : [];
+			const signedIn = status !== void 0 && status.status === "signed-in";
+			const ready = accounts.filter((account) => account.available).length;
+			const benched = accounts.filter((account) => account.cooldown !== void 0 && account.cooldown.untilMs > Date.now()).length;
+			const models = signedIn ? status.models?.length ?? 0 : 0;
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: "wbp-providerCard",
+				children: [
+					failed && status === void 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: "wbp-rowError",
+						children: t("requestFailed")
+					}) : null,
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: "wbp-tiles",
+						children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)(StatTile, {
+								label: t("cardAccounts"),
+								value: String(accounts.length),
+								sub: accounts.length === 0 ? void 0 : t("cardReady", {
+									ready,
+									total: accounts.length
+								})
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)(StatTile, {
+								label: t("cardModels"),
+								value: String(models)
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)(StatTile, {
+								label: t("cardBenched"),
+								value: String(benched),
+								...benched === 0 ? {} : { sub: t("accountStateLimited") }
+							})
+						]
+					}),
+					accounts.length === 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: "wbp-hint",
+						children: t("accountEmpty")
+					}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: "wbp-accountList",
+						children: accounts.map((account) => {
+							const copy = summaryCopy(t);
+							const state = accountSummaryState(account, Date.now(), copy);
+							return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+								className: "wbp-accountRow",
+								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									className: "wbp-accountHead",
+									children: [
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)(StatusDot, {
+											tone: state.tone,
+											title: state.text === "" ? t("accountStateReady") : state.text
+										}),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "wbp-accountName",
+											title: account.name,
+											children: account.name
+										}),
+										state.text === "" ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "wbp-usagePlanStatus",
+											children: state.text
+										})
+									]
+								}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+									className: "wbp-accountMeta",
+									children: accountSummaryMeta(account, Date.now(), copy)
+								})]
+							}, account.id);
+						})
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: "wbp-inlineActions",
+						children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ActionButton, {
+							label: t("cardRefresh"),
+							disabled: reading,
+							onClick: () => {
+								read();
+							}
+						})
+					})
+				]
+			});
+		}
+		/** Notify every subscriber without letting one faulty consumer suppress the rest. */
+		function notify(listeners) {
+			for (const listener of listeners) try {
+				listener();
+			} catch (error) {
+				console.error("[dsh-workbuddy-connect] panel subscriber failed:", error);
+			}
+		}
+		/**
+		* Create the shared panel store.
+		*
+		* A failed read leaves that variant's previous document in place rather than
+		* clearing it: a transient network error must not blank a dashboard the user is
+		* looking at, and the next sweep replaces it anyway.
+		*/
+		function createWorkBuddyPanelStore(options = {}) {
+			const variants = options.variants ?? CARD_VARIANTS;
+			const doFetch = options.fetch ?? ((...args) => globalThis.fetch(...args));
+			const intervalMs = options.intervalMs ?? 6e4;
+			const now = options.now ?? (() => Date.now());
+			let snapshot = {
+				statuses: {},
+				loading: false,
+				fetchedAt: 0
+			};
+			const listeners = /* @__PURE__ */ new Set();
+			let inFlight;
+			let timer;
+			const publish = (next) => {
+				if (Object.is(next.statuses, snapshot.statuses) && next.loading === snapshot.loading && next.fetchedAt === snapshot.fetchedAt) return;
+				snapshot = next;
+				notify(listeners);
+			};
+			const sweep = async () => {
+				publish({
+					...snapshot,
+					loading: true
+				});
+				const answers = await Promise.all(variants.map(async (variant) => {
+					try {
+						const response = await doFetch(variant.statusPath, {
+							headers: { accept: "application/json" },
+							credentials: "same-origin"
+						});
+						if (!response.ok) return void 0;
+						const value = await response.json().catch(() => void 0);
+						return isWorkBuddyWebStatus(value) ? [variant.id, value] : void 0;
+					} catch {
+						return;
+					}
+				}));
+				const statuses = { ...snapshot.statuses };
+				for (const answer of answers) if (answer !== void 0) statuses[answer[0]] = answer[1];
+				publish({
+					statuses,
+					loading: false,
+					fetchedAt: now()
+				});
+			};
+			return {
+				getSnapshot: () => snapshot,
+				subscribe(listener) {
+					listeners.add(listener);
+					return () => {
+						listeners.delete(listener);
+					};
+				},
+				refresh() {
+					if (inFlight !== void 0) return inFlight;
+					inFlight = sweep().finally(() => {
+						inFlight = void 0;
+					});
+					return inFlight;
+				},
+				start() {
+					if (timer !== void 0) return () => {
+						if (timer === void 0) return;
+						clearInterval(timer);
+						timer = void 0;
+					};
+					this.refresh();
+					timer = setInterval(() => {
+						this.refresh();
+					}, intervalMs);
+					timer.unref?.();
+					return () => {
+						if (timer === void 0) return;
+						clearInterval(timer);
+						timer = void 0;
+					};
+				}
+			};
+		}
+		//#endregion
+		//#region src/client/ui-styles.ts
+		/**
+		* Two stylesheets for the WorkBuddy surfaces: the settings page (and the
+		* Models-page provider card, which shares its classes) and the plans panel
+		* (the sidebar footer card plus the dashboard it opens).
+		*
+		* Returned as strings rather than injected here so the modules stay free of DOM
+		* side effects at import time: `./index.tsx` installs each once, keyed by its
+		* own `data-plugin-css` id. The metrics are the harness's own settings pages'
+		* — read out of the 0.1.7 bundles so these surfaces sit beside General and
+		* Models without looking foreign: a row is 16px of padding over a 0.5px
+		* border-l2 hairline, its title 14/22 label-primary, its description 12/18
+		* label-tertiary, the control on the right. Inputs are 32px with an 8px radius,
+		* a card is a 0.5px border-l4 outline with a 16px radius, a nested panel is a
+		* bg-module-platform fill.
+		*
+		* Two design rules hold throughout, both learned from the reference
+		* implementation this is ported from (dsh-commandcode-provider):
+		*
+		* - **No literal colours.** Every value is a `--dsw-alias-*` token with a
+		*   neutral fallback, so the page follows the active theme, light or dark.
+		*   Literal colours get this wrong in exactly one mode: `brand-primary`
+		*   inverts between them, so a hardcoded white thumb vanishes in dark mode.
+		* - **The content column is a fixed 720px稿纸.** The page is a stack of
+		*   groups of hairline-separated rows — no card surfaces — which is what makes
+		*   it read as a settings page rather than as a dashboard.
+		*
+		* The `wbp-` prefix is kept (rather than the reference's `cc-`) because these
+		* rules are GLOBAL CSS: another plugin's stylesheet with the same prefix would
+		* silently restyle these surfaces, and the reference plugin is installed on
+		* this machine.
+		*
+		* @module dsh-workbuddy-connect/client/ui-styles
+		*/
+		/** Idempotency key for the settings-page stylesheet. */
+		const PAGE_CSS_ID = "dsh-workbuddy-connect-page";
+		/** Idempotency key for the panel stylesheet. */
+		const PANEL_CSS_ID = "dsh-workbuddy-connect-panel";
+		/**
+		* The settings-page stylesheet: a 720px column of groups, each a heading over
+		* hairline-separated rows, plus the fields, toggles, segmented controls,
+		* account cards and dialogs the page composes from it.
+		*/
+		const PAGE_CSS = `
+.wbp-section{max-width:720px;color:var(--dsw-alias-label-primary);flex-direction:column;display:flex}
+.wbp-spacer{flex:1}
+/* Groups: a heading over hairline-separated rows, no card surface. */
+.wbp-group{flex-direction:column;display:flex;margin-top:28px}
+.wbp-groupHead{align-items:center;gap:8px;display:flex;min-height:28px;padding-bottom:4px}
+.wbp-groupTitle{margin:0;color:var(--dsw-alias-label-primary);font-size:14px;font-weight:500;line-height:22px}
+.wbp-groupDesc{margin:0 0 12px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.wbp-rows>.wbp-groupDesc{margin:0;padding:4px 0 0}
+.wbp-rows{flex-direction:column;display:flex}
+.wbp-row{align-items:center;gap:8px;display:flex;padding:16px 0;border-bottom:.5px solid var(--dsw-alias-border-l2)}
+.wbp-rows>.wbp-row:last-child{border-bottom:0}
+.wbp-rowNested{padding-left:16px}
+.wbp-rowFlush{padding:0;border-bottom:0}
+.wbp-rowText{flex-direction:column;flex:1;gap:4px;min-width:0;padding-right:32px;display:flex}
+.wbp-rowTitleLine{align-items:center;gap:8px;display:flex;min-width:0}
+.wbp-rowTitle{min-width:0;color:var(--dsw-alias-label-primary);font-size:14px;font-weight:400;line-height:22px}
+.wbp-rowDesc{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.wbp-rowDesc p{margin:0}
+.wbp-rowDesc p+p{margin-top:4px}
+.wbp-rowError{margin:0;color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:18px}
+.wbp-rowControl{flex:none;align-items:center;justify-content:flex-end;gap:8px;display:inline-flex;max-width:60%}
+/* The platform's link button: a compact capsule with no fill until hovered. */
+.wbp-linkButton{box-sizing:border-box;flex:none;align-items:center;display:inline-flex;height:28px;padding:0 10px;border:0;border-radius:14px;background:0 0;color:var(--dsw-alias-label-tertiary);font:inherit;font-size:12px;line-height:18px;white-space:nowrap;cursor:pointer}
+.wbp-linkButton:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary)}
+.wbp-linkButton:disabled{cursor:default;opacity:.4}
+.wbp-linkButton:focus-visible{outline:none;box-shadow:0 0 0 2px var(--dsw-alias-border-l3)}
+/* Tags: the platform Tag's capsule (11/17, weight 500). */
+/* A label paired with a value on one baseline (the total-credit line). */
+.wbp-factLabel{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.wbp-factValue{color:var(--dsw-alias-label-primary);font-size:12px;line-height:18px;font-variant-numeric:tabular-nums}
+/* The stacked field (the Models-page provider card and the account forms):
+ * the platform SettingsForm field's metrics. */
+.wbp-fieldHead{align-items:center;gap:8px;display:flex}
+.wbp-label{min-width:0;color:var(--dsw-alias-label-primary);flex:1;font-size:13px;font-weight:500;line-height:1.5}
+.wbp-input{box-sizing:border-box;height:32px;min-width:0;padding:0 10px;border:.5px solid var(--dsw-alias-border-l4);border-radius:8px;background:var(--dsw-alias-bg-layer-1);font:inherit;color:var(--dsw-alias-label-primary);font-size:14px;line-height:22px}
+.wbp-input::placeholder{color:var(--dsw-alias-label-dimmed)}
+.wbp-input:focus-visible{border-color:var(--dsw-alias-brand-primary);outline:none}
+.wbp-input:disabled{opacity:.6;cursor:default}
+.wbp-hint{color:var(--dsw-alias-label-tertiary);margin:0;font-size:12px;line-height:18px}
+/* An informational outcome (a save that took an older host's route): the same
+ * metrics as the error line and the other colour, so it reads as a note. */
+.wbp-notice{color:var(--dsw-alias-state-warn-label,var(--dsw-alias-label-tertiary));margin:0;font-size:12px;line-height:18px}
+/* The checkbox, drawn rather than native: color-scheme is set once at BOOT and
+ * is not re-applied when the theme is switched in-session, so a native box can
+ * paint light chrome on a dark page. The mark rides brand-primary, so it takes
+ * the theme's foreground for that fill. */
+.wbp-check{box-sizing:border-box;appearance:none;flex-shrink:0;width:16px;height:16px;margin:0;border:1px solid var(--dsw-alias-border-l3);border-radius:4px;background:0 0;position:relative}
+.wbp-check:checked{background:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary)}
+.wbp-check:checked::after{content:'';position:absolute;top:3px;left:5px;width:3px;height:7px;border:solid var(--dsw-alias-label-primary-foreground,#fff);border-width:0 1.5px 1.5px 0;transform:rotate(45deg)}
+.wbp-check:disabled{cursor:default;opacity:.4}
+.wbp-checkRow{align-items:center;gap:8px;display:inline-flex;min-width:0}
+.wbp-checkRow:hover{cursor:pointer}
+.wbp-checkName{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* The platform Switch: a 36x20 capsule padding its track by 2px, sliding a
+ * 16px thumb across the 32px content box. corner-shape:round on both the track
+ * and the thumb keeps the capsule from squaring its ends around a round thumb. */
+.wbp-toggle{box-sizing:border-box;appearance:none;flex-shrink:0;width:36px;height:20px;margin:0;padding:2px;border:0;border-radius:10px;corner-shape:round;background:var(--dsw-alias-border-l3);cursor:pointer;position:relative}
+.wbp-toggle:checked{background:var(--dsw-alias-brand-primary)}
+.wbp-toggle::after{content:'';display:block;width:16px;height:16px;border-radius:50%;corner-shape:round;background:var(--dsw-alias-label-primary-foreground);transition:transform .12s ease}
+.wbp-toggle:checked::after{transform:translateX(16px)}
+.wbp-toggle:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
+.wbp-toggle:disabled{cursor:default;opacity:.5}
+/* The platform SegmentedControl: a translucent track with one raised pill that
+ * slides under the picked segment. Segments are equal grid tracks, so the
+ * indicator's width and offset follow from the count and index alone — no DOM
+ * measurement. */
+.wbp-segmented{position:relative;display:inline-grid;grid-auto-flow:column;grid-auto-columns:1fr;gap:2px;padding:4px;border-radius:var(--dsw-radius-md,9px);background:var(--dsw-alias-interactive-bg-hover)}
+.wbp-segmentIndicator{position:absolute;top:4px;left:4px;width:calc((100% - 8px - 2px * (var(--wbp-segment-count) - 1)) / var(--wbp-segment-count));height:calc(100% - 8px);border-radius:var(--dsw-radius-sm,6px);background:var(--dsw-alias-bg-layer-1);box-shadow:var(--dsw-elevation-soft,0 1px 2px rgba(0,0,0,.12));transform:translateX(calc(var(--wbp-segment-index) * (100% + 2px)));transition:transform .16s ease;pointer-events:none}
+.wbp-segment{box-sizing:border-box;position:relative;z-index:1;height:28px;padding:0 16px;border:0;border-radius:var(--dsw-radius-sm,6px);background:0 0;color:var(--dsw-alias-label-secondary);font:inherit;font-size:13px;font-weight:500;line-height:20px;white-space:nowrap;cursor:pointer;transition:color .12s ease}
+.wbp-segment:hover:not(:disabled),.wbp-segment[aria-checked=true]{color:var(--dsw-alias-label-primary)}
+.wbp-segment:disabled{cursor:default;opacity:.4}
+/* ------------------------------------------------- the model picker menu */
+/* The multi-select trigger: the platform's selector capsule (the reference
+ * implementation's .cc-selector, same numbers). */
+.wbp-modelSelectAnchor{flex-direction:column;align-items:stretch;gap:6px;display:inline-flex;min-width:160px}
+.wbp-selector{box-sizing:border-box;align-items:center;gap:12px;display:inline-flex;height:36px;padding:0 14px;border:0;border-radius:18px;corner-shape:round;background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-label-primary);font:inherit;font-size:14px;line-height:22px;text-align:left;cursor:pointer}
+.wbp-selector:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}
+.wbp-selector:disabled{cursor:default;opacity:.4}
+.wbp-selector:focus-visible{outline:none;box-shadow:0 0 0 2px var(--dsw-alias-border-l3)}
+.wbp-selectorText{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wbp-selectorCaret{flex-shrink:0;border-right:1.5px solid var(--dsw-alias-label-tertiary);border-bottom:1.5px solid var(--dsw-alias-label-tertiary);width:6px;height:6px;margin-bottom:3px;transform:rotate(45deg)}
+/* The portaled list needs its own floor: the models are long names, and a menu
+ * clamped to the trigger's width would ellipsis the part that tells two of them
+ * apart. */
+.wbp-modelMenu{min-width:240px}
+/* The search box sits INSIDE the Menu anchor, so typing in it never trips the
+ * Menu's outside-click close. */
+.wbp-modelSearch{width:100%}
+.wbp-modelSearch::-webkit-search-cancel-button{cursor:pointer}
+/* A model the filter excludes: the platform's muted dot, the same mark the
+ * reference implementation's account default-state column uses. */
+.wbp-modelFiltered{flex-shrink:0;width:6px;height:6px;border-radius:50%;corner-shape:round;background:var(--dsw-alias-label-dimmed,var(--dsw-alias-label-tertiary))}
+/* Three dots from one element: the dot itself plus two box-shadow copies (the
+ * reference implementation's .cc-kebab). */
+.wbp-kebab{width:3px;height:3px;border-radius:50%;corner-shape:round;background:currentColor;box-shadow:0 -5px 0 currentColor,0 5px 0 currentColor}
+/* ------------------------------------------------ account meters (cc port) */
+/* ------------------------------------------- the add-account affordance */
+/* The Models page's dashed add button, opening a filled panel in its place. */
+/* ------------------------------------------------------ staged edit bar (cc port) */
+/* The floating save bar, pinned to the bottom of the page's scrollport and slid
+ * out of view when there is nothing to save. Ported from the reference
+ * implementation's .cc-saveBar: a 44px capsule, 22px radius, concentric 36px
+ * buttons, and a leading tone dot. */
+.wbp-saveBarDock{position:sticky;bottom:0;z-index:20;height:0;pointer-events:none}
+.wbp-saveBar{--wbp-saveBar-tone:var(--dsw-alias-state-warn-primary,#d97706);position:absolute;left:50%;bottom:20px;box-sizing:border-box;width:max-content;max-width:calc(100% - 24px);align-items:center;gap:10px;display:flex;height:44px;padding:4px 4px 4px 16px;border:0;border-radius:22px;corner-shape:round;background:var(--dsw-alias-bg-layer-1);box-shadow:var(--dsw-elevation-prominent,0 12px 32px -8px rgba(0,0,0,.24),0 2px 8px rgba(0,0,0,.08));opacity:0;visibility:hidden;transform:translate(-50%,12px);transition:opacity .16s ease,transform .16s ease,visibility 0s linear .16s}
+.wbp-saveBarShown{opacity:1;visibility:visible;transform:translate(-50%,0);pointer-events:auto;transition:opacity .2s ease,transform .24s cubic-bezier(.2,.9,.3,1.1),visibility 0s}
+.wbp-saveBarError{--wbp-saveBar-tone:var(--dsw-alias-state-error-primary)}
+.wbp-saveBarSuccess{--wbp-saveBar-tone:var(--dsw-alias-state-success-primary,#16a34a);padding-right:18px}
+.wbp-saveBarIcon{flex-shrink:0;align-items:center;justify-content:center;display:inline-flex;width:16px;height:16px;color:var(--wbp-saveBar-tone)}
+.wbp-saveBarPulse{width:8px;height:8px;border-radius:50%;corner-shape:round;background:var(--wbp-saveBar-tone)}
+.wbp-saveBarText{min-width:0;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-primary);font-size:14px;line-height:22px}
+.wbp-saveBarError .wbp-saveBarText{color:var(--dsw-alias-state-error-primary)}
+.wbp-saveBarActions{flex-shrink:0;align-items:center;gap:4px;display:flex;margin-left:8px}
+.wbp-saveBarButton{box-sizing:border-box;height:36px;padding:0 16px;border:0;border-radius:18px;corner-shape:round;font:inherit;font-size:14px;line-height:22px;white-space:nowrap;cursor:pointer}
+.wbp-saveBarButton:focus-visible{outline:none;box-shadow:0 0 0 2px var(--dsw-alias-border-l3)}
+.wbp-saveBarButton:disabled{cursor:default;opacity:.4}
+.wbp-saveBarGhost{background:0 0;color:var(--dsw-alias-label-primary)}
+.wbp-saveBarGhost:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}
+.wbp-saveBarPrimary{background:var(--dsw-alias-button-primary-fill,var(--dsw-alias-brand-primary));color:var(--dsw-alias-label-primary-foreground,#fff)}
+.wbp-saveBarPrimary:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover,var(--dsw-alias-button-primary-fill,var(--dsw-alias-brand-primary)))}
+/* ------------------------------------------------------------- accounts */
+/* One card per PRODUCT, every account of that product as a row inside it.
+ * The card is the platform's outlined surface (0.5px border-l4, 16px radius),
+ * because it groups rows rather than being a row itself; the rows inside carry
+ * no chrome at all, only a hairline between them. */
+.wbp-productCards{flex-direction:column;gap:12px;display:flex}
+.wbp-productCard{box-sizing:border-box;flex-direction:column;display:flex;padding:12px 14px 4px;border:.5px solid var(--dsw-alias-border-l4);border-radius:16px;min-width:0}
+.wbp-productHead{align-items:center;gap:8px;display:flex;min-width:0;padding-bottom:8px}
+.wbp-productName{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-primary);font-size:14px;font-weight:500;line-height:22px}
+.wbp-productCount{flex:none;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.wbp-productTotal{flex:none;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.wbp-productDetail{margin:0 0 8px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.wbp-accountList{flex-direction:column;display:flex;min-width:0}
+/* One account: a name line and ONE grey line under it. No disclosure, no
+ * per-account card — the pool is one subject and its rows are comparable only
+ * when they share a frame. The hairline separates rows, and the last row drops
+ * it so the card's own border is the only line at the bottom. */
+.wbp-accountRow{flex-direction:column;gap:2px;display:flex;min-width:0;padding:10px 2px;border-bottom:.5px solid var(--dsw-alias-border-l2)}
+.wbp-accountList>.wbp-accountRow:last-child{border-bottom:0}
+/* The account the pool is actually serving from: the reference
+ * implementation's own active-row mark, kept as a left accent rather than a
+ * border so it does not shift the row's text by a pixel when it flips. */
+.wbp-accountRowActive{padding-left:8px;box-shadow:inset 2px 0 0 var(--dsw-alias-brand-primary)}
+.wbp-accountHead{align-items:center;gap:8px;display:flex;min-width:0;min-height:22px}
+.wbp-accountName{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-primary);font-size:14px;font-weight:500;line-height:22px}
+/* The grey meta line: every figure the row states, separated by a middot. It
+ * wraps rather than truncates — a figure the reader cannot see is worse than a
+ * second line — and its numbers are tabular so rows line up down the column. */
+.wbp-accountMeta{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.wbp-usagePlanStatus{flex:none;margin:0;white-space:nowrap;color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:18px}
+.wbp-iconButton{flex-shrink:0;align-items:center;justify-content:center;display:inline-flex;width:28px;height:28px;padding:0;background:0 0;border:0;border-radius:6px;color:var(--dsw-alias-label-tertiary);cursor:pointer}
+.wbp-iconButton:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.wbp-iconButton:disabled{cursor:default;opacity:.4}
+.wbp-iconButton:focus-visible{outline:none;box-shadow:0 0 0 2px var(--dsw-alias-border-l3)}
+.wbp-inlineForm,.wbp-confirmBar{flex-direction:column;gap:8px;display:flex}
+.wbp-inlineActions{align-items:center;gap:8px;display:flex;flex-wrap:wrap}
+.wbp-confirmBar{border:.5px solid var(--dsw-alias-state-error-primary);border-radius:12px;padding:12px 14px}
+.wbp-confirmText{color:var(--dsw-alias-label-primary);margin:0;font-size:14px;line-height:22px}
+/* Adding an account: the Models page's dashed add button, opening a filled
+ * panel in its place. */
+/* Account report: stat tiles are filled panels, like the platform's editors. */
+/* The per-product total tiles sit under the account cards, so they need the
+ * same air the add button gets — flush against the last card they read as part
+ * of it. The reference implementation has no equivalent row, so this spacing is
+ * ours to set. */
+.wbp-usageStat{min-width:0;flex-direction:column;gap:2px;display:flex;padding:10px 12px;border-radius:12px;background:var(--dsw-alias-bg-module-platform)}
+.wbp-usageStatLabel{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.wbp-usageStatValue{color:var(--dsw-alias-label-primary);font-size:16px;font-weight:500;line-height:24px;font-variant-numeric:tabular-nums}
+.wbp-usageStatSub{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* Tabs across the top of the page: one per product. */
+/* --------------------------------------------------------------- models */
+.wbp-modelRow{align-items:center;gap:8px;display:flex;padding:10px 0;border-bottom:.5px solid var(--dsw-alias-border-l2)}
+/* The row's left half: the mark, the name, its promotions and its rate. Grows to take the space the fixed control column leaves. */
+.wbp-modelMain{align-items:center;gap:8px;display:flex;flex:1;min-width:0}
+.wbp-modelName{min-width:0;color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* The row's right-hand column, as a fixed grid so the rows line up top to
+ * bottom: one column per slot (probe result, Detect button, context figure),
+ * each sized to its widest occupancy. Flow layout could not hold a column — a
+ * row without a Detect button would pull its context figure left, and the
+ * figures would read as ragged down the page even though every row is
+ * individually correct.
+ *
+ * The two fixed tracks are the widths of the button and of the context figure
+ * at their widest real content, so a row can be missing either without shifting
+ * the other. The first track is auto so the result badge takes what it needs;
+ * justify-items:end keeps every cell flush right, which is what makes the
+ * column's edge straight. */
+.wbp-modelControl{flex:none;align-items:center;display:grid;grid-template-columns:auto 76px minmax(120px,auto);gap:8px;justify-items:end}
+.wbp-modelProbeResult{display:inline-flex;justify-content:flex-end;min-width:0}
+.wbp-modelProbeAction{display:inline-flex;justify-content:flex-end}
+.wbp-modelContext{display:inline-flex;justify-content:flex-end;align-items:center;text-align:right;white-space:nowrap}
+/* --------------------------------------------------------------- dialogs */
+/* The overlay portals to document.body (see WorkBuddySettingsPage), so its
+   z-index is compared in the ROOT stacking context — against the host's own
+   chrome, not just this page. The host stacks its shell and chat surfaces up
+   to z-index 1100 and reserves layers beyond that; the original 60 sat behind
+   the Settings surface the dialog was opened from, so the click meant to
+   dismiss the dialog landed on Settings instead — and closing Settings
+   unmounted the dialog with it. Pinned near the top of the 32-bit range: a
+   modal this plugin opens must never interleave with host chrome. */
+.wbp-overlay{position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;padding:24px;background:var(--dsw-alias-bg-mask,rgba(0,0,0,.45))}
+.wbp-dialog{box-sizing:border-box;width:100%;max-width:380px;display:flex;flex-direction:column;gap:14px;padding:20px;border-radius:16px;border:.5px solid var(--dsw-alias-border-l4);background:var(--dsw-alias-bg-layer-1);box-shadow:var(--dsw-elevation-prominent,0 12px 32px -8px rgba(0,0,0,.24))}
+.wbp-dialogTitle{margin:0;color:var(--dsw-alias-label-primary);font-size:16px;line-height:24px;font-weight:500;text-align:center}
+.wbp-dialogBody{margin:0;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}
+.wbp-dialogActions{display:flex;justify-content:flex-end;gap:8px}
+.wbp-qrFrame{display:flex;align-items:center;justify-content:center;padding:12px;border-radius:12px;background:#fff}
+.wbp-tokenArea{box-sizing:border-box;width:100%;min-height:96px;padding:10px;border:.5px solid var(--dsw-alias-border-l4);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;line-height:20px;resize:vertical}
+/* The address of a page no strategy could open: a copy target, so it stays
+ * selectable and reads in the same field style as the other inputs. */
+.wbp-linkFallback{display:flex;flex-direction:column;gap:8px}
+.wbp-linkFallback .wbp-input{font-size:12px}
+.wbp-tokenArea:focus-visible{border-color:var(--dsw-alias-brand-primary);outline:none}
+@media (prefers-reduced-motion:reduce){.wbp-toggle::after,.wbp-segmentIndicator,.wbp-segment{transition:none}}
+`;
+		/** The panel stylesheet. */
+		const PANEL_CSS = `
+/* ------------------------------------------------- sidebar footer card */
+/* The shell's foot area renders this list ABOVE the Settings seat, so the card
+   is the sidebar's bottom-most content. The shell supplies no chrome: the entry
+   is the button. It is deliberately quiet — a surface that sits beside Settings
+   should read as part of the column, not as a call to action — with one hover
+   step and a hairline border.
 
-		/** 客户端入口：往设置里加一个独立分区。 */
+   The shell's container is a flex ROW whose occupants each declare a full-width
+   line, so as a row it would overflow the column: this card cannot shrink and a
+   sibling sized 100% would absorb the whole overflow. Both were written for a
+   full-width line, which is what a column gives them. Matched by the CSS-module
+   class STEM — never a hashed name — so a renamed shell degrades to its own row
+   rather than breaking, and anchored under "footArea" rather than the bare
+   "footerActions" stem because that stem is NOT the shell's alone:
+   dsh-client-ui-user-questions renders the ask-user-question dialog's button
+   row with it, and the unanchored rule stacked that dialog's side-by-side
+   buttons on every page. The descendant combinator (rather than a child one)
+   deliberately survives a wrapper element appearing between the two. */
+[class*="_footArea"] [class*="_footerActions"]{flex-direction:column}
+.wbp-foot{box-sizing:border-box;flex:0 0 auto;width:100%;min-width:0;font:inherit;color:var(--dsw-alias-label-secondary);text-align:left;cursor:pointer;background:0 0;border:1px solid transparent;border-radius:10px;flex-direction:column;gap:6px;margin:0 0 4px;padding:8px;display:flex}
+.wbp-foot:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover);border-color:var(--dsw-alias-border-l2)}
+.wbp-foot:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.wbp-footTop{align-items:center;gap:8px;min-width:0;display:flex}
+.wbp-footName{white-space:nowrap;text-overflow:ellipsis;color:var(--dsw-alias-label-primary);min-width:0;overflow:hidden;font-size:13px;font-weight:500;line-height:20px}
+/* ONE line per product: the label names the figure, the figure sits flush right.
+ * nowrap on both halves is load-bearing — the label carries the product name and
+ * "剩余额度", and a wrap would put the number on a line of its own, which is
+ * exactly the stacked layout this replaced. */
+.wbp-footRow{align-items:baseline;gap:8px;min-width:0;display:flex}
+/* The "used / total + bar" style stacks its head line over a full-width bar; the
+ * default style is the single line above. Two shapes rather than two skins of one
+ * markup, because the bar must span the card, not the space left beside a figure. */
+.wbp-footRowUsage{flex-direction:column;gap:4px;align-items:stretch}
+.wbp-footHead{align-items:baseline;gap:8px;min-width:0;display:flex}
+.wbp-footLabel{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px}
+.wbp-footAmount{flex:none;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.wbp-footBar{display:block;width:100%;background:var(--dsw-alias-bg-layer-2);border-radius:999px;height:5px;overflow:hidden}
+.wbp-footFill{display:block;background:var(--dsw-alias-brand-primary);border-radius:999px;height:100%;transition:width .3s ease}
+/* ------------------------------------------------------- composer badge */
+/* The credit figure in the composer dock, to the RIGHT of the harness's own
+ * context readout.
+ *
+ * Two CSS facts make that placement work, and both are needed:
+ *
+ * - The dock renders the slot's entries FIRST and appends its own context meter
+ *   after them, and the slot outlet uses display:contents, so this element is a
+ *   direct flex item of the dock. DOM order alone would therefore put the badge
+ *   LEFT of the meter; the flex order below is what moves it after.
+ * - The dock centres its items, so being last is not the same as being at the
+ *   edge. margin-left:auto absorbs the free space on the badge's left only, which
+ *   pins it to the row's right end with the meter beside it.
+ *
+ * The trigger copies the context meter's (.JObwrW_trigger) metrics: same radius
+ * token, same secondary text size, same 1px/8px padding and 6px gap, and the same
+ * hover/[aria-expanded] fill — the two sit side by side in one row, so any drift
+ * between them reads as one of the two being broken. */
+.wbp-creditBadgeRoot{flex:none;display:inline-flex;align-items:center;order:1;margin-left:auto;position:relative}
+.wbp-creditBadge{border-radius:var(--dsw-radius-sm);color:var(--dsw-alias-label-tertiary);font-family:inherit;font-size:var(--dsh-content-font-size-secondary,13px);font-variant-numeric:tabular-nums;line-height:calc(20px + var(--dsh-content-font-delta-secondary,0px));white-space:nowrap;cursor:pointer;background:0 0;border:none;flex:none;align-items:center;gap:6px;padding:1px 8px;display:inline-flex}
+.wbp-creditBadge:hover,.wbp-creditBadge[aria-expanded=true]{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary)}
+.wbp-creditBadge:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.wbp-creditBadgeName{color:inherit}
+.wbp-creditBadgeValue{color:var(--dsw-alias-label-secondary)}
+.wbp-creditBadge[aria-expanded=true] .wbp-creditBadgeValue{color:var(--dsw-alias-label-primary)}
+/* The expanded panel: the context popover's own material (.JObwrW_panel) —
+ * the menu surface plus its backdrop filter, the prominent elevation token, the
+ * same 12px/-lg radius, the same min(264px, …) width, and the same 12px padding
+ * and 12px type. Fixed-positioned from the trigger (and portalled) so it survives
+ * scrolling and the composer's own overflow. */
+.wbp-badgePanel{position:fixed;z-index:1100;box-sizing:border-box;border-radius:var(--dsw-radius-lg);background:var(--dsw-specific-menu);width:min(264px,100vw - 24px);backdrop-filter:var(--dsw-menu-backdrop-filter);--dsw-elevation-stroke-color:var(--dsw-alias-border-l1);box-shadow:var(--dsw-elevation-prominent);color:var(--dsw-alias-label-secondary);cursor:default;border:0;padding:12px;font-size:12px;line-height:20px}
+/* One product's block, with the pool's own line above its accounts. Separated by
+ * a margin rather than a rule: the context popover's two sections are set apart
+ * the same way, and a hairline here would draw a card the row above does not. */
+.wbp-badgeGroup+.wbp-badgeGroup{margin-top:12px}
+.wbp-badgeGroupHead{display:flex;align-items:center;gap:6px}
+.wbp-badgeGroupName{color:var(--dsw-alias-label-tertiary)}
+.wbp-badgeGroupTotal{font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary);margin-left:auto;font-weight:500}
+.wbp-badgeBar{corner-shape:round;background:var(--dsw-alias-interactive-bg-hover);border-radius:999px;height:4px;margin:10px 0 12px;display:flex;overflow:hidden}
+.wbp-badgeBarFill{background:var(--dsw-alias-brand-primary);border-radius:1px;min-width:2px;height:100%;display:block}
+.wbp-badgeRows{margin:6px 0 0}
+.wbp-badgeRow{justify-content:space-between;align-items:center;gap:12px;padding:2px 0;display:flex}
+.wbp-badgeRow dt{color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.wbp-badgeRow dd{font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary);margin:0;white-space:nowrap}
+/* The expanded panel: the context popover's own material (.JObwrW_panel) —
+ * the menu surface plus its backdrop filter, the prominent elevation token, the
+ * same 12px/-lg radius, the same min(264px, …) width, and the same 12px padding
+ * and 12px type. Fixed-positioned from the trigger (and portalled) so it survives
+ * scrolling and the composer's own overflow. */
+/* One product's block, with the pool's own line above its accounts. Separated by
+ * a margin rather than a rule: the context popover's two sections are set apart
+ * the same way, and a hairline here would draw a card the row above does not. */
+/* -------------------------------------------------------- the rail icon */
+.wbp-railButton{box-sizing:border-box;width:36px;height:36px;color:var(--dsw-alias-label-secondary);cursor:pointer;background:0 0;border:1px solid transparent;border-radius:8px;flex:none;justify-content:center;align-items:center;margin:0 0 4px;padding:0;display:inline-flex}
+.wbp-railButton:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}
+.wbp-railButton:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+/* The quota ring: one glyph serves the rail button, the card's head and the
+   dashboard header. Circumference 2πr = 45.55 at r = 7.25. */
+.wbp-glyph{flex:none;justify-content:center;align-items:center;display:inline-flex;color:var(--dsw-alias-brand-primary)}
+/* ----------------------------------------------------------- dashboard */
+.wbp-main{background:var(--dsw-alias-bg-layer-1);width:100%;height:100%;overflow:auto;display:block}
+.wbp-mainInner{max-width:760px;margin:0 auto;padding:24px 20px 40px;flex-direction:column;gap:14px;display:flex;color:var(--dsw-alias-label-primary)}
+.wbp-header{align-items:center;gap:10px;display:flex;flex-wrap:wrap}
+.wbp-headerText{flex-direction:column;gap:2px;display:flex;min-width:0}
+.wbp-titleLg{margin:0;font-size:18px;font-weight:600;line-height:1.4}
+.wbp-subtitle{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:1.5}
+.wbp-notice{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-3);border-radius:12px;padding:12px 14px;flex-direction:column;gap:4px;display:flex}
+.wbp-noticeError{border-color:var(--dsw-alias-state-error-primary)}
+.wbp-noticeTitle{margin:0;font-size:13px;font-weight:600;line-height:1.5}
+.wbp-noticeError .wbp-noticeTitle{color:var(--dsw-alias-state-error-primary)}
+.wbp-noticeHint{margin:0;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:1.55}
+/* One product's card: the account head, its quota windows, its totals. */
+.wbp-card{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-3);border-radius:14px;padding:16px 18px;flex-direction:column;gap:16px;display:flex}
+.wbp-cardHead{align-items:center;gap:10px;display:flex;flex-wrap:wrap}
+.wbp-avatar{flex:none;width:28px;height:28px;color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-module-platform);border-radius:50%;justify-content:center;align-items:center;font-size:12px;font-weight:600;line-height:1;display:inline-flex}
+.wbp-cardIdentity{flex-direction:column;gap:1px;min-width:0;display:flex}
+.wbp-cardTitle{font-size:13px;font-weight:600;line-height:1.4}
+.wbp-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}
+/* One account's bench: a labelled bar over its remaining wait. */
+@media (prefers-reduced-motion:reduce){.wbp-barFill,.wbp-footFill{transition:none}}
+`;
+		//#endregion
+		//#region src/client/locales.ts
+		const en = {
+			title: "DSH WorkBuddy Connect Functy",
+			intro: "Use the models in the WorkBuddy desktop app directly in DSH — zero configuration, ready out of the box.",
+			titleAI: "DSH WorkBuddy AI Connect Functy",
+			introAI: "Use the models in the WorkBuddy AI international desktop app directly in DSH — zero configuration, ready out of the box.",
+			collapse: "Collapse",
+			loading: "Loading account…",
+			signedOut: "Not signed in",
+			signedOutHint: "Sign in once in the WorkBuddy desktop app; this plugin follows that sign-in automatically.",
+			signedOutHintAI: "Sign in once in the WorkBuddy AI desktop app; this plugin follows that sign-in automatically.",
+			accessTokenExpires: "Access token expires {time} (refresh is automatic)",
+			creditsTotal: "Total: {total}",
+			creditsError: "Credit unavailable: {message}",
+			refresh: "Refresh",
+			refreshing: "Refreshing…",
+			refreshModels: "Refresh model list",
+			catalogError: "Last update failed: {message}",
+			requestFailed: "Request failed",
+			statusResponseInvalid: "WorkBuddy returned an unreadable status reply",
+			accountHeading: "Account",
+			contextHeading: "Context window",
+			useMaximumContextWindow: "Use the largest declared context window",
+			freeModel: "Free",
+			rate: "{rate} credits per message",
+			rateUnknown: "Price unavailable — refresh to update",
+			probeLabel: "Reasoning levels",
+			probeTooltipIdle: "Detect the reasoning levels {model} accepts",
+			probeTooltipVerified: "Accepted levels: {levels} · click to detect again",
+			probeTooltipNotValidating: "This model does not check the effort parameter",
+			probeTooltipRetry: "Detection did not complete · click to retry",
+			probeBubbleBody: "Send test requests to confirm the available reasoning levels. May consume a small amount of credit.",
+			probeConfirmAction: "Confirm",
+			probeNoteVerified: "Detected: {levels}",
+			probeNoteNotValidating: "This model does not check the effort parameter",
+			probeNoteUnknown: "Detection did not complete",
+			probeNoteDismiss: "Got it",
+			probeStart: "Detect",
+			probeRedetect: "Detect again",
+			probeRunning: "Detecting {model}…",
+			probeConfirmBody: "Send test requests to {model} to confirm its available reasoning levels. May consume a small amount of credit.",
+			cancel: "Cancel",
+			probeResultNotValidating: "This model does not check the effort parameter",
+			probeResultUnknown: "Detection did not complete",
+			accountAdd: "Add account",
+			accountAddTitle: "Add an account",
+			accountAddBody: "Open the mobile app, sign in, and scan this code. The account is added to the plugin only — it does not change the desktop app's sign-in.",
+			accountAddWaiting: "Waiting for the scan… ({seconds}s left)",
+			accountChecking: "Checking…",
+			accountQrExpired: "This code expired. Close the dialog and start again.",
+			accountQrInvalid: "This sign-in is no longer valid. Start again.",
+			accountEmpty: "No accounts yet. Sign in to the desktop app, or add one by QR.",
+			accountEmptyHint: "Sign in once — the desktop app's session is picked up automatically — or add an account below.",
+			navWorkBuddy: "DSH-WorkBuddy",
+			accountAddCn: "Add WorkBuddy account",
+			accountAddPickHint: "Which product is this account for?",
+			accountAddAi: "Add WorkBuddy AI account",
+			accountLoginQr: "Scan to sign in",
+			accountLoginWeb: "Sign in on the web",
+			accountLoginDesktop: "Desktop sign-in",
+			accountLoginToken: "Sign-in token",
+			accountDesktopBody: "Reads the sign-in the WorkBuddy desktop app already holds (WorkBuddy AI for the international product). Use it when the app is signed in but the account is missing from this list — for example after removing it.",
+			accountActionLogin: "Add account",
+			accountTokenBody: "Paste the sign-in token from the WorkBuddy web console, or a whole credential JSON ({'account':…,'auth':…}). It is stored on this machine only; a token cannot renew itself — when it expires you paste a new one.",
+			accountTokenPlaceholder: "Paste the token (eyJ…) or a credential JSON ({…)",
+			accountSubmit: "Add",
+			accountOpenLink: "Open sign-in page",
+			accountOpenLinkFailed: "The page could not be opened automatically. Copy this address into your browser:",
+			accountWebBody: "Sign in on the page that just opened in your browser; the account is added here automatically as soon as it is done.",
+			accountWebWaiting: "Waiting for the sign-in to finish… ({seconds}s left)",
+			accountExpired: "Sign-in expired",
+			modelsHeading: "Models",
+			modelsRefresh: "Refresh list",
+			modelsSwitchLabel: "Which model list",
+			modelsSwitchTitle: "{product} model list · {count} models",
+			modelsCount: "{count} models",
+			contextLabel: "Context length",
+			contextSwitchTitle: "Run this model at {size}",
+			modelsEmpty: "No models yet. Refresh the list, or check the account above.",
+			modelsSourceLive: "Updated {time}",
+			modelsSourceSaved: "Saved list from {time}",
+			modelsSourceFallback: "Built-in list",
+			accountRotateHint: "Requests rotate between these accounts; one that answers \"too many requests\" is set aside for a while and tried again later.",
+			accountTest: "Test",
+			accountEnable: "Enable",
+			accountDisable: "Disable",
+			accountRename: "Rename",
+			accountRemove: "Remove",
+			accountRemoveConfirm: "Remove {name}? Its stored sign-in is deleted and cannot be recovered without scanning again.",
+			accountActions: "Account actions",
+			accountRenamePlaceholder: "Account name",
+			accountApply: "Apply",
+			accountRemoveAction: "Remove account",
+			sidebarStyleHeading: "Sidebar",
+			sidebarStyleLabel: "Sidebar credit line",
+			sidebarStyleHint: "How the sidebar card states each product's credit.",
+			sidebarStyleRemaining: "Remaining only",
+			sidebarStyleUsage: "Used / total + bar",
+			sidebarSettingUnsupported: "This DSH host does not accept the setting. Restart DSH Desktop and try again.",
+			sidebarVisibleLabel: "Sidebar credit card",
+			sidebarVisibleHint: "Shows both products' balances at the bottom of the sidebar. Off: no card is drawn there, and the dashboard is opened from the sidebar alone.",
+			composerVisibleLabel: "Composer credit badge",
+			composerVisibleHint: "Shows the selected product's balance at the right of the composer row, beside the context readout. Click it to list every account's credit.",
+			probeControlVisibleLabel: "Composer detection control",
+			probeControlVisibleHint: "Shows the reasoning-level detection control beside the model selector. Off: detection stays available from this page's model list.",
+			accountRefreshAll: "Refresh accounts",
+			accountRefreshAllHint: "Re-reads every signed-in account's balance and state, across both products.",
+			accountCredits: "Credits {total}",
+			accountCreditsPending: "Credits —",
+			/** The grey line under an account's name, piece by piece. */
+			accountCreditsFailed: "Balance unavailable",
+			accountMetaRemaining: "{remaining} left",
+			accountMetaRemainingOf: "{remaining} / {total} left",
+			accountMetaUsed: "{used} used",
+			accountMetaRequests: "{count} requests",
+			accountMetaInputTokens: "in {value}",
+			accountMetaOutputTokens: "out {value}",
+			accountMetaCache: "cache {percent}",
+			accountMetaResets: "resets in {when}",
+			accountMetaTokenExpires: "token expires in {when}",
+			accountStateDisabled: "Off",
+			accountStateLimited: "rate limited",
+			accountStateExhausted: "out of quota",
+			accountStateSessionDead: "sign-in expired",
+			accountStateReady: "Ready",
+			waitMinutes: "{value} min",
+			waitHours: "{value} h",
+			accountTestFailed: "Test failed",
+			cardAccounts: "Accounts",
+			cardModels: "Models",
+			cardBenched: "Set aside",
+			cardReady: "{ready} of {total} ready",
+			cardRefresh: "Refresh",
+			filterModelsLabel: "Show only selected models",
+			filterModelsHint: "Turn this on to choose which models appear in the model picker. Off shows the whole list.",
+			filterModelsIdle: "Tick the models to keep, then turn the switch on. While the switch is off every model stays visible.",
+			filterModelsUnsupported: "The running DSH host does not support this filter yet. Restart DSH Desktop and try again.",
+			filterModelsFallback: "Saved — this DSH session is running a pre-update copy of the plugin's host half, so the same filter was stored as per-model visibility. Restart DSH Desktop once and it will be stored as a filter list.",
+			filterModelsCount: "{ticked} of {total} shown",
+			filterModelsExcludedHint: "Hidden from the model picker by the filter above",
+			filterModelsClear: "Show all",
+			modelPick: "Choose models",
+			modelPickCount: "{count} models selected",
+			modelSearchPlaceholder: "Search models",
+			modelSearchEmpty: "No model matches that search",
+			modelStale: "no longer offered",
+			saveBarUnsaved: "Unsaved changes",
+			saveBarSave: "Save",
+			saveBarSaving: "Saving…",
+			saveBarDiscard: "Discard",
+			saveBarSaved: "Saved",
+			checkinHeading: "Daily check-in",
+			checkinHint: "The upstream grants daily credit for checking in. Off by default: the plugin never spends a request against your account unless you ask it to.",
+			checkinAutoLabel: "Check in automatically",
+			checkinAutoHint: "Once a day, for every account that can serve. A check-in never benches an account or changes its sign-in.",
+			checkinRunNow: "Check in now",
+			checkinRowNever: "not checked in yet",
+			checkinRowDay: "checked in {day}",
+			checkinRowFailed: "last attempt failed: {reason}",
+			checkinRowSkipped: "skipped: {reason}"
+		};
+		const zh = {
+			title: "DSH WorkBuddy Connect Functy",
+			intro: "在 DSH 中直接使用 WorkBuddy 桌面 App 包含的模型，开箱即用，无需额外配置。",
+			titleAI: "DSH WorkBuddy AI Connect Functy",
+			introAI: "在 DSH 中直接使用 WorkBuddy AI 国际版桌面 App 包含的模型，开箱即用，无需额外配置。",
+			collapse: "收起",
+			loading: "正在读取账号…",
+			signedOut: "未登录",
+			signedOutHint: "在 WorkBuddy 桌面 App 里登录一次即可，插件会自动跟随当前登录的账号。",
+			signedOutHintAI: "在 WorkBuddy AI 国际版桌面 App 里登录一次即可，插件会自动跟随当前登录的账号。",
+			accessTokenExpires: "访问令牌 {time} 过期（自动续期）",
+			creditsTotal: "合计：{total}",
+			creditsError: "积分查询失败：{message}",
+			refresh: "刷新",
+			refreshing: "正在刷新…",
+			refreshModels: "刷新模型列表",
+			catalogError: "上次更新失败：{message}",
+			requestFailed: "请求失败",
+			statusResponseInvalid: "WorkBuddy 返回的状态数据无法识别",
+			accountHeading: "账号",
+			contextHeading: "上下文窗口",
+			useMaximumContextWindow: "使用上游声明的最大上下文窗口",
+			freeModel: "免费",
+			rate: "{rate} 积分/次",
+			rateUnknown: "价格未知 — 刷新后更新",
+			probeLabel: "推理等级",
+			probeTooltipIdle: "检测 {model} 可用的推理档位",
+			probeTooltipVerified: "已接受：{levels} · 点击可重新检测",
+			probeTooltipNotValidating: "该模型不校验该参数",
+			probeTooltipRetry: "检测未完成 · 点击重试",
+			probeBubbleBody: "发送探测请求以确认可用推理档位。可能消耗少量积分。",
+			probeConfirmAction: "确认检测",
+			probeNoteVerified: "已检测：{levels}",
+			probeNoteNotValidating: "该模型不校验该参数",
+			probeNoteUnknown: "检测未完成",
+			probeNoteDismiss: "知道了",
+			probeStart: "开始检测",
+			probeRedetect: "重新检测",
+			probeRunning: "正在检测 {model}…",
+			probeConfirmBody: "向 {model} 发送探测请求，以确认可用推理档位。可能消耗少量积分。",
+			cancel: "取消",
+			probeResultNotValidating: "该模型不校验该参数",
+			probeResultUnknown: "检测未完成",
+			accountAdd: "添加账号",
+			accountAddTitle: "添加账号",
+			accountAddBody: "打开手机 App 登录后扫描此二维码。账号只加入本插件，不会改变桌面 App 的登录状态。",
+			accountAddWaiting: "等待扫码…（剩余 {seconds} 秒）",
+			accountChecking: "检查中…",
+			accountQrExpired: "二维码已过期，关闭后重新发起。",
+			accountQrInvalid: "该登录已失效，请重新发起。",
+			accountEmpty: "还没有账号。可在桌面 App 登录，或在此扫码添加。",
+			accountEmptyHint: "先登录一次即可：桌面 App 的登录态会被自动识别，也可以在下面手动添加账号。",
+			navWorkBuddy: "DSH-WorkBuddy",
+			accountAddCn: "添加 WorkBuddy 账号",
+			accountAddPickHint: "这个账号属于哪一版？",
+			accountAddAi: "添加 WorkBuddy AI 账号",
+			accountLoginQr: "扫码登录",
+			accountLoginWeb: "网页登录",
+			accountLoginDesktop: "桌面端凭证",
+			accountLoginToken: "Cookie 登录",
+			accountDesktopBody: "直接读取已登录的 WorkBuddy 桌面 App 保存的凭证（国际版读 WorkBuddy AI 的）。适用于桌面 App 已登录、但这里列表里没有该账号的情况——比如刚把它删掉之后。",
+			accountActionLogin: "添加账号",
+			accountTokenBody: "粘贴 WorkBuddy 网页控制台里的登录令牌，或整份凭证 JSON（{'account':…,'auth':…}）。只保存在本机；令牌无法自动续期，过期后重新粘贴一份即可。",
+			accountTokenPlaceholder: "在此粘贴令牌（eyJ…）或凭证 JSON（{…）",
+			accountSubmit: "添加",
+			accountOpenLink: "打开登录页面",
+			accountOpenLinkFailed: "没能自动打开页面。请把下面的地址复制到浏览器里打开：",
+			accountWebBody: "在刚弹出的浏览器页面上完成登录即可，登录完成后账号会自动加入。",
+			accountWebWaiting: "等待登录完成…（剩余 {seconds} 秒）",
+			accountExpired: "登录已过期",
+			modelsHeading: "模型列表",
+			modelsRefresh: "刷新列表",
+			modelsSwitchLabel: "模型列表切换",
+			modelsSwitchTitle: "{product} 的模型列表 · {count} 个模型",
+			modelsCount: "{count} 个模型",
+			contextLabel: "上下文长度",
+			contextSwitchTitle: "以 {size} 运行该模型",
+			modelsEmpty: "暂无模型。可刷新列表，或检查上方账号。",
+			modelsSourceLive: "更新于 {time}",
+			modelsSourceSaved: "已保存的列表，更新于 {time}",
+			modelsSourceFallback: "内置列表",
+			accountRotateHint: "请求会在这些账号之间轮换；被上游限流的账号会暂时搁置，稍后自动重试。",
+			accountTest: "测试",
+			accountEnable: "启用",
+			accountDisable: "停用",
+			accountRename: "重命名",
+			accountRemove: "删除",
+			accountRemoveConfirm: "确定删除 {name}？其保存的登录凭证会被清除，除非重新扫码否则无法恢复。",
+			accountActions: "账号操作",
+			accountRenamePlaceholder: "账号名称",
+			accountApply: "确定",
+			accountRemoveAction: "删除账号",
+			sidebarStyleHeading: "侧边栏",
+			sidebarStyleLabel: "侧边栏额度显示",
+			sidebarStyleHint: "侧边栏卡片怎么显示每一版的额度。",
+			sidebarStyleRemaining: "仅剩余额度",
+			sidebarStyleUsage: "已用 / 上限 + 进度条",
+			sidebarSettingUnsupported: "当前 DSH 宿主不接受这个设置，重启 DSH Desktop 后再试。",
+			sidebarVisibleLabel: "侧边栏额度卡片",
+			sidebarVisibleHint: "在侧栏底部显示两版的余额。关掉后侧栏不再画这张卡片，仪表盘只从侧栏卡片进入。",
+			composerVisibleLabel: "输入框额度徽标",
+			composerVisibleHint: "在输入框那一行最右侧（上下文占用右边）显示当前模型所属产品的余额，点击可展开各账号额度。",
+			probeControlVisibleLabel: "输入框检测按钮",
+			probeControlVisibleHint: "在模型选择器旁显示思考强度检测按钮。关掉后仍可在本页模型列表里检测。",
+			accountRefreshAll: "刷新账号",
+			accountRefreshAllHint: "重新读取两版所有已登录账号的余额与状态。",
+			accountCredits: "积分 {total}",
+			accountCreditsPending: "积分 —",
+			accountCreditsFailed: "余额读取失败",
+			accountMetaRemaining: "剩余 {remaining}",
+			accountMetaRemainingOf: "剩余 {remaining} / {total}",
+			accountMetaUsed: "已用 {used}",
+			accountMetaRequests: "{count} 次请求",
+			accountMetaInputTokens: "输入 {value}",
+			accountMetaOutputTokens: "输出 {value}",
+			accountMetaCache: "缓存 {percent}",
+			accountMetaResets: "{when}后恢复",
+			accountMetaTokenExpires: "{when}后令牌过期",
+			accountStateDisabled: "已停用",
+			accountStateLimited: "限流中",
+			accountStateExhausted: "额度耗尽",
+			accountStateSessionDead: "登录失效",
+			accountStateReady: "可用",
+			waitMinutes: "{value} 分钟",
+			waitHours: "{value} 小时",
+			accountTestFailed: "测试失败",
+			cardAccounts: "账号",
+			cardModels: "模型",
+			cardBenched: "搁置中",
+			cardReady: "{total} 个中 {ready} 个可用",
+			cardRefresh: "刷新",
+			filterModelsLabel: "只显示勾选的模型",
+			filterModelsHint: "开启后，只有勾选的模型会出现在模型选择列表里；关闭则显示全部。",
+			filterModelsIdle: "先勾选要保留的模型，再打开开关。开关关闭时所有模型都会显示。",
+			filterModelsUnsupported: "当前运行的 DSH 宿主还不支持这个过滤功能，重启 DSH Desktop 后再试。",
+			filterModelsFallback: "已保存 —— 本次 DSH 会话运行的是插件宿主半边的旧副本，所以同一个筛选被存成了「逐模型隐藏」。重启一次 DSH Desktop，就会按筛选列表存。",
+			filterModelsCount: "已选 {ticked} / {total}",
+			filterModelsExcludedHint: "被上方筛选排除，不会出现在模型选择器里",
+			filterModelsClear: "全部显示",
+			modelPick: "选择模型",
+			modelPickCount: "已选 {count} 个模型",
+			modelSearchPlaceholder: "搜索模型",
+			modelSearchEmpty: "没有匹配的模型",
+			modelStale: "已下线",
+			saveBarUnsaved: "有未保存的修改",
+			saveBarSave: "保存",
+			saveBarSaving: "保存中…",
+			saveBarDiscard: "放弃",
+			saveBarSaved: "已保存",
+			checkinHeading: "每日签到",
+			checkinHint: "上游每日签到会发放积分。默认关闭：除非你打开，插件不会用你的账号发任何请求。",
+			checkinAutoLabel: "自动签到",
+			checkinAutoHint: "每天一次，覆盖每个可用账号。签到不会搁置账号，也不改动登录状态。",
+			checkinRunNow: "立即签到",
+			checkinRowNever: "尚未签到",
+			checkinRowDay: "签到于 {day}",
+			checkinRowFailed: "上次尝试失败：{reason}",
+			checkinRowSkipped: "已跳过：{reason}"
+		};
+		//#endregion
+		//#region src/client/index.tsx
+		/** Stable browser-plugin name: the package name plus the `-client` half. */
+		const name = "dsh-plugin-wb2api-ui-client";
+		/**
+		* Client services required by this browser half.
+		*
+		* DSH 0.1.2 removed `@deepseek-ai/dsh-client-runtime` (the package that used to
+		* hold the browser `ClientContext` alias and the `slots` service), so the
+		* services come from narrower packages: the `slots` registry lives in
+		* `@deepseek-ai/dsh-client-ui-renderer` and `locale` in
+		* `@deepseek-ai/dsh-client-locale`. None of the SEAT OWNERS is named here:
+		* `sidebar.footer.action`, `main` and `settings.section` are declared by three
+		* different packages, and the seam each host actually ships is discovered by
+		* slot-declaration lifetime rather than by activation order — a static inject
+		* would park this fiber on a package some profiles never mount.
+		*/
+		const inject = [
+			"slots",
+			"locale",
+			"remote",
+			"remote.session"
+		];
+		/** Prefix every guarded client contribution's degradation logs with this. */
+		const CLIENT_CONTRIBUTION_FAILED = "[dsh-workbuddy-connect] client contribution failed to load (host provider unaffected):";
+		/** Disposer handed back when a deferred registration degraded: nothing to undo. */
+		const NOOP_DISPOSER = () => {};
+		/**
+		* The sidebar panel's id. It is the layout's `MainPanelId`: one string shared
+		* by the `sidebar.footer.action` card and the `main` slot cell, so the card
+		* selects this panel and nothing else.
+		*/
+		const PANEL_ID = "workbuddy-panel";
+		/**
+		* `ui-conversation`'s reserved `main` key, used only as the exit fallback for
+		* a layout whose `selectPanel` predates the `null` "show the Conversation"
+		* selection. Declared locally because `ui-conversation` is not a dependency of
+		* this bundle and the key is a published contract of the layout.
+		*/
+		const CONVERSATION_PANEL_ID = "conversation";
+		/** Inject the settings-page copy and resolve the translator bound to it. */
+		function bindSettingsCopy(ctx, namespace) {
+			return ctx.locale.bind(namespace);
+		}
+		/**
+		* Inject one stylesheet once and return its disposer, for `ctx.effect` to own.
+		*
+		* Keyed by its own `data-plugin-css` id, so the injection is idempotent even if
+		* a second surface asks for it later. The two ids must stay distinct from each
+		* other: they key two separate style tags, and a shared id would make the
+		* second injection a silent no-op that drops one stylesheet.
+		*/
+		function injectCss(id, css) {
+			if (typeof document === "undefined") return NOOP_DISPOSER;
+			if (document.querySelector(`style[data-plugin-css="${id}"]`) !== null) return NOOP_DISPOSER;
+			const tag = document.createElement("style");
+			tag.dataset.plugin = "dsh-workbuddy-connect";
+			tag.dataset.pluginCss = id;
+			tag.textContent = css;
+			document.head.appendChild(tag);
+			return () => {
+				tag.remove();
+			};
+		}
+		/**
+		* Run ONE browser-side contribution, degrading its failure to a `console.error`
+		* instead of throwing into the DSH loader. Returns the contribution's own value
+		* on success, or `undefined` when it degraded — the deferred slot callbacks
+		* below substitute `NOOP_DISPOSER` for that, because the slot runtime always
+		* expects a disposer back.
+		*
+		* Every contribution is guarded at BOTH boundaries where it can throw:
+		*
+		* 1. the eager `ctx.slots.inject(...)` / `ctx.inject(...)` call itself, which
+		*    runs synchronously inside `apply()` — e.g. a slot-API shape break such as
+		*    the rc.6→rc.7 `id`→`key` rename;
+		* 2. the deferred callback, which the slot runtime invokes later — when the
+		*    owner commits the slot's declaration, or when the injected services
+		*    arrive — long after `apply()` has returned, where no enclosing try/catch
+		*    could still catch it.
+		*
+		* The pair is what makes the contributions independent: a failure in one
+		* surface leaves every other registration intact. Guards are for THIS browser
+		* half only; the host half reports its own errors through `ctx.logger`.
+		*/
+		function guardClientContribution(label, fn) {
+			try {
+				return fn();
+			} catch (error) {
+				console.error(`${CLIENT_CONTRIBUTION_FAILED} ${label}`, error);
+				return;
+			}
+		}
+		/**
+		* Register the copy namespaces, the dashboard, and the conversation-side
+		* surfaces, one guarded contribution at a time.
+		*
+		* The host provider keeps working throughout: the `workbuddy` model channel is
+		* unaffected, and `dsh-workbuddy-connect status` reports host health via the
+		* heartbeat file.
+		*/
 		function apply(ctx) {
-			injectStyles();
-			ctx.slots.inject("settings.section", () => ctx.slots.register({
-				name: "settings.section",
-				id: "dsh-plugin-wb2api-ui",
-				order: 43,
-				label: () => "WorkBuddy 反代",
-			}, () => h(Panel, null)));
+			const namespace = "settings.workbuddy.functy";
+			guardClientContribution("settings copy", () => {
+				ctx.effect(() => ctx.locale.register(namespace, {
+					zh,
+					en
+				}), "dsh-workbuddy-connect: settings copy");
+			});
+			const t = bindSettingsCopy(ctx, namespace);
+			guardClientContribution("panel copy", () => {
+				ctx.effect(() => ctx.locale.register(PANEL_LOCALE_NS, {
+					zh: PANEL_COPY_ZH,
+					en: PANEL_COPY_EN
+				}), "dsh-workbuddy-connect: panel copy");
+			});
+			const panelStore = createWorkBuddyPanelStore();
+			/**
+			* The injected face both panel slots carry. `layout` is read reflectively AT
+			* CLICK TIME, never captured at setup: ui-layout is not a dependency of this
+			* bundle, so a static `inject` would park the whole client fiber.
+			*/
+			const panelFace = () => ({
+				hooks: { workBuddyPanel: panelStore },
+				refresh: () => {
+					panelStore.refresh();
+				},
+				startAutoRefresh: () => panelStore.start(),
+				open: () => {
+					const layout = ctx.get("layout");
+					if (typeof layout?.selectPanel === "function") layout.selectPanel(PANEL_ID);
+				},
+				close: () => {
+					const layout = ctx.get("layout");
+					if (typeof layout?.selectPanel !== "function") return;
+					try {
+						layout.selectPanel(null);
+					} catch {
+						try {
+							layout.selectPanel(CONVERSATION_PANEL_ID);
+						} catch (error) {
+							console.error("[dsh-workbuddy-connect] could not close the dashboard:", error);
+						}
+					}
+				}
+			});
+			guardClientContribution("styles", () => {
+				ctx.effect(() => {
+					const page = injectCss(PAGE_CSS_ID, PAGE_CSS);
+					const panel = injectCss(PANEL_CSS_ID, PANEL_CSS);
+					return () => {
+						page();
+						panel();
+					};
+				}, "dsh-workbuddy-connect: styles");
+			});
+			guardClientContribution("dashboard panel", () => {
+				ctx.slots.inject("main", () => guardClientContribution("dashboard panel", () => ctx.slots.register({
+					name: "main",
+					key: "workbuddy-panel",
+					locale: "panel.workbuddy.functy",
+					inject: panelFace
+				}, WorkBuddyPanel)) ?? NOOP_DISPOSER);
+			});
+			guardClientContribution("sidebar footer card", () => {
+				ctx.inject(["layout"], (layoutCtx) => {
+					if (typeof layoutCtx.get("layout")?.selectPanel !== "function") return;
+					guardClientContribution("sidebar footer card", () => layoutCtx.slots.inject("sidebar.footer.action", () => guardClientContribution("sidebar footer card", () => layoutCtx.slots.register({
+						name: "sidebar.footer.action",
+						id: "workbuddy-panel",
+						order: 1,
+						locale: "panel.workbuddy.functy",
+						inject: panelFace
+					}, WorkBuddyFooterEntry)) ?? NOOP_DISPOSER));
+				});
+			});
+			guardClientContribution("settings section", () => {
+				ctx.slots.inject("settings.section", () => guardClientContribution("settings section", () => ctx.slots.register({
+					name: "settings.section",
+					id: "dsh-workbuddy",
+					order: 40,
+					label: () => t("navWorkBuddy"),
+					locale: namespace,
+					inject: () => ({
+						t,
+						context: ctx,
+						refreshPanel: () => {
+							panelStore.refresh();
+						}
+					})
+				}, WorkBuddySettingsPage)) ?? NOOP_DISPOSER);
+			});
+			guardClientContribution("models provider card", () => {
+				ctx.slots.inject("settings.models.provider-card", () => guardClientContribution("models provider card", () => ctx.slots.register({
+					name: "settings.models.provider-card",
+					key: "llm-workbuddy-functy",
+					locale: namespace,
+					inject: () => ({ t })
+				}, WorkBuddyProviderCard)) ?? NOOP_DISPOSER);
+			});
+			guardClientContribution("composer credit badge", () => {
+				ctx.inject(["modelDirectories"], (scope) => {
+					guardClientContribution("composer credit badge", () => {
+						scope.slots.inject("conversation.composer.dock", () => guardClientContribution("composer credit badge", () => scope.slots.register({
+							name: "conversation.composer.dock",
+							id: "workbuddy-credit-badge",
+							order: 100,
+							inject: (sessionId) => ({
+								directory: scope.modelDirectories.directoryFor(sessionId).store,
+								panel: panelStore,
+								t: panelTranslator((key, params) => t(key, params))
+							})
+						}, WorkBuddyCreditBadge)) ?? NOOP_DISPOSER);
+					});
+				});
+			});
+			guardClientContribution("conversation probe control", () => {
+				ctx.inject(["modelDirectories"], (scope) => {
+					guardClientContribution("conversation probe control", () => {
+						scope.slots.inject("conversation.input.right", () => guardClientContribution("conversation probe control", () => scope.slots.register({
+							name: "conversation.input.right",
+							id: "workbuddy-probe",
+							order: 10,
+							inject: (sessionId) => ({
+								directory: scope.modelDirectories.directoryFor(sessionId).store,
+								t
+							})
+						}, WorkBuddyProbeControl)) ?? NOOP_DISPOSER);
+					});
+				});
+			});
 		}
-
-		exports.name = name;
-		exports.inject = inject;
+		//#endregion
+		exports.CARD_VARIANTS = CARD_VARIANTS;
+		exports.PANEL_ID = PANEL_ID;
 		exports.apply = apply;
+		exports.inject = inject;
+		exports.name = name;
 		return module.exports;
 	}
 });
