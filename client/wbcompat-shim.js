@@ -422,9 +422,26 @@
       return { state: 'added', name: nickname, created: true };
     }
     if (kind === 'adopt-desktop') {
+      // 接管 WorkBuddy 桌面 App 当前的登录态：宿主侧读它的加密存储（lib/desktop-import.js），
+      // 解出来的 token 直接落进账号池 —— 与「令牌 / 扫码」并列的第三条添加路径。
+      var adopted = await postJson(API + '/adopt-desktop', {});
+      cache.value = null;
+      var added = adopted && Array.isArray(adopted.imported) ? adopted.imported : [];
+      var missed = adopted && Array.isArray(adopted.skipped) ? adopted.skipped : [];
+      if (added.length > 0) {
+        return {
+          state: 'added',
+          name: added.map(function (row) { return String(row.nickname || row.uid || ''); }).filter(function (name) { return name !== ''; }).join('、'),
+          created: true,
+        };
+      }
       return {
         state: 'failed',
-        reason: '本插件不走面板内接管：请在宿主机跑 tools/wb_import.mjs --write（WorkBuddy 桌面端登录态导入）。',
+        reason: missed.length > 0
+          ? '桌面端没有可接管的新登录态：' + missed.map(function (row) {
+            return String(row.nickname || row.uid || '') + '（' + String(row.reason || '原因未知') + '）';
+          }).join('；')
+          : '桌面端没有已登录的账号：先在 WorkBuddy App 里登录一次。',
       };
     }
     if (kind === 'label') {
