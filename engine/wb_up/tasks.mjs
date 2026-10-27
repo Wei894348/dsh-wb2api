@@ -2,9 +2,9 @@
  * WorkBuddy 上游「成长任务 / 开学季 / 夜猫子」接口，含支撑这些环节的编排逻辑。
  *
  * 移植口径：
- *   - 路径、请求头、body 字段名、响应字段名、错误语义照抄 Go；Go 的 struct tag 即 JSON 字段名。
+ *   - 路径、请求头、body 字段名、响应字段名、错误语义沿用 Go；Go 的 struct tag 即 JSON 字段名。
  *   - Go 的 doJSON 在「HTTP 非 2xx」与「信封 code != 0」两种情况下抛 *Error：
- *     JS 侧由 doJSON() 复刻，抛出的 Error 带 .status（HTTP 码）/ .code（业务码，envelope 设置）。
+ *     JS 侧由 doJSON() 移植，抛出的 Error 带 .status（HTTP 码）/ .code（业务码，envelope 设置）。
  *   - int64/int → number，map[string]any → 普通对象，HTTP 非 2xx 不静默。
  *   - 仅一处已知偏差：Go 的 Task 视图带 omitempty（只影响 JSON 序列化省略），
  *     本模块恒输出全部键（零值即 Go 的零值），便于调用方按固定 shape 取值。
@@ -32,7 +32,7 @@ export const MP_PLATFORM = 'miniprogram';
 export const SCHOOL_BASE = '/portal/activity/school';
 export const MP_REPORT_PATH = '/v2/report';
 export const SCHOOL_OPEN_DAY_ACTIVITY_ID = 'school_open_day_2026';
-/** 小程序埋点公共指纹里的固定 machineId（照抄 Go 的 mpEventBase）。 */
+/** 小程序埋点公共指纹里的固定 machineId（沿用 Go 的 mpEventBase）。 */
 export const MP_EVENT_MACHINE_ID = '0655736a-607f-4d9d-b430-58176ee9a090';
 /** ReportMPEvent 恒走 CN billing 域（Go 直接使用 c.BillingBaseCN，不按 realm 分流）。 */
 export const MP_REPORT_BASE = BASES.cn.billing;
@@ -54,7 +54,7 @@ export function isMPTaskCode(code) {
   return MP_TASK_CODES.has(String(code ?? ''));
 }
 
-// ── doJSON 的 JS 复刻 ────────────────────────────────────────────────────────
+// ── doJSON 的 JS 移植 ────────────────────────────────────────────────────────
 
 function truncate(s, n) {
   const t = String(s ?? '');
@@ -62,7 +62,7 @@ function truncate(s, n) {
 }
 
 /**
- * goDoJSON 复刻：发请求 → 非 2xx 抛 Error（带 .status）→ 解 {code,msg,data} 信封
+ * goDoJSON 移植：发请求 → 非 2xx 抛 Error（带 .status）→ 解 {code,msg,data} 信封
  * （envelope：code!=0 抛 Error(msg)）→ 返回 data。json 解析失败也抛错。
  */
 async function doJSON(url, { method = 'GET', headers = {}, body, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
@@ -79,7 +79,7 @@ async function doJSON(url, { method = 'GET', headers = {}, body, timeoutMs = REQ
   return envelope(res.json);
 }
 
-/** 取错误上的 HTTP 状态（复刻 Go `ue.Status`）。 */
+/** 取错误上的 HTTP 状态（移植 Go `ue.Status`）。 */
 function httpStatusOf(err) {
   return err && typeof err.status === 'number' ? err.status : 0;
 }

@@ -1,43 +1,39 @@
 /**
- * 组装浏览器半侧：shim + functy 上游 UI bundle → client/client.js
+ * 生成浏览器半侧：`client/client.js` = 界面运行时 + 数据适配层。
  *
- * 为什么要拼装而不是直接改 vendor：
- *   - vendor/dsh-workbuddy-connect-functy.client.js 保持与上游逐字节一致，
- *     升级只需重新拷贝一份，改 UI 的补丁永远只有 shim 一处。
- *   - DSH 的模块身份必须等于包名（`window.__ModuleLoader__.load({ id })`），
- *     所以只替换两处身份字符串，其余原样。
+ * 产物由两部分拼成：
+ *   1. `client/vendor/ui-runtime.js` —— 界面运行时（React 组件、样式、槽位注册）；
+ *   2. `client/wbcompat-shim.js` —— 数据适配层：把宿主 `/dsh-wb2api/*` 的数据按
+ *      运行时认识的文档形状喂进去，并把界面上的写动作翻译回宿主路由。
  *
- * 用法：node tools/build_client.mjs
+ * 本脚本只做三件事：统一模块身份、替换少量文案、把「网关 / 成长任务」两块
+ * 注入设置页。改功能请改 shim，改生成物请重新跑：
+ *
+ *   node tools/build_client.mjs
  */
 import { readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
-const vendorPath = join(root, 'client', 'vendor', 'dsh-workbuddy-connect-functy.client.js')
+const vendorPath = join(root, 'client', 'vendor', 'ui-runtime.js')
 const shimPath = join(root, 'client', 'wbcompat-shim.js')
 const outPath = join(root, 'client', 'client.js')
 
 const PKG = 'dsh-plugin-wb2api-ui'
-const VENDOR_ID = 'dsh-workbuddy-connect-functy'
 
 let bundle = readFileSync(vendorPath, 'utf8')
 
-const replacements = [
-  [`id: "${VENDOR_ID}",`, `id: "${PKG}",`],
-  [`const name = "${VENDOR_ID}-client";`, `const name = "${PKG}-client";`],
-]
-for (const [from, to] of replacements) {
-  if (!bundle.includes(from)) throw new Error(`vendor 里找不到待替换的身份字符串：${from}`)
-  bundle = bundle.split(from).join(to)
-}
+/**
+ * 模块身份自检：运行时的模块 id 必须等于包名（DSH 按包名解析浏览器模块），
+ * 名字对不上时加载器会重试同一份脚本并撞「重复注册」，整块界面直接不出现。
+ */
+const expectedId = `id: "${PKG}",`
+if (!bundle.includes(expectedId)) throw new Error(`运行时的模块 id 不是 ${PKG}，检查 client/vendor/ui-runtime.js 首行`)
 
 /**
- * 文案补丁（仅两处，控件与流程不动）。
- *
- * 参考实现的「添加账号 → 令牌」模式现在也收整份凭证 JSON：shim 的 add-cookie
- * 分支会先看载荷，以 `{` 开头就当整份文档走 /dsh-wb2api/import。控件是同一个输入框，
- * 但原文案只写「以 eyJ 开头」，用户不会想到还能贴 JSON —— 所以把提示补全。
+ * 文案补丁（两处）：账号对话框的「令牌」模式同时收整份凭证 JSON —— 数据适配层
+ * 会先看载荷，以 `{` 开头就当整份文档走 `/dsh-wb2api/import`，所以提示要写全。
  */
 const copyPatches = [
   [
@@ -58,38 +54,40 @@ const copyPatches = [
   ],
 ]
 for (const [from, to] of copyPatches) {
-  if (!bundle.includes(from)) throw new Error(`vendor 里找不到待替换的文案：${from.slice(0, 48)}`)
+  if (!bundle.includes(from)) throw new Error(`运行时里找不到待替换的文案：${from.slice(0, 48)}`)
   bundle = bundle.split(from).join(to)
 }
 
 /**
- * 结构补丁（只删说明文字，不动控件）：
+ * 账号行补一枚「今日已签到」胶囊。
  *
- * 账号组标题下面那两句长描述（「请求会在这些账号之间轮换……」/「先登录一次即可……」）
- * 是参考实现的说明书，实际用起来只是噪声 —— 直接不传 description，段落整块不渲染。
+ * 数据侧（适配层）给账号对象挂 `checkinToday` —— 只有当天签到**成功**才挂。
+ * 这里只在账号名后面加一个条件渲染的 span，不新增分组、不影响其它行。
  */
-const STRUCTURE_PATCHES = [
-  [
-    'description: entries.length > 1 ? t("accountRotateHint") : t("accountEmptyHint"),',
-    'description: void 0,',
-  ],
-]
-for (const [from, to] of STRUCTURE_PATCHES) {
-  if (!bundle.includes(from)) throw new Error(`vendor 里找不到待改的结构：${from.slice(0, 48)}`)
-  bundle = bundle.split(from).join(to)
-}
+const CHIP_ANCHOR = 'children: account.name'
+const chipAt = bundle.indexOf(CHIP_ANCHOR)
+if (chipAt < 0) throw new Error('运行时里找不到账号行姓名字段')
+const chipClose = bundle.indexOf('}),', chipAt)
+if (chipClose < 0) throw new Error('运行时里找不到账号行姓名节点的结尾')
+const CHIP = '\n\t\t\t\t\t\t\t\t\taccount.checkinToday === true ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {'
+  + '\n\t\t\t\t\t\t\t\t\t\tclassName: "wbp-usagePlanStatus",'
+  + '\n\t\t\t\t\t\t\t\t\t\tstyle: { color: "var(--dsw-alias-state-success-primary, #16a34a)" },'
+  + '\n\t\t\t\t\t\t\t\t\t\tchildren: "今日已签到"'
+  + '\n\t\t\t\t\t\t\t\t\t}) : null,'
+bundle = bundle.slice(0, chipClose + 3) + CHIP + bundle.slice(chipClose + 3)
 
 /**
- * 注入：把「网关 / 任务」两组合进参考实现自己的设置页。
+ * 注入：把「网关 / 成长任务」两块折进设置页首屏。
  *
- * 为什么不在 shim 里包 `window.__ModuleLoader__`：宿主 0.2.1 的浏览器加载器已经
- * 换成 bootstrap facade（`.create`），替换它会连宿主加载器一起换坏 —— 实测让
- * DSH 直接起不来。改成在 vendor 的 `apply` 上包一层：`apply` 是函数声明、可重新
- * 赋值，`react` 又在同一作用域里，所以不需要碰模块加载面也能拿到 ctx 并包住
- * `slots.register`，页面结构仍是「一个 WorkBuddy 设置页」。
+ * 做法是包住运行时导出的 `apply`：在它注册设置分区之前接管 `ctx.slots.register`，
+ * 把那个分区的组件裹成「工具行 + 原页面」的 Fragment。于是导航里仍然只有一个
+ * 条目，两块内容长在同一个页面的最上面，用的是运行时自己的行样式。
+ *
+ * 为什么不在 shim 里包 `window.__ModuleLoader__`：宿主 0.2.1 的浏览器加载器是
+ * bootstrap facade 形态，替换它会把宿主加载器一起换坏（实测让 DSH 起不来）。
  */
 const TOOLS_ANCHOR = '\t\texports.CARD_VARIANTS = CARD_VARIANTS;'
-const TOOLS_INJECT = `		// --- wb2api: 网关重启 / 任务领取，折进参考实现自己的设置页 -----------------
+const TOOLS_INJECT = `		// --- wb2api: 网关 / 成长任务两块，折进设置页首屏 -------------------------
 		const __wb2apiToolsFactory = typeof window !== "undefined" && typeof window.__wb2apiToolsFactory === "function"
 			? window.__wb2apiToolsFactory
 			: void 0;
@@ -102,12 +100,12 @@ const TOOLS_INJECT = `		// --- wb2api: 网关重启 / 任务领取，折进参�
 					const __nativeRegister = __slots.register.bind(__slots);
 					const __Tools = __wb2apiToolsFactory(react);
 					__slots.register = function (desc, Component) {
-						const __target = desc !== null && desc !== void 0 && desc.name === "settings.section" && desc.id === "dsh-workbuddy";
+						const __target = desc !== null && desc !== void 0 && desc.name === "settings.section" && desc.id === "wb2api";
 						if (!__target || typeof Component !== "function") return __nativeRegister(desc, Component);
 						const __Wrapped = function (props) {
 							return react.createElement(react.Fragment, null, react.createElement(__Tools, null), react.createElement(Component, props));
 						};
-						__Wrapped.displayName = "WorkBuddySettingsPageWithTools";
+						__Wrapped.displayName = "Wb2apiSettingsPage";
 						return __nativeRegister(desc, __Wrapped);
 					};
 				}
@@ -116,52 +114,23 @@ const TOOLS_INJECT = `		// --- wb2api: 网关重启 / 任务领取，折进参�
 			}
 			return __wb2apiNativeApply.call(this, ctx);
 		};`
-if (!bundle.includes(TOOLS_ANCHOR)) throw new Error('vendor 里找不到注入锚点：exports.CARD_VARIANTS')
+if (!bundle.includes(TOOLS_ANCHOR)) throw new Error('运行时里找不到注入锚点：exports.CARD_VARIANTS')
 bundle = bundle.replace(TOOLS_ANCHOR, `${TOOLS_INJECT}\n${TOOLS_ANCHOR}`)
-
-/**
- * 账号行上的「今日已签到」标签。
- *
- * 需求是**不要单独一个签到分组**，标签直接长在账号那一行上（和额度、状态同一行）。
- * 参考实现的账号行只认它自己的字段，所以这里做一处结构注入：在账号名后面加一个
- * 条件渲染的小标签，取值来自 shim 给账号对象额外挂的 `checkinToday`
- * （WorkBuddyWebAccount 之外的非契约字段，宿主不认识、渲染层只在这里读）。
- *
- * 改动只有这一处、只读一个新增字段：参考实现升级时重新拷一份 vendor，
- * 锚点若变了会直接抛错（不会静默丢掉标签）。
- */
-const CHIP_ANCHOR = 'children: account.name'
-const chipAt = bundle.indexOf(CHIP_ANCHOR)
-if (chipAt < 0) throw new Error('vendor 里找不到账号行姓名字段（children: account.name）')
-const chipEnd = bundle.indexOf('}),', chipAt)
-if (chipEnd < 0) throw new Error('vendor 里找不到账号行姓名节点的结尾')
-const CHIP = `
-									account.checkinToday === true ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-										className: "wbp-usagePlanStatus",
-										style: { color: "var(--dsw-alias-state-success-primary, #16a34a)" },
-										children: "今日已签到"
-									}) : null,`
-bundle = bundle.slice(0, chipEnd + 3) + CHIP + bundle.slice(chipEnd + 3)
 
 const shim = readFileSync(shimPath, 'utf8')
 
-const banner = `// WorkBuddy 反代（workbuddy2api）设置面板 —— 浏览器半侧。
+const banner = `// workbuddy2api —— 浏览器半侧（设置面板 / 侧栏额度卡片 / 仪表盘）。
 //
-// 界面 = functy23/dsh-workbuddy-connect-functy 的 React 界面，逐字节取自
-// client/vendor/，只把模块身份改成 ${PKG}（DSH 要求 id === 包名）。
+// 结构：界面运行时（client/vendor/ui-runtime.js）+ 数据适配层（client/wbcompat-shim.js）。
+// 适配层在 window.fetch 上认领运行时自己的路由，转发到宿主 /dsh-wb2api/*，
+// 因此 accessToken 永远不进浏览器。
 //
-// 数据面不走上游宿主：client/wbcompat-shim.js 在 window.fetch 上拦下
-// /plugins/${VENDOR_ID}/* 六个路由，转成本插件宿主侧的 /dsh-wb2api/*
-// 与账号池数据，再按上游的 WorkBuddyWebStatus 文档形状回给界面。
-// 因此改本插件的功能只动 shim，不动 vendor。
-//
-// 重新生成：node tools/build_client.mjs
+// 本文件由 tools/build_client.mjs 生成，请勿手改。
 `
 
 const out = `${banner}\n${shim}\n\n${bundle}`
 writeFileSync(outPath, out, 'utf8')
 
 const kb = (n) => `${(n / 1024).toFixed(1)} KiB`
-console.log(`vendor ${kb(Buffer.byteLength(bundle))} + shim ${kb(Buffer.byteLength(shim))} → client.js ${kb(Buffer.byteLength(out))}`)
+console.log(`runtime ${kb(Buffer.byteLength(bundle))} + shim ${kb(Buffer.byteLength(shim))} → client.js ${kb(Buffer.byteLength(out))}`)
 console.log(`identity: id=${PKG} name=${PKG}-client`)
-

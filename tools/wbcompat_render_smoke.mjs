@@ -1,5 +1,5 @@
 /**
- * 渲染冒烟：在 jsdom 里把复刻过来的 UI 真正挂起来，看它能不能用本插件的数据画出来。
+ * 渲染冒烟：在 jsdom 里把移植过来的 UI 真正挂起来，看它能不能用本插件的数据画出来。
  *
  * 三件事一起验：
  *   1. client.js（shim + vendor bundle）能在浏览器式环境里执行并交出 factory；
@@ -124,10 +124,10 @@ console.log('load() 捕获 id =', captured.id);
 globalThis.fetch = win.fetch;
 
 // ---- 预热：第一次 /credits 需要打上游（6 个账号），先把两边的文档各拉一次 ----
-for (const path of ['/plugins/dsh-workbuddy-connect-functy/status', '/plugins/dsh-workbuddy-connect-functy/ai/status']) {
+for (const path of ['/plugins/dsh-plugin-wb2api-ui/status', '/plugins/dsh-plugin-wb2api-ui/ai/status']) {
   const response = await win.fetch(path, { headers: { accept: 'application/json' } });
   const doc = await response.json();
-  console.log('[warm]', path.replace('/plugins/dsh-workbuddy-connect-functy', ''), '→', doc.status,
+  console.log('[warm]', path.replace('/plugins/dsh-plugin-wb2api-ui', ''), '→', doc.status,
     doc.credits ? 'credits=' + doc.credits.total : '(无 credits)',
     doc.accounts ? 'accounts=' + doc.accounts.accounts.length : '');
 }
@@ -193,7 +193,7 @@ for (const row of registrations) console.log('  -', row.slot, row.id === '' ? ''
  *
  * DSH 的槽位约定：注册描述里的 `inject` 返回 `{ hooks: { xxx: store } }` 时，
  * 宿主把每个 store 包成 `useXxx(selector)` 钩子再传给组件（`useSyncExternalStore`）。
- * 这里照着复现 —— 所以面板读到的就是参考实现自己 create 的那个 store，
+ * 这里照着复现 —— 所以面板读到的就是既有界面自己 create 的那个 store，
  * 不是替身，数据来源仍然是我们拦截的 fetch。
  */
 function hookFromStore(store) {

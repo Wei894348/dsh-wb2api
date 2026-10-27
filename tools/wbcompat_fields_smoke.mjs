@@ -137,5 +137,5 @@ if (failures.length > 0) {
   for (const line of failures) console.error('  -', line);
   process.exitCode = 1;
 } else {
-  console.log('\n[OK] 倍率 / 签到 / 账号映射全部符合参考界面的数据契约');
+  console.log('\n[OK] 倍率 / 签到 / 账号映射全部符合既有界面的数据契约');
 }

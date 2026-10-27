@@ -2,7 +2,7 @@
  * 离线冒烟：把 client/client.js 当成 DSH 浏览器半边加载一遍。
  *
  * 目的不是渲染（没有 DOM），而是回答三个问题：
- *   1) 顶层代码能不能执行完（复刻过来的 bundle 在模块作用域里读没读宿主 API）；
+ *   1) 顶层代码能不能执行完（移植过来的 bundle 在模块作用域里读没读宿主 API）；
  *   2) factory 拿到的 require 能不能解析（react / react-dom / jsx-runtime / primitives）；
  *   3) apply(ctx) 会不会抛，六个注册点是否都落地。
  *

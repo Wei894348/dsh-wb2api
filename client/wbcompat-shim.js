@@ -1,8 +1,8 @@
-// wbcompat-shim —— 让 functy23/dsh-workbuddy-connect-functy 的浏览器半边跑在
+// wbcompat-shim —— 让 本插件的界面运行时 的浏览器半边跑在
 // 本插件（dsh-plugin-wb2api-ui）的宿主数据上。
 //
-// 为什么要这一层：复刻过来的 UI 是一份完整的 React 客户端，它只认
-// `/plugins/dsh-workbuddy-connect-functy/{status,accounts,probe,ai/*}` 六个路由
+// 为什么要这一层：移植过来的 UI 是一份完整的 React 客户端，它只认
+// `/plugins/dsh-plugin-wb2api-ui/{status,accounts,probe,ai/*}` 六个路由
 // 和一份 WorkBuddyWebStatus 文档。本插件宿主侧的数据已经挂在 `/dsh-wb2api/*`
 // （state / credits / models / checkin / login / import / account/*），
 // 再往宿主里加一套路由就要重启 DSH 才能生效。这里在浏览器侧把 fetch 截住，
@@ -27,7 +27,7 @@
     });
   }
 
-  var PREFIX = '/plugins/dsh-workbuddy-connect-functy';
+  var PREFIX = '/plugins/dsh-plugin-wb2api-ui';
   var API = '/dsh-wb2api';
   /** 写路由的握手 key：UI 从文档里取它再回填到 X-WorkBuddy-Probe-Key。 */
   var PROBE_KEY = 'wb2api-local';
@@ -182,7 +182,7 @@
         domain: typeof account.domain === 'string' ? account.domain : '',
         renewable: true,
         enabled: account.disabled !== true,
-        // 「可用」要同时满足：没被手动禁用、文件没过期、令牌没过期。参考实现还会看
+        // 「可用」要同时满足：没被手动禁用、文件没过期、令牌没过期。既有界面还会看
         // sessionDead —— 见下面两处判定，光看前两条会把已经死掉的号画成绿色圆点。
         available: account.disabled !== true && account.expired !== true && !tokenExpired,
         expiresAtMs: expiresAtMs,
@@ -191,7 +191,7 @@
       };
       if (account.nickname) row.nickname = account.nickname;
       if (tokenExpired) {
-        // 令牌过期：参考实现只对 `renewable !== true` 的账号渲染「令牌即将过期」，
+        // 令牌过期：既有界面只对 `renewable !== true` 的账号渲染「令牌即将过期」，
         // 所以真正要它显示「登录已失效」必须走 sessionDead 这条。
         row.sessionDead = true;
         row.available = false;
@@ -241,7 +241,7 @@
         contextWindow: Number(model.contextLength) || undefined,
         maxContextWindow: Number(model.contextLength) || undefined,
       };
-      // 倍率：宿主 /models 现在带 creditsMult（"0.79x"），卡片按参考实现的口径
+      // 倍率：宿主 /models 现在带 creditsMult（"0.79x"），卡片按既有界面的口径
       // 显示成 "x0.79"；0 倍率另给 free 徽章。
       if (typeof model.creditsMult === 'string' && model.creditsMult !== '') {
         var mult = model.creditsMult.replace(/x$/i, '');
@@ -298,7 +298,7 @@
       doc.models = buildModels(data.models, realm);
       doc.catalog = { source: 'live', fetchedAt: Date.now() };
 
-      // 签到：**不再单独成组**，而是标在每个账号行上。参考实现的账号行被构建期
+      // 签到：**不再单独成组**，而是标在每个账号行上。既有界面的账号行被构建期
       // 补了一处条件渲染（读 `account.checkinToday`），所以这里只给账号对象挂标记。
       // 数据来自宿主 /dsh-wb2api/checkin-status（本插件自己的记录优先，外部文件兜底）。
       if (data.checkin && Array.isArray(data.checkin.rows)) {
@@ -590,9 +590,9 @@
     return originalFetch(input, init);
   };
 
-  // --- 参考界面里没有的入口：补一个「WorkBuddy 工具」分区 --------------------
+  // --- 既有界面里没有的入口：补一个「WorkBuddy 工具」分区 --------------------
   //
-  // 参考项目的设置页只有「账号 / 模型」两页，网关重启与成长任务领取没有落点。
+  // 既有界面的设置页只有「账号 / 模型」两页，网关重启与成长任务领取没有落点。
   // 这里用它**自己的样式类**（wbp-*）在同一个 settings.section 槽位里再挂一页，
   // 骨架与它逐行一致（.wbp-section → .wbp-group → .wbp-row），所以看上去是同一
   // 套界面的一部分；代码留在这层，vendor bundle 保持逐字节原样。
@@ -602,7 +602,7 @@
     const { useState, useEffect, useCallback } = React;
 
     /**
-     * 三件套与参考界面同一套类名：一行 = 文案块 + 右侧控件，一组 = 标题 + 行容器。
+     * 三件套与既有界面同一套类名：一行 = 文案块 + 右侧控件，一组 = 标题 + 行容器。
      * 定义在 makeToolsComponent 里而不是模块级，这样它们拿到的 props 就是槽位
      * 直接传进来的那一个（模块级签名写成 (React, props) 会被 React 当成 props，
      * 拿到的 React 其实是 props —— 冒烟里当场炸成 "h is not a function"）。
@@ -733,7 +733,7 @@
           ? (tasks.summary ? '上一轮已完成' : '当前没有待办')
           : '待办 ' + pendingTotal + ' 项';
 
-      // 折进参考页面里渲染（同一个 wbp-section 列），所以这里只出分组、不再自建列。
+      // 折进既有页面里渲染（同一个 wbp-section 列），所以这里只出分组、不再自建列。
       // 只留「标题 + 一行状态 + 一个动作」：分组说明、日志尾巴、token 统计这些次要
       // 文案全部去掉（用户 2026-10-27：删除多余的标语、说明文字、次要标签）。
       const lastLog = tasks.logs.length > 0 ? String(tasks.logs[tasks.logs.length - 1]) : '';
@@ -770,9 +770,9 @@
   /**
    * 工具块的少量排版修正。
    *
-   * 参考实现的 `.wbp-group` 是「标题 + 28px 上边距」的结构，放在页面最顶上时会在
+   * 既有界面的 `.wbp-group` 是「标题 + 28px 上边距」的结构，放在页面最顶上时会在
    * 页首堆出两段空隙、看着很突兀；行本身又是 16px 上下内边距，两行就占掉半屏。
-   * 这里只覆盖我们自己这块（`.wb2api-tools`），不动参考页面的任何样式。
+   * 这里只覆盖我们自己这块（`.wb2api-tools`），不动既有页面的任何样式。
    */
   function injectToolsCss() {
     if (typeof document === 'undefined' || document === null) return;

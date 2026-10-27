@@ -12,7 +12,7 @@ import vm from 'node:vm';
 const here = dirname(fileURLToPath(import.meta.url));
 const shimPath = join(here, '..', 'client', 'wbcompat-shim.js');
 const base = (process.argv[2] ?? 'http://127.0.0.1:41018').replace(/\/+$/u, '');
-const PREFIX = '/plugins/dsh-workbuddy-connect-functy';
+const PREFIX = '/plugins/dsh-plugin-wb2api-ui';
 
 const store = new Map();
 const baseFetch = (input, init) => fetch(new URL(typeof input === 'string' ? input : input.url, base), init);

@@ -1,7 +1,7 @@
-# 把本仓库的本地改动（复刻 UI + 宿主补丁）覆盖回 DSH 的 profile 安装目录。
+# 把本仓库的本地改动（界面 + 宿主补丁）覆盖回 DSH 的 profile 安装目录。
 #
 # 背景：插件从 npm 安装，插件市场/管理器升级会整包覆盖 node_modules 里的副本，
-# 把 client/client.js（functy 界面）和 lib/index.js（签到/倍率/login-pending 补丁）冲掉。
+# 把 client/client.js（仪表盘界面）和 lib/index.js（签到/倍率/login-pending 补丁）冲掉。
 # 这个脚本就是「冲掉之后再贴回去」的一键操作：只覆盖我们改过的文件，先备份被覆盖的原件。
 #
 # 用法：
@@ -66,7 +66,7 @@ foreach ($dest in $profiles) {
     if ($a -ne $b) { $ok = $false }
     Write-Host ("  {0,-18} repo={1} inst={2} {3}" -f $rel, $a, $b, $(if ($a -eq $b) { 'OK' } else { 'MISMATCH' }))
   }
-  foreach ($rel in @('lib\gw\link.js', 'lib\gw\restart.js', 'client\wbcompat-shim.js', 'client\vendor\dsh-workbuddy-connect-functy.client.js')) {
+  foreach ($rel in @('lib\gw\link.js', 'lib\gw\restart.js', 'client\wbcompat-shim.js', 'client\vendor\ui-runtime.js')) {
     if (-not (Test-Path -LiteralPath (Join-Path $repo $rel))) { continue }
     $a = Hash (Join-Path $repo $rel)
     $b = Hash (Join-Path $dest $rel)

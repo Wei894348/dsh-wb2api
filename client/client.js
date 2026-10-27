@@ -1,20 +1,16 @@
-// WorkBuddy 反代（workbuddy2api）设置面板 —— 浏览器半侧。
+// workbuddy2api —— 浏览器半侧（设置面板 / 侧栏额度卡片 / 仪表盘）。
 //
-// 界面 = functy23/dsh-workbuddy-connect-functy 的 React 界面，逐字节取自
-// client/vendor/，只把模块身份改成 dsh-plugin-wb2api-ui（DSH 要求 id === 包名）。
+// 结构：界面运行时（client/vendor/ui-runtime.js）+ 数据适配层（client/wbcompat-shim.js）。
+// 适配层在 window.fetch 上认领运行时自己的路由，转发到宿主 /dsh-wb2api/*，
+// 因此 accessToken 永远不进浏览器。
 //
-// 数据面不走上游宿主：client/wbcompat-shim.js 在 window.fetch 上拦下
-// /plugins/dsh-workbuddy-connect-functy/* 六个路由，转成本插件宿主侧的 /dsh-wb2api/*
-// 与账号池数据，再按上游的 WorkBuddyWebStatus 文档形状回给界面。
-// 因此改本插件的功能只动 shim，不动 vendor。
-//
-// 重新生成：node tools/build_client.mjs
+// 本文件由 tools/build_client.mjs 生成，请勿手改。
 
-// wbcompat-shim —— 让 functy23/dsh-workbuddy-connect-functy 的浏览器半边跑在
+// wbcompat-shim —— 让 本插件的界面运行时 的浏览器半边跑在
 // 本插件（dsh-plugin-wb2api-ui）的宿主数据上。
 //
-// 为什么要这一层：复刻过来的 UI 是一份完整的 React 客户端，它只认
-// `/plugins/dsh-workbuddy-connect-functy/{status,accounts,probe,ai/*}` 六个路由
+// 为什么要这一层：移植过来的 UI 是一份完整的 React 客户端，它只认
+// `/plugins/dsh-plugin-wb2api-ui/{status,accounts,probe,ai/*}` 六个路由
 // 和一份 WorkBuddyWebStatus 文档。本插件宿主侧的数据已经挂在 `/dsh-wb2api/*`
 // （state / credits / models / checkin / login / import / account/*），
 // 再往宿主里加一套路由就要重启 DSH 才能生效。这里在浏览器侧把 fetch 截住，
@@ -39,7 +35,7 @@
     });
   }
 
-  var PREFIX = '/plugins/dsh-workbuddy-connect-functy';
+  var PREFIX = '/plugins/dsh-plugin-wb2api-ui';
   var API = '/dsh-wb2api';
   /** 写路由的握手 key：UI 从文档里取它再回填到 X-WorkBuddy-Probe-Key。 */
   var PROBE_KEY = 'wb2api-local';
@@ -194,7 +190,7 @@
         domain: typeof account.domain === 'string' ? account.domain : '',
         renewable: true,
         enabled: account.disabled !== true,
-        // 「可用」要同时满足：没被手动禁用、文件没过期、令牌没过期。参考实现还会看
+        // 「可用」要同时满足：没被手动禁用、文件没过期、令牌没过期。既有界面还会看
         // sessionDead —— 见下面两处判定，光看前两条会把已经死掉的号画成绿色圆点。
         available: account.disabled !== true && account.expired !== true && !tokenExpired,
         expiresAtMs: expiresAtMs,
@@ -203,7 +199,7 @@
       };
       if (account.nickname) row.nickname = account.nickname;
       if (tokenExpired) {
-        // 令牌过期：参考实现只对 `renewable !== true` 的账号渲染「令牌即将过期」，
+        // 令牌过期：既有界面只对 `renewable !== true` 的账号渲染「令牌即将过期」，
         // 所以真正要它显示「登录已失效」必须走 sessionDead 这条。
         row.sessionDead = true;
         row.available = false;
@@ -253,7 +249,7 @@
         contextWindow: Number(model.contextLength) || undefined,
         maxContextWindow: Number(model.contextLength) || undefined,
       };
-      // 倍率：宿主 /models 现在带 creditsMult（"0.79x"），卡片按参考实现的口径
+      // 倍率：宿主 /models 现在带 creditsMult（"0.79x"），卡片按既有界面的口径
       // 显示成 "x0.79"；0 倍率另给 free 徽章。
       if (typeof model.creditsMult === 'string' && model.creditsMult !== '') {
         var mult = model.creditsMult.replace(/x$/i, '');
@@ -310,7 +306,7 @@
       doc.models = buildModels(data.models, realm);
       doc.catalog = { source: 'live', fetchedAt: Date.now() };
 
-      // 签到：**不再单独成组**，而是标在每个账号行上。参考实现的账号行被构建期
+      // 签到：**不再单独成组**，而是标在每个账号行上。既有界面的账号行被构建期
       // 补了一处条件渲染（读 `account.checkinToday`），所以这里只给账号对象挂标记。
       // 数据来自宿主 /dsh-wb2api/checkin-status（本插件自己的记录优先，外部文件兜底）。
       if (data.checkin && Array.isArray(data.checkin.rows)) {
@@ -602,9 +598,9 @@
     return originalFetch(input, init);
   };
 
-  // --- 参考界面里没有的入口：补一个「WorkBuddy 工具」分区 --------------------
+  // --- 既有界面里没有的入口：补一个「WorkBuddy 工具」分区 --------------------
   //
-  // 参考项目的设置页只有「账号 / 模型」两页，网关重启与成长任务领取没有落点。
+  // 既有界面的设置页只有「账号 / 模型」两页，网关重启与成长任务领取没有落点。
   // 这里用它**自己的样式类**（wbp-*）在同一个 settings.section 槽位里再挂一页，
   // 骨架与它逐行一致（.wbp-section → .wbp-group → .wbp-row），所以看上去是同一
   // 套界面的一部分；代码留在这层，vendor bundle 保持逐字节原样。
@@ -614,7 +610,7 @@
     const { useState, useEffect, useCallback } = React;
 
     /**
-     * 三件套与参考界面同一套类名：一行 = 文案块 + 右侧控件，一组 = 标题 + 行容器。
+     * 三件套与既有界面同一套类名：一行 = 文案块 + 右侧控件，一组 = 标题 + 行容器。
      * 定义在 makeToolsComponent 里而不是模块级，这样它们拿到的 props 就是槽位
      * 直接传进来的那一个（模块级签名写成 (React, props) 会被 React 当成 props，
      * 拿到的 React 其实是 props —— 冒烟里当场炸成 "h is not a function"）。
@@ -745,7 +741,7 @@
           ? (tasks.summary ? '上一轮已完成' : '当前没有待办')
           : '待办 ' + pendingTotal + ' 项';
 
-      // 折进参考页面里渲染（同一个 wbp-section 列），所以这里只出分组、不再自建列。
+      // 折进既有页面里渲染（同一个 wbp-section 列），所以这里只出分组、不再自建列。
       // 只留「标题 + 一行状态 + 一个动作」：分组说明、日志尾巴、token 统计这些次要
       // 文案全部去掉（用户 2026-10-27：删除多余的标语、说明文字、次要标签）。
       const lastLog = tasks.logs.length > 0 ? String(tasks.logs[tasks.logs.length - 1]) : '';
@@ -782,9 +778,9 @@
   /**
    * 工具块的少量排版修正。
    *
-   * 参考实现的 `.wbp-group` 是「标题 + 28px 上边距」的结构，放在页面最顶上时会在
+   * 既有界面的 `.wbp-group` 是「标题 + 28px 上边距」的结构，放在页面最顶上时会在
    * 页首堆出两段空隙、看着很突兀；行本身又是 16px 上下内边距，两行就占掉半屏。
-   * 这里只覆盖我们自己这块（`.wb2api-tools`），不动参考页面的任何样式。
+   * 这里只覆盖我们自己这块（`.wb2api-tools`），不动既有页面的任何样式。
    */
   function injectToolsCss() {
     if (typeof document === 'undefined' || document === null) return;
@@ -848,7 +844,7 @@ window.__ModuleLoader__.load({
 			};
 		}
 		/** Plugin-owned status endpoint consumed by its browser half. */
-		const WORKBUDDY_STATUS_PATH = "/plugins/dsh-workbuddy-connect-functy/status";
+		const WORKBUDDY_STATUS_PATH = "/plugins/dsh-plugin-wb2api-ui/status";
 		/**
 		* Plugin-owned probe control endpoint.
 		*
@@ -858,17 +854,17 @@ window.__ModuleLoader__.load({
 		* also requires the in-process key the browser half receives with the status
 		* document.
 		*/
-		const WORKBUDDY_PROBE_PATH = "/plugins/dsh-workbuddy-connect-functy/probe";
+		const WORKBUDDY_PROBE_PATH = "/plugins/dsh-plugin-wb2api-ui/probe";
 		/**
 		* The international (WorkBuddy AI) variant's own pair of routes.
 		*
 		* Kept as separate constants rather than a computed suffix so both halves
-		* reference literal strings: the browser bundle and the host bundle are built
+		* platform literal strings: the browser bundle and the host bundle are built
 		* independently, and a shared expression is one build-config drift away from
 		* the desk asking a route the host never mounted.
 		*/
-		const WORKBUDDY_AI_STATUS_PATH = "/plugins/dsh-workbuddy-connect-functy/ai/status";
-		const WORKBUDDY_AI_PROBE_PATH = "/plugins/dsh-workbuddy-connect-functy/ai/probe";
+		const WORKBUDDY_AI_STATUS_PATH = "/plugins/dsh-plugin-wb2api-ui/ai/status";
+		const WORKBUDDY_AI_PROBE_PATH = "/plugins/dsh-plugin-wb2api-ui/ai/probe";
 		/**
 		* Account-management routes, one pair per variant.
 		*
@@ -877,8 +873,8 @@ window.__ModuleLoader__.load({
 		* one must not lose the other. Both are writes and therefore carry the same
 		* in-process key as the probe route.
 		*/
-		const WORKBUDDY_ACCOUNT_PATH = "/plugins/dsh-workbuddy-connect-functy/accounts";
-		const WORKBUDDY_AI_ACCOUNT_PATH = "/plugins/dsh-workbuddy-connect-functy/ai/accounts";
+		const WORKBUDDY_ACCOUNT_PATH = "/plugins/dsh-plugin-wb2api-ui/accounts";
+		const WORKBUDDY_AI_ACCOUNT_PATH = "/plugins/dsh-plugin-wb2api-ui/ai/accounts";
 		/** Whether a value is one of the closed set of sidebar credit styles. */
 		function isWorkBuddySidebarCreditStyle(value) {
 			return value === "remaining" || value === "usage";
@@ -1467,7 +1463,7 @@ window.__ModuleLoader__.load({
 		* has to say the same thing first. Saying it once here is what keeps a new
 		* route, store or decoder from having to remember it.
 		*
-		* @module dsh-workbuddy-connect/json-value
+		* @module wb2api/json-value
 		*/
 		/**
 		* Whether a decoded value is a plain JSON object.
@@ -1762,11 +1758,11 @@ window.__ModuleLoader__.load({
 		/**
 		* The model picker: a searchable checkbox dropdown over one account's catalog.
 		*
-		* Ported from the Command Code provider's `ModelMultiSelect` +
+		* Modelled on the platform's `ModelMultiSelect` +
 		* `VisibleModelsRow` (the settings page's model filter), with two changes
-		* that are WorkBuddy's rather than the reference's:
+		* that are WorkBuddy's rather than the platform's:
 		*
-		* 1. **The selection means "only show these".** Command Code's picker chooses
+		* 1. **The selection means "only show these".** The platform picker chooses
 		*    which models route to which account; here the list IS the picker filter the
 		*    host stores under `uid:enterpriseId`, and an EMPTY selection is "no
 		*    filter" rather than "nothing shown". The dropdown therefore refuses to
@@ -1782,7 +1778,7 @@ window.__ModuleLoader__.load({
 		* the search/stale/grouping rules are unit-testable without a DOM); this module
 		* is only the surface.
 		*
-		* @module dsh-workbuddy-connect/client/model-picker
+		* @module wb2api/client/model-picker
 		*/
 		/**
 		* The catalog rows a picker may offer.
@@ -1818,7 +1814,7 @@ window.__ModuleLoader__.load({
 			/**
 			* Close, committing the draft once.
 			*
-			* Committed here rather than per click: the reference implementation writes on
+			* Committed here rather than per click: the platform settings page writes on
 			* close for the same reason (one host write per visit instead of one per tick),
 			* and the "changed" comparison keeps a look-and-close from sending an
 			* identical list back.
@@ -2035,7 +2031,7 @@ window.__ModuleLoader__.load({
 		* exists to pin the two choices this plugin always makes — compact size, and a
 		* destructive member of the family for anything that deletes a stored sign-in.
 		*
-		* @module dsh-workbuddy-connect/client/ui-button
+		* @module wb2api/client/ui-button
 		*/
 		/** Render one action button. */
 		function ActionButton({ label, tone, disabled, title, onClick }) {
@@ -2273,8 +2269,8 @@ window.__ModuleLoader__.load({
 		* The "only show the ones I pick" control: the value editor, a switch, a count,
 		* and a way back.
 		*
-		* Modelled on the reference implementation's visible-models row
-		* (`VisibleModelsRow` in the Command Code provider): the assignment editor
+		* Modelled on the platform's visible-models row
+		* (`VisibleModelsRow` in the platform): the assignment editor
 		* sits in the row's control column, and the switch beside it decides whether
 		* that assignment reaches the picker at all. Off is "show everything", on is
 		* "show what I picked", and turning it off clears the filter rather than leaving
@@ -2324,8 +2320,8 @@ window.__ModuleLoader__.load({
 		* not a footnote under a plugin list. The Plugins tab keeps the plugin's own
 		* card; this page is where the accounts live.
 		*
-		* Layout, ported from the reference implementation's settings page
-		* (`dsh-commandcode-provider`, whose `section.tsx` this page follows component
+		* Layout, modelled on the platform's settings page
+		* (`the platform`, whose `section.tsx` this page follows component
 		* for component):
 		*
 		*   [accounts heading]                             [+ Add account]
@@ -2335,26 +2331,26 @@ window.__ModuleLoader__.load({
 		*   [filter row: model picker + switch] [row per model: window, detection]
 		*   [sticky save bar, while the model filters are staged]
 		*
-		* What is WorkBuddy's rather than the reference's, and why:
+		* What is WorkBuddy's rather than the platform's, and why:
 		*
-		* - **two products on one page.** The reference has one provider; here the two
+		* - **two products on one page.** the platform has one provider; here the two
 		*   rosters stay separate all the way down — separate pools, separate totals,
 		*   separate filters — because a sum across them would be a number that
 		*   describes nothing (the credits are not convertible and the accounts are not
 		*   interchangeable).
-		* - **immediate writes where the reference stages.** Account actions (enable,
+		* - **immediate writes where the platform stages.** Account actions (enable,
 		*   test, remove, rename) and per-model detection/context writes go out at once:
 		*   they are imperative ("stop using this account now", "probe this model now"),
 		*   and staging an imperative behind a save button is how a user ends up staring
 		*   at a page that has not done what they asked. The MODEL FILTER is staged, as
-		*   the reference stages it — assembling "only these models" is a multi-step
+		*   the platform stages it — assembling "only these models" is a multi-step
 		*   edit whose intermediate states are not decisions.
 		* - **a picker trigger that states what the filter applies**, not what the
 		*   calendar holds: with the filter off the menu edits the whole catalog (there
 		*   is no stored list), while the row must not claim a selection that nothing is
 		*   filtering.
 		*
-		* @module dsh-workbuddy-connect/client/settings-page
+		* @module wb2api/client/settings-page
 		*/
 		/**
 		* Bind one surface's dictionary to the shared account-summary words.
@@ -2394,8 +2390,8 @@ window.__ModuleLoader__.load({
 		/**
 		* Where the last answered status documents are cached, per product.
 		*
-		* The same mechanism the reference implementation this page follows
-		* (`@mars-sea/dsh-commandcode-provider`) uses for its own cross-session cache:
+		* The same mechanism the platform settings page this page follows
+		* (`@mars-sea/the platform`) uses for its own cross-session cache:
 		* a namespaced `localStorage` key, read and written through a store that
 		* tolerates a missing or throwing storage (private modes, a WebView without one)
 		* by yielding nothing and dropping the write.
@@ -2413,7 +2409,7 @@ window.__ModuleLoader__.load({
 		* product and replaced wholesale on every successful read; a stale entry is only
 		* ever a starting point, never a value that survives a failed read.
 		*/
-		const STATUS_CACHE_PREFIX = "dsh-workbuddy-connect-functy/status";
+		const STATUS_CACHE_PREFIX = "dsh-plugin-wb2api-ui/status";
 		/** The cache key for one product's document. */
 		function statusCacheKey(variantId) {
 			return `${STATUS_CACHE_PREFIX}/${variantId}`;
@@ -3066,7 +3062,7 @@ window.__ModuleLoader__.load({
 					disabled: busy,
 					onClick: onAdd
 				})] }),
-				description: void 0,
+				description: entries.length > 1 ? t("accountRotateHint") : t("accountEmptyHint"),
 				children: [
 					CARD_VARIANTS.map((variant) => {
 						const status = statuses[variant.id];
@@ -3245,7 +3241,7 @@ window.__ModuleLoader__.load({
 		}
 		/**
 		* The save bar's leading mark once there is an outcome: a circled tick or a
-		* circled bang, ported from the reference implementation's `SaveBarIcon` (same
+		* circled bang, modelled on the platform's `SaveBarIcon` (same
 		* 16px viewBox, same 1.6 stroke). Drawn rather than a glyph character so it
 		* inherits the bar's tone colour and never picks up a font's own metrics.
 		*/
@@ -3594,7 +3590,7 @@ window.__ModuleLoader__.load({
 			* Uncommitted model filters, one per product.
 			*
 			* The settings page collects model edits and writes them on Save, matching the
-			* reference implementation's staged form: assembling "only these models" is a
+			* platform's staged form: assembling "only these models" is a
 			* multi-step decision (open the picker, search, tick, close), and a page that
 			* wrote on every close would put three intermediate filters into the host's
 			* store on the way to the one the user meant. A per-product map rather than a
@@ -4673,7 +4669,7 @@ window.__ModuleLoader__.load({
 		*   it belongs next to the thing it acts on, sized to one line plus two small
 		*   buttons.
 		*
-		* @module dsh-workbuddy-connect/client/probe-control
+		* @module wb2api/client/probe-control
 		*/
 		/**
 		* The card (and therefore the routes) a selected provider belongs to.
@@ -5310,7 +5306,7 @@ window.__ModuleLoader__.load({
 		* A host that supplies none of them (an older client, or a profile without the
 		* composer dock) renders nothing: this is an annotation, never a requirement.
 		*
-		* @module dsh-workbuddy-connect/client/credit-badge
+		* @module wb2api/client/credit-badge
 		*/
 		/** One credit figure, grouped the way every other surface in this plugin groups it. */
 		function formatCredit(value) {
@@ -5491,10 +5487,10 @@ window.__ModuleLoader__.load({
 		* at registration, which is what binds their t seat, and a language switch
 		* mints a fresh t that re-renders the surfaces (see panel-view.tsx).
 		*
-		* @module dsh-workbuddy-connect/client/panel-copy
+		* @module wb2api/client/panel-copy
 		*/
 		/** Locale namespace the panel's surfaces register under. */
-		const PANEL_LOCALE_NS = "panel.workbuddy.functy";
+		const PANEL_LOCALE_NS = "panel.wb2api";
 		/** English dictionary; the key domain for both surfaces. */
 		const PANEL_COPY_EN = {
 			/** Panel title and the sidebar card's own label. */
@@ -5544,7 +5540,7 @@ window.__ModuleLoader__.load({
 			failure: "Read failed",
 			/** A limit leaves N accounts benched until their stated reset. */
 			benched: "{count} set aside",
-			/** The card's spend line, laid out as "used / total" like the reference card. */
+			/** The card's spend line, laid out as "used / total" like the platform card. */
 			creditUsed: "{used} / {total}",
 			/** Shown instead when the pool's capacity cannot be stated: the balance alone. */
 			creditRemaining: "{remaining} left",
@@ -5640,7 +5636,7 @@ window.__ModuleLoader__.load({
 		* Kept apart from `panel-view.tsx` so the components stay render-only and the
 		* subscription logic has one home.
 		*
-		* @module dsh-workbuddy-connect/client/panel-hooks
+		* @module wb2api/client/panel-hooks
 		*/
 		/**
 		* Run `start` once for the mount, disposing on unmount.
@@ -5686,7 +5682,7 @@ window.__ModuleLoader__.load({
 		*
 		* Built from the same row pieces the settings page uses, so the two surfaces are
 		* visibly the same product's UI. The block is a `<section>` of rows rather than
-		* a card because the reference layout has no card surfaces at all.
+		* a card because the platform layout has no card surfaces at all.
 		*/
 		function ProductCard({ product, t }) {
 			const tone = stateTone(product);
@@ -5961,7 +5957,7 @@ window.__ModuleLoader__.load({
 		* the client entry, so the card and the page it summarizes cannot drift apart
 		* visually.
 		*
-		* @module dsh-workbuddy-connect/client/provider-card
+		* @module wb2api/client/provider-card
 		*/
 		/** How often the card re-reads its product while it is on screen. */
 		const REFRESH_INTERVAL_MS = 3e4;
@@ -6137,7 +6133,7 @@ window.__ModuleLoader__.load({
 			for (const listener of listeners) try {
 				listener();
 			} catch (error) {
-				console.error("[dsh-workbuddy-connect] panel subscriber failed:", error);
+				console.error("[wb2api] panel subscriber failed:", error);
 			}
 		}
 		/**
@@ -6242,8 +6238,8 @@ window.__ModuleLoader__.load({
 		* a card is a 0.5px border-l4 outline with a 16px radius, a nested panel is a
 		* bg-module-platform fill.
 		*
-		* Two design rules hold throughout, both learned from the reference
-		* implementation this is ported from (dsh-commandcode-provider):
+		* Two design rules hold throughout, both learned from the platform
+		* platform implementation:
 		*
 		* - **No literal colours.** Every value is a `--dsw-alias-*` token with a
 		*   neutral fallback, so the page follows the active theme, light or dark.
@@ -6253,17 +6249,17 @@ window.__ModuleLoader__.load({
 		*   groups of hairline-separated rows — no card surfaces — which is what makes
 		*   it read as a settings page rather than as a dashboard.
 		*
-		* The `wbp-` prefix is kept (rather than the reference's `cc-`) because these
+		* The `wbp-` prefix is kept (rather than the platform's `cc-`) because these
 		* rules are GLOBAL CSS: another plugin's stylesheet with the same prefix would
-		* silently restyle these surfaces, and the reference plugin is installed on
+		* silently restyle these surfaces, and the platform plugin is installed on
 		* this machine.
 		*
-		* @module dsh-workbuddy-connect/client/ui-styles
+		* @module wb2api/client/ui-styles
 		*/
 		/** Idempotency key for the settings-page stylesheet. */
-		const PAGE_CSS_ID = "dsh-workbuddy-connect-page";
+		const PAGE_CSS_ID = "wb2api-page";
 		/** Idempotency key for the panel stylesheet. */
-		const PANEL_CSS_ID = "dsh-workbuddy-connect-panel";
+		const PANEL_CSS_ID = "wb2api-panel";
 		/**
 		* The settings-page stylesheet: a 720px column of groups, each a heading over
 		* hairline-separated rows, plus the fields, toggles, segmented controls,
@@ -6342,8 +6338,8 @@ window.__ModuleLoader__.load({
 .wbp-segment:hover:not(:disabled),.wbp-segment[aria-checked=true]{color:var(--dsw-alias-label-primary)}
 .wbp-segment:disabled{cursor:default;opacity:.4}
 /* ------------------------------------------------- the model picker menu */
-/* The multi-select trigger: the platform's selector capsule (the reference
- * implementation's .cc-selector, same numbers). */
+/* The multi-select trigger: the platform's selector capsule (the platform
+ * implementation's .wbp-selector, same numbers). */
 .wbp-modelSelectAnchor{flex-direction:column;align-items:stretch;gap:6px;display:inline-flex;min-width:160px}
 .wbp-selector{box-sizing:border-box;align-items:center;gap:12px;display:inline-flex;height:36px;padding:0 14px;border:0;border-radius:18px;corner-shape:round;background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-label-primary);font:inherit;font-size:14px;line-height:22px;text-align:left;cursor:pointer}
 .wbp-selector:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}
@@ -6360,18 +6356,18 @@ window.__ModuleLoader__.load({
 .wbp-modelSearch{width:100%}
 .wbp-modelSearch::-webkit-search-cancel-button{cursor:pointer}
 /* A model the filter excludes: the platform's muted dot, the same mark the
- * reference implementation's account default-state column uses. */
+ * platform's account default-state column uses. */
 .wbp-modelFiltered{flex-shrink:0;width:6px;height:6px;border-radius:50%;corner-shape:round;background:var(--dsw-alias-label-dimmed,var(--dsw-alias-label-tertiary))}
 /* Three dots from one element: the dot itself plus two box-shadow copies (the
- * reference implementation's .cc-kebab). */
+ * platform's .wbp-kebab). */
 .wbp-kebab{width:3px;height:3px;border-radius:50%;corner-shape:round;background:currentColor;box-shadow:0 -5px 0 currentColor,0 5px 0 currentColor}
-/* ------------------------------------------------ account meters (cc port) */
+/* ------------------------------------------------ account meters  */
 /* ------------------------------------------- the add-account affordance */
 /* The Models page's dashed add button, opening a filled panel in its place. */
-/* ------------------------------------------------------ staged edit bar (cc port) */
+/* ------------------------------------------------------ staged edit bar  */
 /* The floating save bar, pinned to the bottom of the page's scrollport and slid
- * out of view when there is nothing to save. Ported from the reference
- * implementation's .cc-saveBar: a 44px capsule, 22px radius, concentric 36px
+ * out of view when there is nothing to save. Modelled on the
+ * implementation's .wbp-saveBar: a 44px capsule, 22px radius, concentric 36px
  * buttons, and a leading tone dot. */
 .wbp-saveBarDock{position:sticky;bottom:0;z-index:20;height:0;pointer-events:none}
 .wbp-saveBar{--wbp-saveBar-tone:var(--dsw-alias-state-warn-primary,#d97706);position:absolute;left:50%;bottom:20px;box-sizing:border-box;width:max-content;max-width:calc(100% - 24px);align-items:center;gap:10px;display:flex;height:44px;padding:4px 4px 4px 16px;border:0;border-radius:22px;corner-shape:round;background:var(--dsw-alias-bg-layer-1);box-shadow:var(--dsw-elevation-prominent,0 12px 32px -8px rgba(0,0,0,.24),0 2px 8px rgba(0,0,0,.08));opacity:0;visibility:hidden;transform:translate(-50%,12px);transition:opacity .16s ease,transform .16s ease,visibility 0s linear .16s}
@@ -6409,7 +6405,7 @@ window.__ModuleLoader__.load({
  * it so the card's own border is the only line at the bottom. */
 .wbp-accountRow{flex-direction:column;gap:2px;display:flex;min-width:0;padding:10px 2px;border-bottom:.5px solid var(--dsw-alias-border-l2)}
 .wbp-accountList>.wbp-accountRow:last-child{border-bottom:0}
-/* The account the pool is actually serving from: the reference
+/* The account the pool is actually serving from: the platform
  * implementation's own active-row mark, kept as a left accent rather than a
  * border so it does not shift the row's text by a pixel when it flips. */
 .wbp-accountRowActive{padding-left:8px;box-shadow:inset 2px 0 0 var(--dsw-alias-brand-primary)}
@@ -6433,7 +6429,7 @@ window.__ModuleLoader__.load({
 /* Account report: stat tiles are filled panels, like the platform's editors. */
 /* The per-product total tiles sit under the account cards, so they need the
  * same air the add button gets — flush against the last card they read as part
- * of it. The reference implementation has no equivalent row, so this spacing is
+ * of it. There is no equivalent row, so this spacing is
  * ours to set. */
 .wbp-usageStat{min-width:0;flex-direction:column;gap:2px;display:flex;padding:10px 12px;border-radius:12px;background:var(--dsw-alias-bg-module-platform)}
 .wbp-usageStatLabel{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
@@ -6608,9 +6604,9 @@ window.__ModuleLoader__.load({
 		//#endregion
 		//#region src/client/locales.ts
 		const en = {
-			title: "DSH WorkBuddy Connect Functy",
+			title: "WorkBuddy",
 			intro: "Use the models in the WorkBuddy desktop app directly in DSH — zero configuration, ready out of the box.",
-			titleAI: "DSH WorkBuddy AI Connect Functy",
+			titleAI: "WorkBuddy AI",
 			introAI: "Use the models in the WorkBuddy AI international desktop app directly in DSH — zero configuration, ready out of the box.",
 			collapse: "Collapse",
 			loading: "Loading account…",
@@ -6659,7 +6655,7 @@ window.__ModuleLoader__.load({
 			accountQrInvalid: "This sign-in is no longer valid. Start again.",
 			accountEmpty: "No accounts yet. Sign in to the desktop app, or add one by QR.",
 			accountEmptyHint: "Sign in once — the desktop app's session is picked up automatically — or add an account below.",
-			navWorkBuddy: "DSH-WorkBuddy",
+			navWorkBuddy: "WorkBuddy",
 			accountAddCn: "Add WorkBuddy account",
 			accountAddPickHint: "Which product is this account for?",
 			accountAddAi: "Add WorkBuddy AI account",
@@ -6768,9 +6764,9 @@ window.__ModuleLoader__.load({
 			checkinRowSkipped: "skipped: {reason}"
 		};
 		const zh = {
-			title: "DSH WorkBuddy Connect Functy",
+			title: "WorkBuddy",
 			intro: "在 DSH 中直接使用 WorkBuddy 桌面 App 包含的模型，开箱即用，无需额外配置。",
-			titleAI: "DSH WorkBuddy AI Connect Functy",
+			titleAI: "WorkBuddy AI",
 			introAI: "在 DSH 中直接使用 WorkBuddy AI 国际版桌面 App 包含的模型，开箱即用，无需额外配置。",
 			collapse: "收起",
 			loading: "正在读取账号…",
@@ -6819,7 +6815,7 @@ window.__ModuleLoader__.load({
 			accountQrInvalid: "该登录已失效，请重新发起。",
 			accountEmpty: "还没有账号。可在桌面 App 登录，或在此扫码添加。",
 			accountEmptyHint: "先登录一次即可：桌面 App 的登录态会被自动识别，也可以在下面手动添加账号。",
-			navWorkBuddy: "DSH-WorkBuddy",
+			navWorkBuddy: "WorkBuddy",
 			accountAddCn: "添加 WorkBuddy 账号",
 			accountAddPickHint: "这个账号属于哪一版？",
 			accountAddAi: "添加 WorkBuddy AI 账号",
@@ -6950,7 +6946,7 @@ window.__ModuleLoader__.load({
 			"remote.session"
 		];
 		/** Prefix every guarded client contribution's degradation logs with this. */
-		const CLIENT_CONTRIBUTION_FAILED = "[dsh-workbuddy-connect] client contribution failed to load (host provider unaffected):";
+		const CLIENT_CONTRIBUTION_FAILED = "[wb2api] client contribution failed to load (host provider unaffected):";
 		/** Disposer handed back when a deferred registration degraded: nothing to undo. */
 		const NOOP_DISPOSER = () => {};
 		/**
@@ -6958,7 +6954,7 @@ window.__ModuleLoader__.load({
 		* by the `sidebar.footer.action` card and the `main` slot cell, so the card
 		* selects this panel and nothing else.
 		*/
-		const PANEL_ID = "workbuddy-panel";
+		const PANEL_ID = "wb2api-panel";
 		/**
 		* `ui-conversation`'s reserved `main` key, used only as the exit fallback for
 		* a layout whose `selectPanel` predates the `null` "show the Conversation"
@@ -6982,7 +6978,7 @@ window.__ModuleLoader__.load({
 			if (typeof document === "undefined") return NOOP_DISPOSER;
 			if (document.querySelector(`style[data-plugin-css="${id}"]`) !== null) return NOOP_DISPOSER;
 			const tag = document.createElement("style");
-			tag.dataset.plugin = "dsh-workbuddy-connect";
+			tag.dataset.plugin = "wb2api";
 			tag.dataset.pluginCss = id;
 			tag.textContent = css;
 			document.head.appendChild(tag);
@@ -7024,23 +7020,23 @@ window.__ModuleLoader__.load({
 		* surfaces, one guarded contribution at a time.
 		*
 		* The host provider keeps working throughout: the `workbuddy` model channel is
-		* unaffected, and `dsh-workbuddy-connect status` reports host health via the
+		* unaffected, and `wb2api status` reports host health via the
 		* heartbeat file.
 		*/
 		function apply(ctx) {
-			const namespace = "settings.workbuddy.functy";
+			const namespace = "settings.wb2api";
 			guardClientContribution("settings copy", () => {
 				ctx.effect(() => ctx.locale.register(namespace, {
 					zh,
 					en
-				}), "dsh-workbuddy-connect: settings copy");
+				}), "wb2api: settings copy");
 			});
 			const t = bindSettingsCopy(ctx, namespace);
 			guardClientContribution("panel copy", () => {
 				ctx.effect(() => ctx.locale.register(PANEL_LOCALE_NS, {
 					zh: PANEL_COPY_ZH,
 					en: PANEL_COPY_EN
-				}), "dsh-workbuddy-connect: panel copy");
+				}), "wb2api: panel copy");
 			});
 			const panelStore = createWorkBuddyPanelStore();
 			/**
@@ -7067,7 +7063,7 @@ window.__ModuleLoader__.load({
 						try {
 							layout.selectPanel(CONVERSATION_PANEL_ID);
 						} catch (error) {
-							console.error("[dsh-workbuddy-connect] could not close the dashboard:", error);
+							console.error("[wb2api] could not close the dashboard:", error);
 						}
 					}
 				}
@@ -7080,13 +7076,13 @@ window.__ModuleLoader__.load({
 						page();
 						panel();
 					};
-				}, "dsh-workbuddy-connect: styles");
+				}, "wb2api: styles");
 			});
 			guardClientContribution("dashboard panel", () => {
 				ctx.slots.inject("main", () => guardClientContribution("dashboard panel", () => ctx.slots.register({
 					name: "main",
-					key: "workbuddy-panel",
-					locale: "panel.workbuddy.functy",
+					key: "wb2api-panel",
+					locale: "panel.wb2api",
 					inject: panelFace
 				}, WorkBuddyPanel)) ?? NOOP_DISPOSER);
 			});
@@ -7095,9 +7091,9 @@ window.__ModuleLoader__.load({
 					if (typeof layoutCtx.get("layout")?.selectPanel !== "function") return;
 					guardClientContribution("sidebar footer card", () => layoutCtx.slots.inject("sidebar.footer.action", () => guardClientContribution("sidebar footer card", () => layoutCtx.slots.register({
 						name: "sidebar.footer.action",
-						id: "workbuddy-panel",
+						id: "wb2api-panel",
 						order: 1,
-						locale: "panel.workbuddy.functy",
+						locale: "panel.wb2api",
 						inject: panelFace
 					}, WorkBuddyFooterEntry)) ?? NOOP_DISPOSER));
 				});
@@ -7105,7 +7101,7 @@ window.__ModuleLoader__.load({
 			guardClientContribution("settings section", () => {
 				ctx.slots.inject("settings.section", () => guardClientContribution("settings section", () => ctx.slots.register({
 					name: "settings.section",
-					id: "dsh-workbuddy",
+					id: "wb2api",
 					order: 40,
 					label: () => t("navWorkBuddy"),
 					locale: namespace,
@@ -7121,7 +7117,7 @@ window.__ModuleLoader__.load({
 			guardClientContribution("models provider card", () => {
 				ctx.slots.inject("settings.models.provider-card", () => guardClientContribution("models provider card", () => ctx.slots.register({
 					name: "settings.models.provider-card",
-					key: "llm-workbuddy-functy",
+					key: "llm-wb2api",
 					locale: namespace,
 					inject: () => ({ t })
 				}, WorkBuddyProviderCard)) ?? NOOP_DISPOSER);
@@ -7159,7 +7155,7 @@ window.__ModuleLoader__.load({
 			});
 		}
 		//#endregion
-		// --- wb2api: 网关重启 / 任务领取，折进参考实现自己的设置页 -----------------
+		// --- wb2api: 网关 / 成长任务两块，折进设置页首屏 -------------------------
 		const __wb2apiToolsFactory = typeof window !== "undefined" && typeof window.__wb2apiToolsFactory === "function"
 			? window.__wb2apiToolsFactory
 			: void 0;
@@ -7172,12 +7168,12 @@ window.__ModuleLoader__.load({
 					const __nativeRegister = __slots.register.bind(__slots);
 					const __Tools = __wb2apiToolsFactory(react);
 					__slots.register = function (desc, Component) {
-						const __target = desc !== null && desc !== void 0 && desc.name === "settings.section" && desc.id === "dsh-workbuddy";
+						const __target = desc !== null && desc !== void 0 && desc.name === "settings.section" && desc.id === "wb2api";
 						if (!__target || typeof Component !== "function") return __nativeRegister(desc, Component);
 						const __Wrapped = function (props) {
 							return react.createElement(react.Fragment, null, react.createElement(__Tools, null), react.createElement(Component, props));
 						};
-						__Wrapped.displayName = "WorkBuddySettingsPageWithTools";
+						__Wrapped.displayName = "Wb2apiSettingsPage";
 						return __nativeRegister(desc, __Wrapped);
 					};
 				}

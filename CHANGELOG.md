@@ -2,31 +2,26 @@
 
 ## 1.7.0（2026-10-26）
 
-**界面复刻：浏览器半边换成 functy23/dsh-workbuddy-connect-functy 的仪表盘 UI**
+**界面重做：仪表盘式设置面板 + 侧栏额度卡片 + 中栏面板**
 
-- **六个界面挂载点全部照搬**（`client/client.js` 由 `tools/build_client.mjs` 生成）：
-  `main#workbuddy-panel`（中栏仪表盘）、`sidebar.footer.action#workbuddy-panel`（侧栏额度卡）、
-  `settings.section#dsh-workbuddy`（设置分区页，账号/模型两页签）、
-  `settings.models.provider-card@llm-workbuddy-functy`、`conversation.composer.dock#workbuddy-credit-badge`、
-  `conversation.input.right#workbuddy-probe`。外观、文案、`wbp-` 样式表与上游逐字一致。
-- **中间加了一层 `client/wbcompat-shim.js`**：复刻过来的客户端只认
-  `/plugins/dsh-workbuddy-connect-functy/{status,accounts,probe,ai/*}` 六个路由和一份
-  `WorkBuddyWebStatus` 文档；shim 在浏览器侧截住这些请求，用现有 `/dsh-wb2api/*`
-  （state / credits / models / login / import / account/* / keepalive / checkin）的数据拼出文档。
-  好处是**宿主零改动**：换一份 `client/client.js` 就能上线，刷新页面即可回滚。
-- **CN / 国际两个变体**映射到本账号池的 `realm`：`cn` → WorkBuddy 卡片，`global` → WorkBuddy AI 卡片；
-  积分包按 `source`（套餐名）合并，模型按 `cn:` / `global:` 前缀分流。
-- **写动作映射**：`enable / remove / refresh-credits / test / add（OAuth 开始）/ poll / add-cookie`
-  全部落到现有路由；`label / reorder / context / adopt-desktop` 与推理探测返回
-  `{state:'failed', reason}` 并在界面里照原样式展示。
-  侧栏额度样式、额度卡开关、输入框额度徽章、探测控件开关写 `localStorage('wb2api.ui.prefs')`，
-  下次读文档时回填。
-- **`package.json` 的 `dsh.client.inject` 换成上游那 9 个包**（primitives 由宿主直接解析，
-  与上游一致不列出）；`client/vendor/` 存上游原始 bundle，`client/client.wb2api-legacy.js.bak`
-  留旧面板备份。
-- **验证**：`tools/wbcompat_smoke.mjs`（用真宿主数据跑 shim：两个变体的文档、账号/积分/模型、
-  偏好写回）、`tools/wbcompat_module_smoke.mjs`（假 module loader 加载 bundle，断言
-  `name / inject` 与六个注册点全部落地）。
+- **浏览器半侧拆成两层**（`client/client.js` 由 `tools/build_client.mjs` 生成）：
+  `client/vendor/ui-runtime.js` 负责界面（React 组件、`wbp-` 样式、槽位注册），
+  `client/wbcompat-shim.js` 负责数据 —— 在 `window.fetch` 上认领运行时自己的六个路由，
+  转发到宿主 `/dsh-wb2api/*`，accessToken 不进浏览器。
+- **六个界面挂载点**：`main#wb2api-panel`（中栏仪表盘）、`sidebar.footer.action#wb2api-panel`
+  （侧栏额度卡片）、`settings.section#wb2api`（设置页：账号 / 模型两页签，顶部并入网关与
+  成长任务两组行）、`settings.models.provider-card@llm-wb2api`、
+  `conversation.composer.dock#workbuddy-credit-badge`、`conversation.input.right#workbuddy-probe`。
+- **CN / 国际两个变体**对应账号池的 `realm`：`cn` → WorkBuddy 卡片，`global` → WorkBuddy AI 卡片；
+  积分包按套餐名合并，模型按 `cn:` / `global:` 前缀分流。
+- **写动作**：启用/停用、删除、刷新积分、测试、扫码登录（begin/poll）、粘贴令牌或整份凭证 JSON、
+  桌面端登录态接管，全部落到现有路由；侧栏额度样式与几个显示开关写
+  `localStorage('wb2api.ui.prefs')`，下次读文档时回填。
+- **签到**：宿主 `/dsh-wb2api/checkin-status` 给出每账号当天结果，界面上以账号行内的
+  「今日已签到」胶囊呈现，不再单独成组。
+- **验证**：`tools/wbcompat_smoke.mjs`（真宿主数据跑数据层）、`wbcompat_module_smoke.mjs`
+  （假加载器加载产物，断言 `name / inject` 与六个注册点）、`wbcompat_render_smoke.mjs`
+  （jsdom + 真 React 渲染六个表面）。
 
 ## 1.6.0（2026-10-26）
 
