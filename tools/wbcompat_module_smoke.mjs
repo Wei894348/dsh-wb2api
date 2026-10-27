@@ -203,7 +203,11 @@ try {
 
 console.log('注册点：');
 for (const row of registrations) console.log('  -', row);
-const expected = ['main', 'sidebar.footer.action', 'settings.section', 'settings.models.provider-card', 'conversation.composer.dock', 'conversation.input.right'];
+// 侧栏底部额度卡片已按需求下线：`sidebar.footer.action` 不再注册，也不再期望它出现。
+const expected = ['main', 'settings.section', 'settings.models.provider-card', 'conversation.composer.dock', 'conversation.input.right'];
 const missing = expected.filter((want) => !registrations.some((row) => row.startsWith(want)));
-console.log(missing.length === 0 ? '[OK] 六个注册点全部落地' : `[WARN] 缺注册点：${missing.join(', ')}`);
+const sidebarStillThere = registrations.some((row) => row.startsWith('sidebar.footer.action'));
+console.log(missing.length === 0 && !sidebarStillThere
+  ? '[OK] 五个注册点全部落地，侧栏卡片已移除'
+  : `[WARN] 缺注册点：${missing.join(', ') || '（无）'}${sidebarStillThere ? ' · 侧栏卡片仍在' : ''}`);
 console.log(`样式表注入：${[...styleTags.keys()].join(', ') || '（无）'}`);

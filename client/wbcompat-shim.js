@@ -942,7 +942,8 @@
     observer.observe(document.body, { childList: true, subtree: true })
     scheduleCardToggle()
   }
-  watchSidebarCard()
+  // 侧栏额度卡片已按用户要求下线：不再挂折叠箭头，也不再监听 DOM。
+  // watchSidebarCard()
 
   // 让同一页面的其它脚本能手动清缓存（调试用）。
   window.__wb2apiShim = {

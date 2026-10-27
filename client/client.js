@@ -950,7 +950,8 @@
     observer.observe(document.body, { childList: true, subtree: true })
     scheduleCardToggle()
   }
-  watchSidebarCard()
+  // 侧栏额度卡片已按用户要求下线：不再挂折叠箭头，也不再监听 DOM。
+  // watchSidebarCard()
 
   // 让同一页面的其它脚本能手动清缓存（调试用）。
   window.__wb2apiShim = {
@@ -7321,6 +7322,9 @@ window.__ModuleLoader__.load({
 					const __nativeRegister = __slots.register.bind(__slots);
 					const __Tools = __wb2apiToolsFactory(react);
 					__slots.register = function (desc, Component) {
+						// 侧栏底部那张额度卡片已按需求下线：整个挂载点跳过，不注册也不渲染。
+						if (desc !== null && desc !== void 0 && desc.name === "sidebar.footer.action") return function () {};
+						// 仪表盘面板的 store 接到 window 上，供即时刷新使用。
 						// 侧栏卡片与仪表盘共用同一个面板 store：这里把它接到 window 上，
 						// 隐藏按钮才能在写入偏好之后立刻触发一次重读（不然要等下一轮轮询）。
 						if (desc !== null && desc !== void 0 && (desc.name === "sidebar.footer.action" || desc.name === "main") && typeof desc.inject === "function" && desc.__wb2apiStoreHooked !== true) {
