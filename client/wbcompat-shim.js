@@ -170,7 +170,6 @@
       var credit = creditByFile.get(account.file);
       var ok = credit !== undefined && credit.state === 'ok';
       var segments = ok && Array.isArray(credit.segments) ? credit.segments : [];
-      var expiresAtMs = Number(account.expiresAt) > 0 ? Number(account.expiresAt) * 1000 : 0;
       var row = {
         id: account.file,
         uid: account.uid,
@@ -182,7 +181,8 @@
         renewable: true,
         enabled: account.disabled !== true,
         available: account.disabled !== true && account.expired !== true,
-        expiresAtMs: expiresAtMs,
+        // 令牌到期时间属于次要信息（账号行会渲染成「N 天后令牌过期」），不再下发。
+        expiresAtMs: 0,
         lastUsedAtMs: 0,
         addedAtMs: Number.isFinite(Number(account.mtime)) ? Math.round(Number(account.mtime)) : 0,
       };
@@ -191,9 +191,8 @@
         row.credits = Number(Number(credit.total).toFixed(2));
         row.creditsTotal = segmentTotal(segments);
         if (credit.fetchedAt) row.creditsAtMs = Number(credit.fetchedAt);
-        if (credit.todayUsage && Number(credit.todayUsage.used) > 0) {
-          row.creditsUsed = Number(Number(credit.todayUsage.used).toFixed(2));
-        }
+        // 「今日已用 x」这类次要标签不再下发：账号行只留余额（有上限时是 剩余/总量），
+        // 界面上的信息密度降下来，扫一眼就能看。
       } else if (credit !== undefined) {
         row.creditsError = typeof credit.error === 'string' && credit.error !== ''
           ? credit.error
@@ -602,10 +601,6 @@
     return function WorkBuddyTools() {
       const [gateway, setGateway] = useState({ phase: 'idle', text: '—', note: '', busy: false });
       const [tasks, setTasks] = useState({ running: false, pending: null, summary: null, logs: [], note: '', });
-      /** 今日签到：phase=idle/ready/error；rows 里 today 由本地日期与记录 day 比出来。 */
-      // 凭证 JSON 粘贴：参考界面的「添加账号」只有扫码 / 令牌两条路，本插件一直
-      // 支持整份凭证 JSON（含 refreshToken），这里补一个输入框，走宿主 /import。
-
       const loadGateway = useCallback(async () => {
         setGateway((prev) => ({ ...prev, phase: 'loading' }));
         try {
@@ -614,17 +609,14 @@
           const pool = body && body.gateway ? body.gateway : {};
           const accounts = Array.isArray(body && body.accounts) ? body.accounts : [];
           const usable = accounts.filter((account) => account.disabled !== true).length;
-          const health = pool.health ? pool.health : {};
-          setGateway({
+          setGateway((prev) => ({
             phase: 'ready',
             busy: false,
+            // 只留「跑没跑 + 几个可用」这一句：端口和健康计数属于次要标签，
+            // 重启结果与错误走 note，界面上一屏能看到就行。
             text: (pool.running === true ? '运行中' : '未运行')
-              + ' · ' + String(pool.baseURL || '—')
               + ' · 可用账号 ' + usable + '/' + accounts.length,
-            note: health.service
-              ? '健康 ' + String(health.healthy === undefined ? '—' : health.healthy) + '/' + String(health.total === undefined ? '—' : health.total)
-              : '',
-          });
+          }));
         } catch (error) {
           setGateway({ phase: 'error', busy: false, text: '读取网关状态失败', note: String((error && error.message) || error) });
         }
@@ -699,18 +691,18 @@
           : '待办 ' + pendingTotal + ' 项';
 
       // 折进参考页面里渲染（同一个 wbp-section 列），所以这里只出分组、不再自建列。
+      // 只留「标题 + 一行状态 + 一个动作」：分组说明、日志尾巴、token 统计这些次要
+      // 文案全部去掉（用户 2026-10-27：删除多余的标语、说明文字、次要标签）。
+      const lastLog = tasks.logs.length > 0 ? String(tasks.logs[tasks.logs.length - 1]) : '';
       return h(React.Fragment, null,
-        h(toolsGroup, { title: '网关', desc: '自托管网关进程（WorkBuddy / CodeBuddy 账号池反代）。抽风时重启一次即可，端口僵死会被清掉。' },
+        h(toolsGroup, { title: '网关' },
           h(toolsRow, {
             title: gateway.phase === 'loading' ? '读取中…' : gateway.text,
             desc: gateway.note || null,
           }, h(toolsButton, { label: gateway.busy ? '重启中…' : '重启网关', disabled: gateway.busy, onClick: restartGateway }))),
-        h(toolsGroup, { title: '成长任务', desc: '一键确认待办 → 执行 → 达标自动领奖。执行在宿主后台跑，可以离开本页。' },
-          h(toolsRow, { title: taskTitle, desc: tasks.note || null },
-            h(toolsButton, { label: tasks.running ? '领取中…' : '领取任务积分', disabled: tasks.running, onClick: runTasks })),
-          tasks.logs.length === 0 ? null : h('div', { className: 'wbp-rows' },
-            tasks.logs.map((line, index) => h('div', { key: String(index), className: 'wbp-row wbp-rowFlush' },
-              h('div', { className: 'wbp-rowText' }, h('span', { className: 'wbp-hint' }, String(line))))))));
+        h(toolsGroup, { title: '成长任务' },
+          h(toolsRow, { title: taskTitle, desc: tasks.note || lastLog || null },
+            h(toolsButton, { label: tasks.running ? '领取中…' : '领取任务积分', disabled: tasks.running, onClick: runTasks }))));
     };
   }
 

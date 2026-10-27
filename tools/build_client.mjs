@@ -63,6 +63,23 @@ for (const [from, to] of copyPatches) {
 }
 
 /**
+ * 结构补丁（只删说明文字，不动控件）：
+ *
+ * 账号组标题下面那两句长描述（「请求会在这些账号之间轮换……」/「先登录一次即可……」）
+ * 是参考实现的说明书，实际用起来只是噪声 —— 直接不传 description，段落整块不渲染。
+ */
+const STRUCTURE_PATCHES = [
+  [
+    'description: entries.length > 1 ? t("accountRotateHint") : t("accountEmptyHint"),',
+    'description: void 0,',
+  ],
+]
+for (const [from, to] of STRUCTURE_PATCHES) {
+  if (!bundle.includes(from)) throw new Error(`vendor 里找不到待改的结构：${from.slice(0, 48)}`)
+  bundle = bundle.split(from).join(to)
+}
+
+/**
  * 注入：把「网关 / 任务」两组合进参考实现自己的设置页。
  *
  * 为什么不在 shim 里包 `window.__ModuleLoader__`：宿主 0.2.1 的浏览器加载器已经
