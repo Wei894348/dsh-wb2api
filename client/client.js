@@ -588,7 +588,13 @@
         return toJsonResponse({ state: 'failed', reason: '请求体不是 JSON' }, 200);
       }
       try {
-        return toJsonResponse(await handleProbe(probeAction));
+        // 运行时的写偏好逻辑只把 `state === 'updated'` 当成功，其余一律渲染成「请求失败」；
+        // 我们的写动作统一回 'ok' —— 在这里做一次形态对齐。
+        const probeResult = await handleProbe(probeAction);
+        const normalizedProbe = probeResult !== null && typeof probeResult === 'object' && probeResult.state === 'ok'
+          ? Object.assign({}, probeResult, { state: 'updated' })
+          : probeResult;
+        return toJsonResponse(normalizedProbe);
       } catch (error) {
         var probeReason = error instanceof Error ? error.message : String(error);
         return toJsonResponse({ state: 'failed', reason: probeReason }, 200);
@@ -7325,9 +7331,9 @@ window.__ModuleLoader__.load({
 					const __nativeRegister = __slots.register.bind(__slots);
 					const __Tools = __wb2apiToolsFactory(react);
 					__slots.register = function (desc, Component) {
-						// 侧栏额度卡片与中栏仪表盘已按需求整块下线：这两个挂载点直接跳过 ——
-						// 不注册、不渲染，也就不需要再把它们的面板 store 接到 window 上。
-						if (desc !== null && desc !== void 0 && (desc.name === "sidebar.footer.action" || desc.name === "main")) return function () {};
+						// 侧栏额度卡片按需求下线：这个挂载点整个跳过（不注册、不渲染）。
+						// 中栏仪表盘保留 —— 设置页之外唯一能看到网关与额度总览的地方。
+						if (desc !== null && desc !== void 0 && desc.name === "sidebar.footer.action") return function () {};
 						const __target = desc !== null && desc !== void 0 && desc.name === "settings.section" && desc.id === "wb2api";
 						if (!__target || typeof Component !== "function") return __nativeRegister(desc, Component);
 						const __Wrapped = function (props) {

@@ -100,9 +100,9 @@ const TOOLS_INJECT = `		// --- wb2api: 网关 / 成长任务两块，折进设�
 					const __nativeRegister = __slots.register.bind(__slots);
 					const __Tools = __wb2apiToolsFactory(react);
 					__slots.register = function (desc, Component) {
-						// 侧栏额度卡片与中栏仪表盘已按需求整块下线：这两个挂载点直接跳过 ——
-						// 不注册、不渲染，也就不需要再把它们的面板 store 接到 window 上。
-						if (desc !== null && desc !== void 0 && (desc.name === "sidebar.footer.action" || desc.name === "main")) return function () {};
+						// 侧栏额度卡片按需求下线：这个挂载点整个跳过（不注册、不渲染）。
+						// 中栏仪表盘保留 —— 设置页之外唯一能看到网关与额度总览的地方。
+						if (desc !== null && desc !== void 0 && desc.name === "sidebar.footer.action") return function () {};
 						const __target = desc !== null && desc !== void 0 && desc.name === "settings.section" && desc.id === "wb2api";
 						if (!__target || typeof Component !== "function") return __nativeRegister(desc, Component);
 						const __Wrapped = function (props) {

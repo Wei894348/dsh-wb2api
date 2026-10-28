@@ -580,7 +580,13 @@
         return toJsonResponse({ state: 'failed', reason: '请求体不是 JSON' }, 200);
       }
       try {
-        return toJsonResponse(await handleProbe(probeAction));
+        // 运行时的写偏好逻辑只把 `state === 'updated'` 当成功，其余一律渲染成「请求失败」；
+        // 我们的写动作统一回 'ok' —— 在这里做一次形态对齐。
+        const probeResult = await handleProbe(probeAction);
+        const normalizedProbe = probeResult !== null && typeof probeResult === 'object' && probeResult.state === 'ok'
+          ? Object.assign({}, probeResult, { state: 'updated' })
+          : probeResult;
+        return toJsonResponse(normalizedProbe);
       } catch (error) {
         var probeReason = error instanceof Error ? error.message : String(error);
         return toJsonResponse({ state: 'failed', reason: probeReason }, 200);
