@@ -203,11 +203,11 @@ try {
 
 console.log('注册点：');
 for (const row of registrations) console.log('  -', row);
-// 侧栏额度卡片与中栏仪表盘都已按需求下线：这两个挂载点不再注册，也不再期望出现。
-const expected = ['settings.section', 'settings.models.provider-card', 'conversation.composer.dock', 'conversation.input.right'];
+// 侧栏额度卡片已按需求下线；中栏仪表盘保留 —— 它是网关状态与额度总览的落点。
+const expected = ['main', 'settings.section', 'settings.models.provider-card', 'conversation.composer.dock', 'conversation.input.right'];
 const missing = expected.filter((want) => !registrations.some((row) => row.startsWith(want)));
-const removedStillThere = registrations.some((row) => row.startsWith('sidebar.footer.action') || row.startsWith('main@'));
-console.log(missing.length === 0 && !removedStillThere
-  ? '[OK] 四个注册点全部落地，侧栏卡片与仪表盘已移除'
+const sidebarStillThere = registrations.some((row) => row.startsWith('sidebar.footer.action'));
+console.log(missing.length === 0 && !sidebarStillThere
+  ? '[OK] 五个注册点全部落地，侧栏卡片已移除'
   : `[WARN] 缺注册点：${missing.join(', ') || '（无）'}${sidebarStillThere ? ' · 侧栏卡片仍在' : ''}`);
 console.log(`样式表注入：${[...styleTags.keys()].join(', ') || '（无）'}`);
