@@ -795,6 +795,9 @@
       '.wb2api-card-collapsed .wbp-footRow{display:none}',
       '.wb2api-cards-collapsed .wbp-footRow{display:none}',
       '.wb2api-card-collapsed{gap:0}',
+      // 账号行左侧那道竖线（运行时给「当前账号」打的品牌色内阴影 + 8px 内缩）：
+      // 在深色主题下看起来就是一条黑线，按需求去掉，只保留正常行距。
+      '.wbp-accountRowActive{box-shadow:none!important;padding-left:2px!important}',
     ].join('');
     document.head.appendChild(tag);
   }
