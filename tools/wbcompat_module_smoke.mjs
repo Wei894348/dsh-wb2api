@@ -203,11 +203,10 @@ try {
 
 console.log('注册点：');
 for (const row of registrations) console.log('  -', row);
-// 侧栏额度卡片已按需求下线；中栏仪表盘保留 —— 它是网关状态与额度总览的落点。
-const expected = ['main', 'settings.section', 'settings.models.provider-card', 'conversation.composer.dock', 'conversation.input.right'];
+// 六个挂载点：侧栏额度卡片是「打开仪表盘」的唯一入口，不能少。
+const expected = ['main', 'sidebar.footer.action', 'settings.section', 'settings.models.provider-card', 'conversation.composer.dock', 'conversation.input.right'];
 const missing = expected.filter((want) => !registrations.some((row) => row.startsWith(want)));
-const sidebarStillThere = registrations.some((row) => row.startsWith('sidebar.footer.action'));
-console.log(missing.length === 0 && !sidebarStillThere
-  ? '[OK] 五个注册点全部落地，侧栏卡片已移除'
-  : `[WARN] 缺注册点：${missing.join(', ') || '（无）'}${sidebarStillThere ? ' · 侧栏卡片仍在' : ''}`);
+console.log(missing.length === 0
+  ? '[OK] 六个注册点全部落地'
+  : `[WARN] 缺注册点：${missing.join(', ')}`);
 console.log(`样式表注入：${[...styleTags.keys()].join(', ') || '（无）'}`);
