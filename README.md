@@ -35,6 +35,16 @@ dsh plugin --profile web add github:Wei894348/dsh-wb2api
 
 卸完重启 dsh。运行目录 `%USERPROFILE%\.dsh\wb2api\`（账号池与配置）不随卸载删除，要彻底清掉需手动删这一层。
 
+## 源码（网关本体）
+
+本仓库同时留档 **网关本体（`wb2api` / `workbuddy2api-panel`）的 Go 源码**，在 [`gateway-src/`](gateway-src/)：
+
+- 它编译出 `backend/bin/wb2a-server.exe`（随包那份网关二进制）；
+- 比 GitHub 上游多 `internal/agent/`（`/v1/messages`、`/v1/responses` 适配层）与 2026-10-29 的修复（降级窗口/探针、指纹脱敏、模型别名闸、`/v1/models?refresh=1`）；
+- 构建与背景见 [`gateway-src/README-源码说明.md`](gateway-src/README-源码说明.md)；修复件与一键复原脚本见 [`fixes/2026-10-29/`](fixes/2026-10-29/)。
+
+也就是说：**本仓库 = 插件 + 网关二进制 + 网关源码 + 修复归档**，换机器只需拉这一个仓库。
+
 ## 许可
 
 MIT，见 [LICENSE](LICENSE)。
