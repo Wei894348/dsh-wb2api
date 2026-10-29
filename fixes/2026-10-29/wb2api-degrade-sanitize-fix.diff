@@ -1,0 +1,605 @@
+diff --git a/internal/server/degrade.go b/internal/server/degrade.go
+index 1b45b40..af13b56 100644
+--- a/internal/server/degrade.go
++++ b/internal/server/degrade.go
+@@ -1,55 +1,128 @@
+ package server
+ 
+ import (
++	"os"
++	"strconv"
+ 	"sync"
+ 	"time"
+ )
+ 
+ // degradeGate 降级状态机：passthrough 模式下请求被上游内容策略拦截时，
+-// 切换到 Degraded 中性提示词直到次日 00:00 CST 重置。
++// 切换到 Degraded 中性提示词。
+ //
+ // 定位：误报处理（与 internal/upstream/sanitize.go 同哲学）——内容拦截多为
+ // system 来源的指纹误报，换最小中性提示词即可绕开；不是对抗框架。
+ //
+-// 状态机：进程内存、重启清零（可接受：重启极少触发，且 custom 模式根本
+-// 不进降级路径）。降级期内的请求直达 Degraded，不再先撞 400。
++// 历史教训（2026-10-29）：初版让降级持续到"次日 00:00 CST"、且是进程级的。
++// 结果是任何一次上游误杀都会让当天之后所有请求的 system 被整条替换成
++// Degraded —— 用户侧表现为"人设/提示词注入突然全失效，第二天自己好了"，
++// 且完全看不出是网关干的。现在改为：
++//   - 窗口短（默认 10 分钟，WB2A_DEGRADE_WINDOW 可调），过期自动恢复；
++//   - 且只对"本次撞墙后的一次重试"生效（见 handler.go 的 degradedApplied），
++//     窗口内后续请求仍先按客户端原文出站，撞墙了再降级那一条；
++//   - WB2A_DEGRADE_DISABLE=1 可整体关掉降级（只保留错误透传）。
++//
++// 状态机：进程内存、重启清零。
+ type degradeGate struct {
+-	mu    sync.Mutex
+-	until time.Time
++	mu      sync.Mutex
++	until   time.Time
++	probeAt time.Time // 下次允许原文探针出站的时间（降级期内限频）
++}
++
++// degradeWindow 降级窗口时长。
++//
++// 默认 10 分钟：足够覆盖一次上游指纹规则的瞬时抖动，又不会让一次误杀把
++// 半天的人设吃掉。WB2A_DEGRADE_WINDOW 接受 Go duration 语法（如 "30s"、"2h"）；
++// 非法值或 <=0 一律回落默认。
++func degradeWindow() time.Duration {
++	const def = 10 * time.Minute
++	if v := os.Getenv("WB2A_DEGRADE_WINDOW"); v != "" {
++		if d, err := time.ParseDuration(v); err == nil && d > 0 {
++			return d
++		}
++	}
++	return def
++}
++
++// degradeDisabled 是否整体关闭降级（WB2A_DEGRADE_DISABLE=1/true）。
++// 关闭后撞墙不再有中性提示词抢救，错误原文直接回客户端——排查期的正确形态。
++func degradeDisabled() bool {
++	v := os.Getenv("WB2A_DEGRADE_DISABLE")
++	if v == "" {
++		return false
++	}
++	b, err := strconv.ParseBool(v)
++	return err == nil && b
+ }
+ 
+ // Active 当前是否处于降级期（now < until）。
+ func (g *degradeGate) Active() bool {
++	if degradeDisabled() {
++		return false
++	}
+ 	g.mu.Lock()
+ 	defer g.mu.Unlock()
+ 	return time.Now().Before(g.until)
+ }
+ 
+-// Trigger 触发降级，直到次日 00:00 CST（Asia/Shanghai）。
+-// 已在降级期内则不续期（保持最早触发点的 00:00 重置语义）。
++// Trigger 触发降级，持续 degradeWindow()。
++// 已在降级期内则不续期（保持最早触发点的过期语义，避免连续撞墙把窗口无限拉长）。
+ func (g *degradeGate) Trigger() {
++	if degradeDisabled() {
++		return
++	}
+ 	g.mu.Lock()
+ 	defer g.mu.Unlock()
+ 	if !time.Now().Before(g.until) {
+-		// 已过期/未触发 → 设新的 until；未过期则保持原 until（不续期）。
+-		g.until = nextMidnightCST(time.Now())
++		g.until = time.Now().Add(degradeWindow())
+ 	}
+ }
+ 
+-// nextMidnightCST 返回 now 之后最近的 Asia/Shanghai 00:00 时刻（纯函数，方便单测）。
+-//
+-// 边界语义：
+-//   - 23:59 → 次日 00:00（几秒后）
+-//   - 00:00 → 次日 00:00（刚过 00:00，下个零点是次日）
++// probeInterval 降级期内的"原文探针"间隔。
+ //
+-// 用固定 +08:00 偏移计算，避免依赖系统时区配置（容器/宿主机时区不确定）。
+-func nextMidnightCST(now time.Time) time.Time {
+-	cst := time.FixedZone("CST", 8*60*60)
+-	// 把 now 转到 CST 视角取当天 00:00，再加一天；若该 00:00 <= now 则再加一天。
+-	y, m, d := now.In(cst).Date()
+-	midnight := time.Date(y, m, d, 0, 0, 0, 0, cst)
+-	for !midnight.After(now) {
+-		midnight = midnight.Add(24 * time.Hour)
+-	}
+-	return midnight
++// 为什么需要探针：降级期若一律改发 Degraded，就无法察觉上游其实已经恢复到
++// 能放行客户端原文了——人设会白白损失整个窗口。每隔 probeInterval 放一条
++// 原文请求出站：通过则立即清空降级（persona 当场回来），仍被拦则代价只有
++// 一次 400，不放大请求量。WB2A_DEGRADE_PROBE 可调（0 = 关闭探针）。
++func probeInterval() time.Duration {
++	const def = 30 * time.Second
++	if v := os.Getenv("WB2A_DEGRADE_PROBE"); v != "" {
++		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
++			return d
++		}
++	}
++	return def
++}
++
++// AllowProbe 降级期内是否放这一条请求用客户端原文出站（限频）。
++func (g *degradeGate) AllowProbe() bool {
++	iv := probeInterval()
++	if iv == 0 {
++		return false
++	}
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	if !time.Now().Before(g.until) {
++		return false
++	}
++	if time.Now().Before(g.probeAt) {
++		return false
++	}
++	g.probeAt = time.Now().Add(iv)
++	return true
++}
++
++// Clear 立刻结束降级（探针发现原文已能通过时调用）。
++func (g *degradeGate) Clear() {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	g.until = time.Time{}
++	g.probeAt = time.Time{}
++}
++
++// Until 返回当前降级截止时间（供 /status 与日志；未降级为零值）。
++func (g *degradeGate) Until() time.Time {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	return g.until
+ }
+diff --git a/internal/server/degrade_test.go b/internal/server/degrade_test.go
+index 1939f4e..0b90442 100644
+--- a/internal/server/degrade_test.go
++++ b/internal/server/degrade_test.go
+@@ -1,78 +1,127 @@
+-package server
+-
+-import (
+-	"testing"
+-	"time"
+-)
+-
+-// TestNextMidnightCSTBoundaries 边界：CST 视角下当日 00:00 之后 → 次日 00:00，
+-// 23:59 → 次日 00:00，正午 → 次日 00:00。用固定 +08:00 偏移计算，不依赖系统时区。
+-func TestNextMidnightCSTBoundaries(t *testing.T) {
+-	cst := time.FixedZone("CST", 8*60*60)
+-	cases := []struct {
+-		name string
+-		now  time.Time
+-		// 期望 until 的 CST 时分秒恒为 00:00:00，且 strictly after now。
+-	}{
+-		{"23:59 -> next 00:00", time.Date(2026, 9, 11, 23, 59, 0, 0, cst)},
+-		{"00:00:01 -> next 00:00", time.Date(2026, 9, 11, 0, 0, 1, 0, cst)},
+-		{"12:00 -> next 00:00", time.Date(2026, 9, 11, 12, 0, 0, 0, cst)},
+-		{"00:00:00 exact -> next 00:00", time.Date(2026, 9, 11, 0, 0, 0, 0, cst)},
+-	}
+-	for _, tc := range cases {
+-		t.Run(tc.name, func(t *testing.T) {
+-			got := nextMidnightCST(tc.now)
+-			if !got.After(tc.now) {
+-				t.Fatalf("until %v not after now %v", got, tc.now)
+-			}
+-			// CST 视角下必须落在 00:00:00。
+-			if g := got.In(cst); g.Hour() != 0 || g.Minute() != 0 || g.Second() != 0 {
+-				t.Errorf("until CST = %02d:%02d:%02d, want 00:00:00", g.Hour(), g.Minute(), g.Second())
+-			}
+-		})
+-	}
+-}
+-
+-// TestNextMidnightCSTCrossMonth 跨月：月末 23:59 → 次月 1 日 00:00。
+-func TestNextMidnightCSTCrossMonth(t *testing.T) {
+-	cst := time.FixedZone("CST", 8*60*60)
+-	now := time.Date(2026, 1, 31, 23, 59, 0, 0, cst)
+-	got := nextMidnightCST(now)
+-	want := time.Date(2026, 2, 1, 0, 0, 0, 0, cst)
+-	if !got.Equal(want) {
+-		t.Fatalf("got %v want %v", got, want)
+-	}
+-}
+-
+-// TestDegradeGateActiveTriggered Active() 在 Trigger 后为 true，过期后为 false。
+-func TestDegradeGateActiveTriggered(t *testing.T) {
+-	var g degradeGate
+-	if g.Active() {
+-		t.Error("fresh gate should not be active")
+-	}
+-	g.Trigger()
+-	if !g.Active() {
+-		t.Error("after Trigger should be active")
+-	}
+-}
+-
+-// TestDegradeGateTriggerNoRenewal 降级期内再次 Trigger 不续期（保持最早触发点的 00:00 重置）。
+-func TestDegradeGateTriggerNoRenewal(t *testing.T) {
+-	var g degradeGate
+-	g.Trigger()
+-	first := func() time.Time {
+-		g.mu.Lock()
+-		defer g.mu.Unlock()
+-		return g.until
+-	}()
+-	// 再次 Trigger：仍在降级期内，until 不应改变。
+-	g.Trigger()
+-	second := func() time.Time {
+-		g.mu.Lock()
+-		defer g.mu.Unlock()
+-		return g.until
+-	}()
+-	if !first.Equal(second) {
+-		t.Errorf("Trigger during active should not renew: first=%v second=%v", first, second)
+-	}
+-}
++package server
++
++import (
++	"testing"
++	"time"
++)
++
++// TestDegradeWindowDefault 默认窗口为 10 分钟（误杀只损失一小段，不吞掉整天）。
++func TestDegradeWindowDefault(t *testing.T) {
++	t.Setenv("WB2A_DEGRADE_WINDOW", "")
++	if got := degradeWindow(); got != 10*time.Minute {
++		t.Fatalf("default window = %v, want 10m", got)
++	}
++}
++
++// TestDegradeWindowEnv 环境变量覆盖；非法值/非正值回落默认。
++func TestDegradeWindowEnv(t *testing.T) {
++	t.Setenv("WB2A_DEGRADE_WINDOW", "30s")
++	if got := degradeWindow(); got != 30*time.Second {
++		t.Fatalf("window = %v, want 30s", got)
++	}
++	for _, bad := range []string{"abc", "0", "-5m"} {
++		t.Setenv("WB2A_DEGRADE_WINDOW", bad)
++		if got := degradeWindow(); got != 10*time.Minute {
++			t.Fatalf("window(%q) = %v, want default 10m", bad, got)
++		}
++	}
++}
++
++// TestDegradeGateActiveTriggered Active() 在 Trigger 后为 true，窗口过期后为 false。
++func TestDegradeGateActiveTriggered(t *testing.T) {
++	t.Setenv("WB2A_DEGRADE_DISABLE", "")
++	t.Setenv("WB2A_DEGRADE_WINDOW", "120ms")
++	var g degradeGate
++	if g.Active() {
++		t.Error("fresh gate should not be active")
++	}
++	g.Trigger()
++	if !g.Active() {
++		t.Error("after Trigger should be active")
++	}
++	time.Sleep(160 * time.Millisecond)
++	if g.Active() {
++		t.Error("after window expiry should not be active")
++	}
++}
++
++// TestDegradeGateTriggerNoRenewal 降级期内再次 Trigger 不续期（窗口不被连续撞墙拉长）。
++func TestDegradeGateTriggerNoRenewal(t *testing.T) {
++	t.Setenv("WB2A_DEGRADE_DISABLE", "")
++	t.Setenv("WB2A_DEGRADE_WINDOW", "1h")
++	var g degradeGate
++	g.Trigger()
++	first := g.Until()
++	if first.IsZero() {
++		t.Fatal("Until() should be set after Trigger")
++	}
++	g.Trigger()
++	if second := g.Until(); !first.Equal(second) {
++		t.Errorf("Trigger during active should not renew: first=%v second=%v", first, second)
++	}
++	if d := time.Until(first); d <= 0 || d > time.Hour {
++		t.Errorf("Until() = %v (in %v), want within 1h", first, d)
++	}
++}
++
++// TestDegradeDisabledKillSwitch WB2A_DEGRADE_DISABLE 下 Trigger 不生效、Active 恒 false。
++func TestDegradeDisabledKillSwitch(t *testing.T) {
++	t.Setenv("WB2A_DEGRADE_DISABLE", "1")
++	var g degradeGate
++	g.Trigger()
++	if g.Active() {
++		t.Error("kill switch should keep gate inactive")
++	}
++	if !g.Until().IsZero() {
++		t.Error("kill switch should not set until")
++	}
++}
++
++// TestDegradeProbeRateLimited 探针限频：降级期内第一次放行，间隔内不再放行。
++func TestDegradeProbeRateLimited(t *testing.T) {
++	t.Setenv("WB2A_DEGRADE_DISABLE", "")
++	t.Setenv("WB2A_DEGRADE_WINDOW", "1h")
++	t.Setenv("WB2A_DEGRADE_PROBE", "1h")
++	var g degradeGate
++	// 未降级时不放探针。
++	if g.AllowProbe() {
++		t.Fatal("probe must be denied while not degraded")
++	}
++	g.Trigger()
++	if !g.AllowProbe() {
++		t.Fatal("first probe during degrade should be allowed")
++	}
++	if g.AllowProbe() {
++		t.Fatal("second probe within interval must be denied")
++	}
++}
++
++// TestDegradeProbeDisabled 探针间隔为 0 时彻底关闭探针。
++func TestDegradeProbeDisabled(t *testing.T) {
++	t.Setenv("WB2A_DEGRADE_DISABLE", "")
++	t.Setenv("WB2A_DEGRADE_WINDOW", "1h")
++	t.Setenv("WB2A_DEGRADE_PROBE", "0")
++	var g degradeGate
++	g.Trigger()
++	if g.AllowProbe() {
++		t.Fatal("probe must be off when interval is 0")
++	}
++}
++
++// TestDegradeClear Clear 后立即不再降级（探针成功收回人设的路径）。
++func TestDegradeClear(t *testing.T) {
++	t.Setenv("WB2A_DEGRADE_DISABLE", "")
++	t.Setenv("WB2A_DEGRADE_WINDOW", "1h")
++	var g degradeGate
++	g.Trigger()
++	if !g.Active() {
++		t.Fatal("should be active after Trigger")
++	}
++	g.Clear()
++	if g.Active() {
++		t.Fatal("should be inactive after Clear")
++	}
++	if !g.Until().IsZero() {
++		t.Fatal("Until should be zero after Clear")
++	}
++}
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index 0afe85e..8d997e7 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -199,6 +199,10 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
+ 		},
+ 		"sticky_sessions": sticky,
+ 		"redis_mode":      redisMode,
++		// degrade（2026-10-29）：降级期可观测。降级期内 system 被换成中性提示词，
++		// 用户侧只看到「人格/提示词注入突然失效」——此前无任何对外信号，只能靠
++		// 反推网关内存态。零回归：只新增键。
++		"degrade": h.degradeStatus(),
+ 		// cost_explore 事件与 per-model 时间戳（时间值由 encoding/json 写 RFC3339）。
+ 		"cost_explore": map[string]any{
+ 			"events_total": exploreEvents,
+@@ -207,6 +211,25 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
+ 	})
+ }
+ 
++// degradeStatus /status 的降级可观测块（2026-10-29）。
++//
++// 为什么要有：降级期把客户端 system 整条换成 Degraded，用户侧只看到「人设/提示词
++// 注入突然失效」，日志里毫无线索。把窗口/探针/截止时刻透出，运维一查就知道是不是
++// 网关降级干的、还要等多久（探针命中会提前自愈）。
++func (h *Handler) degradeStatus() map[string]any {
++	until := h.degrade.Until()
++	out := map[string]any{
++		"active":   h.degrade.Active(),
++		"disabled": degradeDisabled(),
++		"window":   degradeWindow().String(),
++		"probe":    probeInterval().String(),
++	}
++	if !until.IsZero() {
++		out["until"] = until.UTC().Format(time.RFC3339)
++	}
++	return out
++}
++
+ // countsMapFrom 把 CountsDetailed 五元组打包成 /status 的域分组建模。
+ func countsMapFrom(total, healthy, cooling, disabled, inFlightFull int) map[string]int {
+ 	return map[string]int{
+@@ -579,18 +602,30 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 	//   - custom：用自有提示词替换客户端 system/developer（从源头消灭 system 指纹误报）。
+ 	//   - append：开头连续 system/developer 块后插自有提示词，既有消息逐字不动
+ 	//     （客户端项目规范/工具约定与网关提示词并用，issue #129）。
+-	//   - passthrough + 降级期：换 Degraded 中性提示词直达，不再先撞 400。
++	//   - passthrough + 降级期：默认换 Degraded 中性提示词直达，不再先撞 400。
+ 	//   - passthrough / append 非降级期：透传客户端原始 system（append 则再插一条网关 system）。
++	//
+ 	// 降级裁决：append 在降级期退化为 replace（Rewrite(Degraded)）——append 带
+ 	// 指纹原文重试是确定性再撞墙，replace 是一次性最小抢救（issue #129 设计 §4）。
++	//
++	// 2026-10-29：降级期再加一条原文探针（见 degrade.go AllowProbe）。降级一律改发
++	// Degraded 的话，上游其实早已恢复也察觉不到——人设白丢整个窗口。这里每 probeInterval
++	// 放一条客户端原文出站：它一旦成功（下面的 200 分支）就 Clear() 立刻收回人设；
++	// 仍被拦就当作普通撞墙继续降级，代价仅一次 400。
+ 	degradedApplied := false
++	degradeProbe := false
+ 	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
+ 		body = prompt.Rewrite(body, h.cfg.PromptText)
+ 	} else if h.cfg.PromptMode == "append" && h.cfg.PromptText != "" && !h.degrade.Active() {
+ 		body = prompt.Append(body, h.cfg.PromptText)
+ 	} else if (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && h.degrade.Active() {
+-		body = prompt.Rewrite(body, prompt.Degraded)
+-		degradedApplied = true
++		if h.degrade.AllowProbe() {
++			// 探针：原文出站，成功即清降级（见本轮成功分支）。
++			degradeProbe = true
++		} else {
++			body = prompt.Rewrite(body, prompt.Degraded)
++			degradedApplied = true
++		}
+ 	}
+ 
+ 	// outbound model 名重写为 bareModel（D6）：realm 前缀是网关侧路由协议，
+@@ -726,11 +761,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 				uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+ 			}
+ 			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
+-			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append
+-			// 降级重试同样退化为 replace——原文在场只会确定性再撞 400）。
++			// 触发降级（窗口默认 10 分钟，见 degrade.go），换 Degraded 中性提示词同请求内
++			// 重试（append 降级重试同样退化为 replace——原文在场只会确定性再撞 400）。
+ 			// 第二次仍被拦（用户内容本身触发审核）→ 回内容防火墙错误（见下分支）。
+ 			// 内容问题非账号问题：applyErrorPolicy 不罚账号（见 ErrContentBlocked 分支）。
+-			if kind == upstream.ErrContentBlocked && (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && !degradedApplied {
++			//
++			// 两条边界（2026-10-29 独立验证发现）：
++			//   - WB2A_DEGRADE_DISABLE=1：不降级、不换提示词，上游 400 原文直接透传客户端。
++			//     排查期必须看到真实错误，不能偷偷换成中性提示词回 200。
++			//   - 探针被拦（degradeProbe）：本条仍换 Degraded 抢救一次，但**不算**探针成功，
++			//     也不 Clear 降级（否则窗口被削弱成「每条请求先撞一次 400」）；失败要留日志。
++			if kind == upstream.ErrContentBlocked && (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && !degradedApplied && !degradeDisabled() {
++				if degradeProbe {
++					degradeProbe = false // 探针失败：本条退化为普通降级重试，不能记成「上游已恢复」
++					log.Printf("[server] degrade probe rejected (acct=%s model=%s): original system still blocked; keep degraded until %s",
++						logfmt.Label(acct.UID, acct.Nickname), bareModel, h.degrade.Until().UTC().Format(time.RFC3339))
++				}
+ 				h.degrade.Trigger()
+ 				body = prompt.Rewrite(body, prompt.Degraded)
+ 				degradedApplied = true
+@@ -788,6 +834,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 			continue
+ 		}
+ 		h.cfg.Pool.NoteSuccess(acct.UID)
++		// 只有「用的是客户端原文」才说明上游恢复了。探针被拦后本条已换成 Degraded，
++		// 那次的 200 是中性提示词的功劳——若在这里 Clear，窗口会被削成
++		// 「每条请求先撞一次 400 再降级重试」，等于探针失效（2026-10-29 独立验证缺陷 1）。
++		if degradeProbe && !degradedApplied {
++			// 原文探针成功：上游已能放行客户端 system，立刻收回降级。
++			// 不 Clear 的话人设要白白损失到窗口过期——这正是 2026-10-29 那次的观感。
++			h.degrade.Clear()
++			log.Printf("[server] degrade probe succeeded (acct=%s model=%s): passthrough system restored", logfmt.Label(acct.UID, acct.Nickname), bareModel)
++		}
+ 		// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
+ 		// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
+ 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
+diff --git a/internal/server/handler_test.go b/internal/server/handler_test.go
+index 55afc04..db90409 100644
+--- a/internal/server/handler_test.go
++++ b/internal/server/handler_test.go
+@@ -1347,6 +1347,88 @@ func TestContentBlockedStickyDegraded(t *testing.T) {
+ 	}
+ }
+ 
++// TestContentBlockedDegradeDisabledPassthroughError WB2A_DEGRADE_DISABLE=1 时不降级、
++// 不把 system 换成中性提示词：上游 400 原文直接透传客户端（排查期必须看到真实错误）。
++func TestContentBlockedDegradeDisabledPassthroughError(t *testing.T) {
++	t.Setenv("WB2A_DEGRADE_DISABLE", "1")
++	calls := 0
++	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
++		calls++
++		return 400, `{"code":11-128,"msg":"blocked by security policy"}`, false
++	})
++	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
++	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough"})
++
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
++		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"system","content":"x"},{"role":"user","content":"hi"}]}`)))
++
++	if rec.Code != 400 {
++		t.Fatalf("code=%d want 400 (kill switch must not swap in Degraded)", rec.Code)
++	}
++	if calls != 1 {
++		t.Errorf("upstream calls=%d want 1 (no degraded retry when disabled)", calls)
++	}
++	if h.degrade.Active() {
++		t.Error("degrade must stay inactive when WB2A_DEGRADE_DISABLE=1")
++	}
++	if !strings.Contains(rec.Body.String(), "11-128") {
++		t.Errorf("error body must passthrough upstream original: %s", rec.Body.String())
++	}
++}
++
++// TestDegradeProbeRejectedKeepsDegrade 探针被拦时：本条换 Degraded 抢救一次，
++// 但**不得**判定为探针成功、不得 Clear 降级（否则每条请求都先撞一次 400）。
++func TestDegradeProbeRejectedKeepsDegrade(t *testing.T) {
++	var bodies [][]byte
++	up := &upstream.Client{
++		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
++			raw, _ := io.ReadAll(r.Body)
++			bodies = append(bodies, raw)
++			if len(bodies) == 1 {
++				return &http.Response{
++					StatusCode: 400,
++					Header:     http.Header{"Content-Type": []string{"application/json"}},
++					Body:       io.NopCloser(strings.NewReader(`{"code":11-128,"msg":"blocked by security policy"}`)),
++				}, nil
++			}
++			return &http.Response{
++				StatusCode: 200,
++				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
++				Body:       io.NopCloser(strings.NewReader(sseOK)),
++			}, nil
++		})},
++		ChatBaseCN: "https://fake.example",
++	}
++	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
++	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough"})
++	// 先进入降级期：下一次请求即「探针」（AllowProbe 在 probeAt 为零时必然放行）。
++	h.degrade.Trigger()
++
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
++		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"system","content":"原始指纹"},{"role":"user","content":"hi"}]}`)))
++
++	if rec.Code != 200 {
++		t.Fatalf("code=%d body=%s (want 200 via degraded rescue)", rec.Code, rec.Body)
++	}
++	if len(bodies) != 2 {
++		t.Fatalf("want 2 upstream calls (probe + degraded rescue), got %d", len(bodies))
++	}
++	// 第 1 条是探针：原文出站（未被换成 Degraded）。
++	if !strings.Contains(string(bodies[0]), "原始指纹") {
++		t.Errorf("probe body should carry original system: %s", bodies[0])
++	}
++	// 第 2 条是抢救：Degraded 替换。
++	if !strings.Contains(string(bodies[1]), prompt.Degraded) {
++		t.Errorf("rescue body should carry Degraded prompt: %s", bodies[1])
++	}
++	// 关键断言：探针失败不得清降级。
++	if !h.degrade.Active() {
++		t.Error("probe rejection must NOT clear degrade (window would collapse into a 400 per request)")
++	}
++}
++
+ // TestContentBlockedCustomModeDoesNotDegrade custom 模式不触发降级重试
+ // （custom 已用自有提示词替换，不应再有 system 来源误报）；仍拦则直接回
+ // 400 content_blocked 防火墙文案（不轮转、不暴露账号/上游错误码）。
+diff --git a/internal/upstream/sanitize.go b/internal/upstream/sanitize.go
+index c24fb65..3424bee 100644
+--- a/internal/upstream/sanitize.go
++++ b/internal/upstream/sanitize.go
+@@ -20,6 +20,7 @@ var sanitizeFeatures = []string{
+ 	"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
+ 	"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
+ 	"11128",                                           // 上游反探测：裸数字错误码
++	"Tokens prefixed with @ are paths the user explicitly referenced", // DSH host file-reference guidance sentence (blocked verbatim since 2026-10-29)
+ }
+ 
+ // sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
+@@ -76,6 +77,15 @@ var sanitizeRewrites = [][2]string{
+ 		"11128",
+ 		"11-128",
+ 	},
++	{
++		// DSH host file-reference guidance: since 2026-10-29 the upstream blocks the whole
++		// sentence as a verbatim fingerprint (the first two clauses read together return
++		// 400 11-128; either half alone, or dropping the @, passes). Rewrite only the @ into
++		// the at-sign: meaning is unchanged (at-prefixed tokens are user-referenced paths)
++		// and the verbatim match is broken.
++		"Tokens prefixed with @ are paths the user explicitly referenced.",
++		"Tokens prefixed with the at-sign are paths the user explicitly referenced.",
++	},
+ }
+ 
+ // sanitizeText 单段文本净化：预检不中 → 返回原串（零分配）。
