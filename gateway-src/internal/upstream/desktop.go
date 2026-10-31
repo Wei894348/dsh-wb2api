@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 )
 
 const (
@@ -440,18 +441,31 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	h := req.Header
 	h.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	h.Set("Content-Type", "application/json")
-	h.Set("Accept", "text/event-stream")
+	h.Set("Accept", acceptChat)
 	h.Set("User-Agent", desktopUA)
 	h.Set("X-Domain", c.chatBase(a))
 	h.Set("X-Product", "SaaS")
 	h.Set("X-User-Id", a.UID)
+	// 会话头族与归属族与主 chat 路径（ChatHeaders）同形：同一账号不能在自己
+	// 两条出站路径上呈现两种客户端。消息级 id 用 32 hex（官方形态），不再用
+	// 纳秒数字串——后者是官方生成器从不产出的形状。
+	convReqID := session.NewMessageID()
+	messageID := session.NewMessageID()
 	h.Set("X-Conversation-ID", conversationID)
-	h.Set("X-Request-ID", fmt.Sprintf("%d", time.Now().UnixNano()))
+	h.Set("X-Conversation-Request-ID", convReqID)
+	h.Set("X-Conversation-Message-ID", messageID)
+	h.Set("X-Request-ID", messageID)
+	if acp := acpConnectionID(conversationID, convReqID); acp != "" {
+		h.Set("acp-connection-id", acp)
+	}
+	injectTraceHeaders(req, messageID, messageID[:16], deriveHex("wb2a:parent:"+convReqID, 8))
 	h.Set("X-Agent-Intent", "craft")
+	h.Set("X-Agent-Purpose", "conversation")
 	h.Set("X-Agent-Type", "main")
+	h.Set("X-Private-Data", "true")
 	h.Set("X-IDE-Name", "WorkBuddy")
 	h.Set("X-IDE-Type", "WorkBuddy")
-	h.Set("X-IDE-Version", "5.5.6")
+	h.Set("X-IDE-Version", c.clientVersion())
 	h.Set("x-codebuddy-request", "1")
 	if expertID != "" {
 		h.Set("X-Expert-Id", expertID)

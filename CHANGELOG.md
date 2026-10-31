@@ -1,5 +1,37 @@
 # 变更记录
 
+## 未发布（2026-10-31）· 出站请求头对齐官方原生客户端
+
+**把「像官方客户端」从形状对齐到逐头对齐**（基线 = `_ref` 里从 `WorkBuddy.app` 包内
+`applyGatewayHeaders` / `buildConversationHeaders` 实读出的头集合）。
+
+- **chat 路径删掉官方从不发的声明**：`Origin` / `Referer`（原生客户端不跨域，一条发往
+  `copilot.tencent.com` 却声称来自网页的 POST 是最硬的非客户端特征）、`Accept-Language`、
+  `X-Machine-ID` / `X-Session-ID`（派生虚拟设备指纹）、`X-No-Authorization` /
+  `X-No-User-Id` / `X-No-Enterprise-Id` / `X-No-Department-Info`（否定族只属于
+  `/v2/auth/state` 匿名态）；`Accept` 归位单值 `application/json`。
+- **chat 路径补齐归属族**：`X-Agent-Intent: craft`、`X-Agent-Type: main`、
+  `X-Private-Data: true`（此前只有 `X-Agent-Purpose`），`X-Product` 由 `WorkBuddy`
+  归位官方的 `SaaS`（产品身份由 `X-IDE-*` 声明）；企业与租户头成对出现。
+- **补齐 `acp-connection-id`**：官方网关代理在**每个** chat 上都从会话账本取这条，
+  缺失即明确的"非客户端"（`channel verification` 失败的命名点）。这里按会话稳定派生
+  36 字符带横线 UUID（会话内恒定、会话间互异）。
+- **`X-Root-Request-ID` 改条件发**：官方只在会话有根请求（fork / subagent）时才发，
+  顶层会话一律不带；改为入站透传有才发（`ChatMeta.RootRequestID`）。
+- **trace 三方言共享同一 id**：新增 `traceparent` + `b3` + `X-B3-ParentSpanId`，
+  与 `X-B3-TraceId` / `X-B3-SpanId` / `X-Trace-ID` 全部同源（此前只有 B3 半个族）。
+- **消息级 ID 改 UUIDv7**（`session.NewMessageID`）：官方生成器发 v7，前 48 bit 是
+  毫秒时钟，按到达时间自然有序；随机 v4 形状在后台排出来是乱的。
+- **refresh**：`X-Auth-Refresh-Source` 由 `plugin` 改为官方的 `workbuddy`（此前等于在
+  refresh 请求里自报"插件"）；控制台端点恢复官方宽松 `Accept`。
+- **三条出站路径归一**：Go 主 chat（`ChatHeaders`）、成长任务桌面 chat
+  （`DesktopChatWithExpert`）、JS engine（`engine/wb_up`）此前各写一套 UA / 版本 /
+  头族，现在共用同一形态与同一版本号 `5.5.6`；UA 产品段两服都回到 `WorkBuddy`
+  （`WorkBuddy AI` 只出现在 product.json / 窗口标题 / 目录请求）。
+- **回归闸门**：`internal/upstream/headers_official_test.go` 把那张头表变成断言
+  （missing / extra / mismatch 三类都红）。
+- **网关二进制重建**：`backend/bin/wb2a-server.exe`（新 SHA256 见 `backend/README.md`）。
+
 ## 1.7.0（2026-10-26）
 
 **界面重做：仪表盘式设置面板 + 侧栏额度卡片 + 中栏面板**

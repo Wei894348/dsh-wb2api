@@ -760,6 +760,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		chatMeta.ConversationRequestID = session.TurnRequestID("")
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
+	// 根请求头：官方只在会话有 rootRequestId（fork / subagent）时才发 X-Root-Request-ID，
+	// 顶层会话一律不带。这里照抄这个语义——入站有才透传，没有就不发（此前无条件
+	// 把 conversationRequestID 塞进根请求头，是官方从不做的额外声明）。
+	chatMeta.RootRequestID = r.Header.Get("X-Root-Request-ID")
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。

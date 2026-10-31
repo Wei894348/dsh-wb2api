@@ -3,9 +3,10 @@
  *
  * 纯构造函数只产数据；带 `report*` 前缀的负责发请求。
  */
+import { randomUUID } from 'node:crypto';
 import {
   baseOf, desktopFingerprint, desktopHeaders, webHeaders, billingHeaders,
-  commonHeaders, send, envelope, derive36, hex32, sleep, DESKTOP_UA, WEB_UA,
+  commonHeaders, send, envelope, derive36, hex32, sleep, CLIENT_VERSION, DESKTOP_UA, WEB_UA,
 } from './core.mjs';
 
 // ── 桌面端事件链（copilot.tencent.com/v2/report，数组体）──────────────────────
@@ -317,29 +318,73 @@ export async function marketExpertList(auth, expertType) {
   return Array.isArray(data?.experts) ? data.experts : [];
 }
 
-/** chat 出站的会话头族（简化版：官方聚合主键 + 消息级 ID）。 */
+/**
+ * trace 三方言：traceparent / b3 / B3 族 / X-Trace-ID **共享同一个 trace id**。
+ *
+ * 官方网关代理的注释就是规格——三个 id 各自随机，三种视图就无法交叉关联，等于没发。
+ */
+function traceHeaders() {
+  const traceId = hex32();
+  const spanId = hex32().slice(0, 16);
+  const parentSpanId = hex32().slice(0, 16);
+  return {
+    traceparent: `00-${traceId}-${spanId}-01`,
+    b3: `${traceId}-${spanId}-1-${parentSpanId}`,
+    'X-B3-TraceId': traceId,
+    'X-B3-ParentSpanId': parentSpanId,
+    'X-B3-SpanId': spanId,
+    'X-B3-Sampled': '1',
+    'X-Trace-ID': traceId,
+  };
+}
+
+/**
+ * chat 出站头：与 Go 网关的 `upstream.ChatHeaders` 同一形态（原生客户端形状）。
+ *
+ * 控制台专属的声明（Origin / Referer / Accept-Language / 派生设备头）在 chat 上
+ * 一律不发；归属族（X-Agent-* / X-Private-Data / X-IDE-*）与 acp 连接 id 一律补齐。
+ */
 function chatHeadersFor(auth, conversationId, expertId) {
+  const base = commonHeaders(auth);
+  delete base.Origin;
+  delete base.Referer;
+  delete base['Accept-Language'];
+  delete base['X-Machine-ID'];
+  delete base['X-Session-ID'];
+  const messageId = hex32();
   const h = {
-    ...commonHeaders(auth),
-    Accept: 'application/json, text/event-stream',
+    ...base,
+    Accept: 'application/json',
     Authorization: `Bearer ${auth.accessToken ?? ''}`,
     'X-Product': 'SaaS',
+    'X-Agent-Intent': 'craft',
     'X-Agent-Purpose': 'conversation',
+    'X-Agent-Type': 'main',
+    'X-Private-Data': 'true',
     'X-IDE-Name': 'WorkBuddy',
     'X-IDE-Type': 'WorkBuddy',
-    'X-IDE-Version': '5.5.6',
+    'X-IDE-Version': CLIENT_VERSION,
     'X-Conversation-ID': conversationId,
     'X-Conversation-Request-ID': hex32(),
-    'X-Requested-With': 'XMLHttpRequest',
+    'X-Conversation-Message-ID': messageId,
+    'X-Request-ID': messageId,
+    'acp-connection-id': randomUUID(),
     'x-codebuddy-request': '1',
+    ...traceHeaders(),
   };
+  if (auth.uid) h['X-User-Id'] = auth.uid;
+  if (auth.enterpriseId) {
+    h['X-Enterprise-Id'] = auth.enterpriseId;
+    h['X-Tenant-Id'] = auth.enterpriseId;
+  }
+  if (auth.domain) h['X-Domain'] = auth.domain;
   if (expertId) h['X-Expert-Id'] = expertId;
   return h;
 }
 
 /** 发一条真实 chat（SSE），读干流避免残留连接。 */
 export async function chatStream(auth, bodyObj, { expertId = '', conversationId = '' } = {}) {
-  const conv = conversationId || `wb2api-conv-${Date.now()}`;
+  const conv = conversationId || randomUUID();
   const res = await fetch(`${baseOf(auth, 'chat')}/v2/chat/completions`, {
     method: 'POST',
     headers: chatHeadersFor(auth, conv, expertId),
@@ -354,7 +399,8 @@ const SERVER_ID = /^(?:cmb-)?[0-9a-f]{32}$/u;
 
 /** 真实桌面指纹 chat：从 SSE 里取服务端 requestId（JOIN 类事件必须用它）。 */
 export async function desktopChatWithExpert(auth, expertId) {
-  const conversationId = `wb2api-conv-${Date.now()}`;
+  // 会话 id 用带横线 UUID（官方 randomUUID 形态），不再自造 `wb2api-conv-*` 前缀串。
+  const conversationId = randomUUID();
   const body = {
     model: 'fast-model',
     messages: [
@@ -368,24 +414,9 @@ export async function desktopChatWithExpert(auth, expertId) {
   };
   const res = await fetch(`${baseOf(auth, 'chat')}/v2/chat/completions`, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${auth.accessToken ?? ''}`,
-      'Content-Type': 'application/json',
-      Accept: 'text/event-stream',
-      'User-Agent': DESKTOP_UA,
-      'X-Domain': baseOf(auth, 'chat'),
-      'X-Product': 'SaaS',
-      'X-User-Id': auth.uid,
-      'X-Conversation-ID': conversationId,
-      'X-Request-ID': String(Date.now() * 1000),
-      'X-Agent-Intent': 'craft',
-      'X-Agent-Type': 'main',
-      'X-IDE-Name': 'WorkBuddy',
-      'X-IDE-Type': 'WorkBuddy',
-      'X-IDE-Version': '5.5.6',
-      'x-codebuddy-request': '1',
-      ...(expertId ? { 'X-Expert-Id': expertId } : {}),
-    },
+    // 与 chatStream 同一套头（chatHeadersFor），只把 X-Domain 换成 chat 通道基址：
+    // 成长任务链路实测形状如此，其余头族与主 chat 完全一致（同一账号不能自报两种客户端）。
+    headers: { ...chatHeadersFor(auth, conversationId, expertId), 'X-Domain': baseOf(auth, 'chat') },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(120000),
   });

@@ -12,8 +12,13 @@ export const BASES = {
   global: { chat: 'https://www.workbuddy.ai', billing: 'https://www.workbuddy.ai', web: 'https://www.workbuddy.ai' },
 };
 
-/** 客户端出站 UA 的版本段（对齐官方桌面端分发包 / 内置 CLI）。 */
-export const CLIENT_VERSION = '5.5.4';
+/**
+ * 客户端出站 UA 的版本段（对齐官方桌面端分发包 / 内置 CLI）。
+ *
+ * 5.5.6：与 Go 网关的 defaultClientVersion、desktop.go 的 desktopUA 同一个真机
+ * 版本号——三条出站路径（主 chat / 成长任务 / JS engine）不能各自自报一个版本。
+ */
+export const CLIENT_VERSION = '5.5.6';
 export const CLI_VERSION = '2.137.1';
 /** 桌面端实测 UA（5.5.6 内嵌 CLI 2.137.1）。 */
 export const DESKTOP_UA = 'WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1';
@@ -60,16 +65,25 @@ function identityHeaders(auth) {
   return h;
 }
 
-/** 通用头（CommonHeaders）：chat / refresh 路径用。 */
+/**
+ * 通用头（commonHeaders）：**控制台类端点**（refresh / catalog / billing）用。
+ *
+ * 这些头是"网页控制台自己的请求"形状，官方原样带 Origin/Referer 与宽松 Accept。
+ * chat 端点**不能**用这套：原生客户端不跨域，见 events.mjs 的 chatHeadersFor。
+ *
+ * UA 的产品段两服都写 `WorkBuddy`（不是 `WorkBuddy AI`）：两个官方包的网关代理都
+ * 硬编码 `[WorkBuddy/<v>, WorkBuddy/<v>, CLI/…]`，`WorkBuddy AI` 只出现在
+ * product.json / 窗口标题 / 目录请求的 `WorkBuddyAI/<v>`。
+ */
 export function commonHeaders(auth) {
   const origin = originFor(auth);
   return {
     'Content-Type': 'application/json',
-    Accept: 'application/json',
+    Accept: 'application/json, text/plain, */*',
     'X-Requested-With': 'XMLHttpRequest',
     Origin: origin,
     Referer: `${origin}/`,
-    'User-Agent': `WorkBuddy/${CLIENT_VERSION} ${isGlobal(auth) ? 'WorkBuddy AI' : 'WorkBuddy'}/${CLIENT_VERSION} CLI/${CLI_VERSION}`,
+    'User-Agent': `WorkBuddy/${CLIENT_VERSION} WorkBuddy/${CLIENT_VERSION} CLI/${CLI_VERSION}`,
     'X-CodeBuddy-Request': '1',
     'Accept-Language': acceptLanguageFor(auth),
     'X-Machine-ID': auth.uid ? derive36(auth.uid, 'wb2a:machine') : '',

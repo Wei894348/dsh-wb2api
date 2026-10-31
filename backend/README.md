@@ -20,10 +20,15 @@ backend/
 | 项 | 值 |
 |---|---|
 | 文件名 | `bin/wb2a-server.exe` |
-| 大小 | 9,019,392 字节（8.6 MiB） |
-| SHA256 | `505FA9747B64DD6C4C30CC966CE9A831811A18992510154C22072B454CFA4F74` |
+| 大小 | 10,135,040 字节（9.7 MiB） |
+| SHA256 | `99A30AB58C0E66D91DC1E5BF9A0DBC4ED1DBE195DB37FCE0DA243518C5CEDEE7` |
 | 目标平台 | windows / amd64 |
 | 入口 | Go 侧 `cmd/server` |
+
+> 本次重建（2026-10-31）：出站请求头对齐官方原生客户端（chat 去掉 `Origin`/`Referer`/
+> `Accept-Language`/派生设备头与 `X-No-*` 否定族，补齐归属族 / `acp-connection-id` /
+> trace 三方言，`X-Product` 归位 `SaaS`，refresh 渠道标识改 `workbuddy`）。源码在
+> `gateway-src/`，构建命令见下。
 
 ## 重建
 

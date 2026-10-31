@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strings"
+	"time"
 )
 
 // ResolveConversationID 从请求体提取会话头族的 conversationId（snake/camel 双形态，
@@ -44,12 +45,24 @@ func ResolveConversationID(body []byte) string {
 	return strOrEmpty(obj["conversationId"])
 }
 
-// NewMessageID 生成消息级 ID：32 位 hex（UUID v4 去横线的长度形态），对齐官方
-// X-Request-ID / X-Conversation-Message-ID。crypto/rand 失败（理论上不可能）时回落
-// math/rand/v2 双 uint64 拼 32 hex——恒 32 hex、恒合法，可安全用作 B3 TraceId。
+// NewMessageID 生成消息级 ID：32 位 hex（UUID **v7** 去横线形态），对齐官方
+// X-Request-ID / X-Conversation-Message-ID。
+//
+// 为什么是 v7 而不是 v4：官方客户端的消息 ID 生成器发的是 v7——前 48 bit 是毫秒
+// 时钟，因此"按到达时间排序"的消息 ID 依次递增。随机 v4 形状虽然长度一致，但同一
+// 账号的 ID 在后台按时间排出来是乱的，这本身就是一种可辨特征。
+//
+// crypto/rand 失败（理论上不可能）时回落 math/rand/v2 双 uint64 拼 32 hex——恒 32
+// hex、恒合法，可安全用作 B3 TraceId（此时失去时间有序性，只保留形状）。
 func NewMessageID() string {
 	b := make([]byte, 16)
 	if _, err := cryptorand.Read(b); err == nil {
+		ms := uint64(time.Now().UnixMilli())
+		for i := 0; i < 6; i++ {
+			b[i] = byte(ms >> (8 * (5 - i))) // 48-bit big-endian 毫秒时间戳
+		}
+		b[6] = 0x70 | (b[6] & 0x0f) // version 7
+		b[8] = 0x80 | (b[8] & 0x3f) // RFC 4122 variant
 		return hex.EncodeToString(b)
 	}
 	// 熵源故障的极端兜底：仍保证 32 hex（fallbackID 不 panic、不空串）。
